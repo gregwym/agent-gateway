@@ -19,7 +19,7 @@ import pytest
 from helpers import TOKEN_A, TOKEN_B, TOKEN_HOUSE, agent, base_config, prepare, running_gateway, text_of, tool_names
 from mcp import Client, MCPError, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from service_helpers import FakeGoogle
+from service_helpers import FakeGoogle, localhost_process
 
 pytestmark = pytest.mark.anyio
 
@@ -232,7 +232,7 @@ def test_the_consent_helper_hands_over_a_read_only_token_and_nothing_else(google
     def consent(refresh_token: str) -> subprocess.CompletedProcess:
         google.consenting = refresh_token
         process = subprocess.Popen(
-            [sys.executable, "-m", "agent_gateway.connectors.gmail_auth", str(client_file), "--no-browser"],
+            [*localhost_process("agent_gateway.connectors.gmail_auth"), str(client_file), "--no-browser"],
             # The stand-in is plain http on localhost; Google's library needs to be told that is intended.
             env={"PATH": "/usr/bin:/bin", "OAUTHLIB_INSECURE_TRANSPORT": "1"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,

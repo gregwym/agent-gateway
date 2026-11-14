@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import re
 import socket
 import ssl
@@ -25,6 +26,11 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+
+
+def localhost_process(module: str) -> list[str]:
+    """Run a local fixture without external hostname discovery; see the wrapper."""
+    return [sys.executable, str(Path(__file__).parent / "fixtures" / "localhost_process.py"), module]
 
 
 def free_port() -> int:
@@ -154,7 +160,7 @@ def mail_account(directory: Path, user: str, password: str) -> Iterator[MailAcco
     process = subprocess.Popen(
         [sys.executable, "-c", "from pymap.main import main; main()", "--host", "127.0.0.1", "--port", str(port),
          "--no-tls", "dict", "--demo-data", "--demo-user", user, "--demo-password", password],
-        stdout=output, stderr=subprocess.STDOUT,
+        stdout=output, stderr=subprocess.STDOUT, env={**os.environ, "FQDN": "localhost"},
     )  # fmt: skip
     output.close()
     front = None
@@ -196,7 +202,7 @@ def calendar_server(directory: Path, users: dict[str, str]) -> Iterator[Calendar
     port, log = free_port(), directory / "radicale.log"
     with open(log, "wb") as output:
         process = subprocess.Popen(
-            [sys.executable, "-m", "radicale", "--server-hosts", f"127.0.0.1:{port}", "--auth-type", "htpasswd",
+            [*localhost_process("radicale"), "--server-hosts", f"127.0.0.1:{port}", "--auth-type", "htpasswd",
              "--auth-htpasswd-filename", str(passwords), "--auth-htpasswd-encryption", "plain",
              "--storage-filesystem-folder", str(directory / "data"), "--logging-level", "info"],
             stdout=output, stderr=subprocess.STDOUT,
