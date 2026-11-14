@@ -149,14 +149,20 @@ def mail_account(directory: Path, user: str, password: str) -> Iterator[MailAcco
     """One mailbox on its own IMAP server: pymap's in-memory backend with its demo mailbox."""
     cert, key = localhost_certificate(directory)
     port = free_port()
+    log = directory / "pymap.log"
+    output = log.open("wb")
     process = subprocess.Popen(
         [sys.executable, "-c", "from pymap.main import main; main()", "--host", "127.0.0.1", "--port", str(port),
          "--no-tls", "dict", "--demo-data", "--demo-user", user, "--demo-password", password],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=output, stderr=subprocess.STDOUT,
     )  # fmt: skip
+    output.close()
     front = None
     try:
-        wait_for_port(port)
+        try:
+            wait_for_port(port)
+        except OSError as exc:
+            raise RuntimeError(f"IMAP test server did not start:\n{log.read_text(errors='replace')}") from exc
         front = TLSFront(cert, key, port)
         yield MailAccount(user, password, port, front, cert, process)
     finally:
@@ -196,7 +202,10 @@ def calendar_server(directory: Path, users: dict[str, str]) -> Iterator[Calendar
             stdout=output, stderr=subprocess.STDOUT,
         )  # fmt: skip
     try:
-        wait_for_port(port)
+        try:
+            wait_for_port(port)
+        except OSError as exc:
+            raise RuntimeError(f"CalDAV test server did not start:\n{log.read_text(errors='replace')}") from exc
         yield CalendarServer(f"http://127.0.0.1:{port}", log, process)
     finally:
         process.kill()
