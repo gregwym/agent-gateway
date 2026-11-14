@@ -240,7 +240,7 @@ relative to the config file.
 | `agw lock [--write] [--connection ID]` | diff upstream tool definitions against the lock file; `--write` accepts them |
 | `agw token` | mint a client token and print its hash (the token is not stored) |
 | `agw secret init \| set NAME \| rm NAME \| list` | manage upstream credentials (values are read from a prompt or stdin, never from argv) |
-| `agw approval enroll PERSON \| passkeys \| forget ID \| requests \| cancel ID` | register a person's passkey (prints a one-time link), list or remove passkeys, list recent requests, revoke an unused approval |
+| `agw approval enroll PERSON \| passkeys \| forget ID \| requests \| cancel -- ID` | register a person's passkey (prints a one-time link), list or remove passkeys, list recent requests, revoke an unused approval |
 
 All take `-c FILE` or `$AGW_CONFIG`. They are run by a person on the gateway host;
 none of this is reachable over the network.

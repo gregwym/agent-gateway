@@ -202,7 +202,7 @@ Agent 在有效期内（默认 10 分钟）**用完全相同的参数**再调一
 | 命令（前面加 `docker compose run --rm admin`） | 作用 |
 |---|---|
 | `approval requests` | 列出近期请求及其状态、谁批的、执行结果 |
-| `approval cancel <请求 id>` | 撤销一个已批准但还没用掉的请求 |
+| `approval cancel -- <请求 id>` | 撤销一个已批准但还没用掉的请求；`--` 防止以连字符开头的 ID 被当作选项 |
 | `approval passkeys` | 列出已登记的 Passkey |
 | `approval forget <Passkey id>` | 删除一个 Passkey（设备丢了就做这个） |
 
@@ -318,7 +318,7 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 | 5 | 发起请求，批准后把参数改一个字再调用 | 不执行，生成新的请求 |
 | 6 | 发起请求，在页面上拒绝；再原样调用 | 回答已被拒绝，不生成新请求（默认 10 分钟内） |
 | 7 | 用 B 的设备打开 A 的请求链接 | 看得到内容，但 B 的 Passkey 批不了 A 账号的请求 |
-| 8 | 批准后不调用，`approval cancel <id>`，再调用 | 不执行 |
+| 8 | 批准后不调用，`approval cancel -- <id>`，再调用 | 不执行 |
 | 9 | `jq -c 'select(.event \| startswith("approval"))' data/state/audit/audit.jsonl` | 每次请求、批准、拒绝、撤销各有一行，没有参数值 |
 
 哪一项和预期不符，把现象和对应时间的审计日志行（里面没有内容）发给我就够定位了。

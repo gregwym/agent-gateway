@@ -433,8 +433,10 @@ async def test_admin_commands(tmp_path, capsys):
             assert agw(["approval", *config, "requests"]) == 0
             listed = capsys.readouterr().out
             assert request_id in listed and "pending" in listed and "buy milk" not in listed
-            assert agw(["approval", *config, "cancel", request_id]) == 0
-            assert agw(["approval", *config, "cancel", request_id]) == 2
+            # URL-safe request ids can begin with '-', so terminate CLI options.
+            assert agw(["approval", *config, "cancel", "--", request_id]) == 0
+            assert agw(["approval", *config, "cancel", "--", request_id]) == 2
+            assert agw(["approval", *config, "cancel", "--", "-missing-request"]) == 2
             assert (await page.decide("approve", request_id, key_a)) == (403, {"error": "stale_request"})
 
             assert agw(["approval", *config, "forget", key_a.id.hex()[:16]]) == 0
