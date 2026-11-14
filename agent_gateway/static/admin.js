@@ -219,13 +219,24 @@ function modal(title) {
   const close = button(box, '×', () => box.close(), 'close'); close.setAttribute('aria-label', tr('Close', '关闭'));
   box.addEventListener('close', () => box.remove()); box.showModal(); return box;
 }
-function secretResult(title, value, isLink = false) {
+function secretResult(title, value, isLink = false, fingerprint = '') {
   const box = modal(title);
   el(box, 'p', isLink ? tr('This private link expires in 15 minutes and works once.', '此私密链接 15 分钟后过期，只能使用一次。')
     : tr('Shown only now. Save it for this agent before closing.', '仅在此时显示。关闭前请保存到这个 Agent 的配置中。'), 'muted');
   const input = field(box, isLink ? tr('Registration link', '注册链接') : tr('Agent token', 'Agent Token'), 'secret', value, 'text'); input.readOnly = true; input.className = 'token';
+  input.addEventListener('click', () => input.select());
+  if (fingerprint) el(box, 'p', tr('Token check code (SHA-256, first 12): ', 'Token 核对码（SHA-256 前 12 位）：') + fingerprint, 'token-fingerprint');
   const actions = el(box, 'div', undefined, 'actions');
-  button(actions, tr('Copy', '复制'), async () => { await navigator.clipboard.writeText(value); notify(tr('Copied', '已复制')); });
+  button(actions, tr('Copy', '复制'), async () => {
+    box.querySelector('.dialog-notice')?.remove();
+    try { await navigator.clipboard.writeText(value); }
+    catch {
+      showError(input, new Error(tr('Copy failed: the browser did not allow clipboard access. The value is selected; copy it manually with your device’s Copy action.', '复制失败：浏览器未允许访问剪贴板。内容已全选，请使用设备的「复制」操作手动复制。')));
+      input.focus(); input.select();
+      return;
+    }
+    notify(tr('Copied', '已复制') + (fingerprint ? ' · ' + fingerprint : ''));
+  });
   if (isLink) { const link = el(actions, 'a', tr('Open registration', '打开注册页面'), 'button primary'); link.href = value; link.target = '_blank'; link.rel = 'noopener noreferrer'; }
   else { el(box, 'p', tr('Streamable HTTP endpoint', 'Streamable HTTP 地址'), 'muted'); el(box, 'code', state.mcp_url, 'url');
     el(box, 'p', tr('Use the token as the Authorization: Bearer header. Each agent gets its own token.', '通过 Authorization: Bearer 请求头发送 Token。每个 Agent 使用独立 Token。'), 'muted'); }
@@ -350,7 +361,7 @@ function agents() {
     const box = modal(tr('Create agent token', '创建 Agent Token')); const name = field(box, tr('Agent name', 'Agent 名称'), 'client_id');
     const principal = select(box, tr('Identity', '身份'), 'principal', state.members.map(m => [m.id, identityLabel(m.id)]), state.owner);
     el(box, 'p', tr('For an agent shared by several people, choose the shared household identity.', '多人共享的 Agent 应选择共享家庭身份。'), 'hint');
-    button(box, tr('Create token', '创建 Token'), async () => { const result = await mutate('clients/create', {id: name.value, principal: principal.value}); box.close(); secretResult(tr('Save your agent token', '保存 Agent Token'), result.token); }, 'primary');
+    button(box, tr('Create token', '创建 Token'), async () => { const result = await mutate('clients/create', {id: name.value, principal: principal.value}); box.close(); secretResult(tr('Save your agent token', '保存 Agent Token'), result.token, false, result.fingerprint); }, 'primary');
   }, 'primary');
   el(app, 'code', state.mcp_url, 'url');
   const table = el(el(app, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
@@ -358,9 +369,31 @@ function agents() {
   const body = el(table, 'tbody');
   for (const client of state.clients) {
     const row = el(body, 'tr'); el(row, 'td', client.id); el(row, 'td', identityLabel(client.principal)); const actions = el(el(row, 'td'), 'div', undefined, 'actions');
-    button(actions, tr('Rotate token', '轮换 Token'), () => confirmAction(tr('Replace this token?', '替换此 Token？'), tr('The old token will stop working immediately.', '旧 Token 将立即失效。'), async () => { const result = await mutate('clients/rotate', {id: client.id}); secretResult(tr('Save your new token', '保存新 Token'), result.token); }));
+    el(actions, 'code', tr('Check code: ', '核对码：') + client.fingerprint, 'token-fingerprint');
+    button(actions, tr('Check token', '核对 Token'), () => checkToken(client));
+    button(actions, tr('Rotate token', '轮换 Token'), () => confirmAction(tr('Replace this token?', '替换此 Token？'), tr('The old token will stop working immediately.', '旧 Token 将立即失效。'), async () => { const result = await mutate('clients/rotate', {id: client.id}); secretResult(tr('Save your new token', '保存新 Token'), result.token, false, result.fingerprint); }));
     button(actions, tr('Revoke', '撤销'), () => confirmAction(tr('Revoke agent access?', '撤销 Agent 接入？'), client.id, async () => mutate('clients/revoke', {id: client.id})), 'danger');
   }
+}
+function checkToken(client) {
+  const box = modal(tr('Check an existing token', '核对现有 Token'));
+  el(box, 'p', tr('The pasted value is hashed only in this browser. It is not sent to the gateway or saved. This does not rotate your token.', '粘贴内容仅在此浏览器计算摘要，不会发送到网关或保存，也不会轮换 Token。'), 'hint');
+  const input = field(box, tr('Token to check', '待核对的 Token'), 'check_token', '', 'password');
+  const result = el(box, 'p', '', 'token-check-result'); result.setAttribute('role', 'status');
+  button(box, tr('Compare check code', '比较核对码'), async () => {
+    if (!input.value) throw new Error(tr('Paste the token to check.', '请粘贴待核对的 Token。'));
+    const current = (await api('state')).clients.find(c => c.id === client.id);
+    if (!current) throw new Error(tr(...messages.not_found));
+    if (!crypto.subtle) throw new Error(tr('Use a browser with HTTPS and SHA-256 support.', '请使用支持 HTTPS 和 SHA-256 的浏览器。'));
+    const digest = async value => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(n => n.toString(16).padStart(2, '0')).join('').slice(0, 12);
+    const raw = await digest(input.value), cleaned = input.value.trim().replace(/^Bearer\s+/i, '').trim();
+    const matched = raw === current.fingerprint;
+    const formatting = !matched && cleaned !== input.value && await digest(cleaned) === current.fingerprint;
+    result.className = 'token-check-result ' + (matched ? 'hint' : 'error');
+    result.textContent = (matched ? tr('Check codes match.', '核对码一致。') : formatting ? tr('The value has extra whitespace or a Bearer prefix. Save only the plain token.', '输入包含多余空白或 Bearer 前缀，请只保存纯 Token。') : tr('Check codes differ. This is not the currently configured token.', '核对码不同，此值与当前配置的 Token 不一致。'))
+      + tr(` Pasted: ${raw}; current: ${current.fingerprint}.`, ` 粘贴值：${raw}；当前：${current.fingerprint}。`);
+    input.value = '';
+  }, 'primary');
 }
 function connections() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Account connectors', '账号连接器'));

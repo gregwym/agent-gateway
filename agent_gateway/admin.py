@@ -104,7 +104,7 @@ class AdminController:
                 "mcp_url": gw.cfg.approvals.origin + "/mcp",
                 "members": [{"id": p, "display_name": self.store.name_of(p), "shared": p in gw.cfg.shared,
                              "passkeys": sum(k["principal"] == p for k in keys)} for p in gw.cfg.principals],
-                "clients": [{"id": c.id, "principal": c.principal} for c in gw.cfg.clients],
+                "clients": [{"id": c.id, "principal": c.principal, "fingerprint": c.token_sha256[:12]} for c in gw.cfg.clients],
                 "connections": connections, "passkeys": keys,
                 "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()}}
 
@@ -219,7 +219,7 @@ class AdminController:
                 raw["clients"].remove(client)
             result = await self._commit(state, operation)
             if token:
-                result.update(token=token, mcp_url=self.runtime.gateway.cfg.approvals.origin + "/mcp")
+                result.update(token=token, fingerprint=hash_token(token)[:12], mcp_url=self.runtime.gateway.cfg.approvals.origin + "/mcp")
             return result
         if operation == "connections/preview":
             cfg, _, values = self.store.effective(state)

@@ -178,6 +178,10 @@ credentials, TLS/DNS/network failures, provider permissions, and changed tool
 definitions. Other form errors stay on the current page or dialog. Server errors
 include an error ID that can be matched to the audit log without exposing passwords
 or upstream response bodies; OAuth callback failures also render the normal console.
+Agent rows and one-time token dialogs show a SHA-256 check code. **Check token**
+compares a pasted value locally in the browser, including whitespace/Bearer-prefix
+mistakes; the pasted value is never sent or saved. Clipboard failures are shown
+explicitly and select the full value for manual copying. Checking does not rotate a token.
 
 Web changes override the five account sections (`principals`, `shared`, `clients`,
 `connections`, `policy`) from YAML after the first save. `agw check` includes those
