@@ -44,12 +44,12 @@ async def test_copy_check_and_rotate_token_with_clipboard_failure(tmp_path, loca
         await row.get_by_role('button', name=t('Rotate token', '轮换 Token'), exact=True).click()
         await page.get_by_role('button', name=t('Confirm', '确认'), exact=True).click()
         new = await page.get_by_label(t('Agent token', 'Agent Token'), exact=True).input_value()
-        await page.evaluate("navigator.clipboard.writeText=async () => { throw new DOMException('denied','NotAllowedError'); }")
+        await page.evaluate("() => { navigator.clipboard.writeText=async () => { throw new DOMException('denied','NotAllowedError'); }; }")
         await page.get_by_role('button', name=t('Copy', '复制'), exact=True).click()
         await playwright.expect(page.get_by_role('dialog').get_by_role('alert')).to_contain_text(t('clipboard access', '剪贴板'))
         assert await page.get_by_label(t('Agent token', 'Agent Token'), exact=True).evaluate('(node) => document.activeElement===node && node.selectionStart===0 && node.selectionEnd===node.value.length')
         assert await page.get_by_role('dialog').locator('.dialog-notice').count() == 0
-        await page.evaluate("navigator.clipboard.writeText=async value => { window.copiedToken=value; }")
+        await page.evaluate("() => { navigator.clipboard.writeText=async value => { window.copiedToken=value; }; }")
         await page.get_by_role('button', name=t('Copy', '复制'), exact=True).click()
         assert await page.evaluate('window.copiedToken') == new
         assert (await rpc(origin, new)).status_code == 200 and (await rpc(origin, token)).status_code == 401
