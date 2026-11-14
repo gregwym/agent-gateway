@@ -61,7 +61,7 @@ class Calendars:
             # The server is the one configured. No DNS-based discovery of some other host to send the password to.
             enable_rfc6764=False,
         )
-        self._gate = CredentialGate(_REJECTED)
+        self._gate = CredentialGate(_REJECTED, code="caldav_credentials_rejected")
         self._calendars: dict[str, Any] = {}
         self._listed = 0.0
 
@@ -79,8 +79,9 @@ class Calendars:
             raise ConnectorError("No such calendar or event.") from None
         except dav_error.DAVError:
             raise ConnectorError("The calendar server refused the request.") from None
-        except OSError:  # connection, TLS and timeout errors of the HTTP library
-            raise ConnectorError(_UNREACHABLE) from None
+        except OSError as exc:  # connection, TLS and timeout errors of the HTTP library
+            from ..web_errors import connector_failure
+            raise ConnectorError(_UNREACHABLE, connector_failure(exc, "http")) from None
 
     def all(self, refresh: bool = False) -> dict[str, Any]:
         """Calendars that hold events, by id. Listed at most every few minutes."""

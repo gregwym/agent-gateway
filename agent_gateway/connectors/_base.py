@@ -28,6 +28,10 @@ DATE = r"^\d{4}-\d{2}-\d{2}$"
 class ConnectorError(Exception):
     """A failure whose message is meant for the agent. Never put a credential in it."""
 
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True)
 class Tool:
@@ -82,22 +86,24 @@ class CredentialGate:
     has to act.
     """
 
-    def __init__(self, message: str, pause_seconds: float = 60) -> None:
+    def __init__(self, message: str, pause_seconds: float = 60, code: str | None = None) -> None:
         self.message = message
+        self.code = code
         self._pause = pause_seconds
         self._closed_until = 0.0
 
     def check(self) -> None:
         if time.monotonic() < self._closed_until:
-            raise ConnectorError(self.message)
+            raise ConnectorError(self.message, self.code)
 
     def refused(self) -> ConnectorError:
         self._closed_until = time.monotonic() + self._pause
-        return ConnectorError(self.message)
+        return ConnectorError(self.message, self.code)
 
 
-def text(value: str, *, is_error: bool = False) -> types.CallToolResult:
-    return types.CallToolResult(content=[types.TextContent(type="text", text=value)], is_error=is_error)
+def text(value: str, *, is_error: bool = False, code: str | None = None) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text=value)], is_error=is_error,
+                                meta={"agw_error": code} if code else None)
 
 
 def result(*parts: Any) -> types.CallToolResult:
@@ -147,11 +153,11 @@ def build_server(name: str, tools: list[Tool]) -> Server[Any]:
         try:
             value = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
         except ConnectorError as exc:
-            return text(str(exc), is_error=True)
+            return text(str(exc), is_error=True, code=exc.code)
         except Exception as exc:
             # The type only: exception messages from client libraries can quote requests.
             print(f"{name}: {tool.name} failed with {type(exc).__name__}", file=sys.stderr)
-            return text("The request to the service failed.", is_error=True)
+            return text("The request to the service failed.", is_error=True, code="connector_internal_error")
         return value if isinstance(value, types.CallToolResult) else result(value)
 
     server: Server[Any] = Server(name, version=__version__, on_list_tools=on_list_tools, on_call_tool=on_call_tool)

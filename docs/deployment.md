@@ -355,6 +355,10 @@ admin:
 点击右上角姓名，或「家庭成员 → 修改名称」，可以修改显示名称。身份 ID、权限、现有 Passkey、管理会话和待处理审批不变。
 名称保存在加密的 `admin.enc` 中。连接器预览会显示加载状态；校验或网络错误直接显示在当前弹窗中，已填写内容会保留。
 预览只读取工具定义；应用后仍需点击「验证连接」检查实际账号访问。
+验证失败会在连接器卡片上保留原因，区分用户名/密码被拒、TLS/DNS/网络失败、权限不足和工具定义变化。
+其他表单错误保留在当前页面或弹窗；服务器故障提供错误编号，可在审计日志中关联定位，不显示密码或上游原始响应。
+Google 回调失败也会显示管理页面。iCloud Mail 登录用户名通常是 `@icloud.com` 前的部分，也可尝试完整邮箱地址；
+密码须为 [Apple App 专用密码](https://support.apple.com/en-us/102654)，设置参见 [Apple 的 IMAP 说明](https://support.apple.com/en-us/102525)。
 
 Gmail 可直接点「通过 Google 授权」。在 Google Cloud 创建 **Web 应用** OAuth 客户端，把网页显示的
 `https://<网关域名>/admin/oauth/google/callback` 登记为重定向 URI。需要 `gmail.readonly`、离线授权和刷新令牌；

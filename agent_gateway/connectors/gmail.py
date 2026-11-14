@@ -53,7 +53,7 @@ class Gmail:
         self._api, self._token_url = api.rstrip("/"), token_url
         # No proxy from the environment, no redirects: credentials go to the two configured hosts only.
         self._http = httpx2.Client(timeout=30, trust_env=False, follow_redirects=False)
-        self._gate = CredentialGate(_REVOKED, pause_seconds=300)
+        self._gate = CredentialGate(_REVOKED, pause_seconds=300, code="gmail_authorization_rejected")
         self._access: str | None = None
         self._expires = 0.0
         self._too_broad = False
@@ -67,8 +67,9 @@ class Gmail:
         self._access = None
         try:
             reply = self._http.post(self._token_url, data=self._grant)
-        except httpx2.TransportError:
-            raise ConnectorError(_UNREACHABLE) from None
+        except httpx2.TransportError as exc:
+            from ..web_errors import connector_failure
+            raise ConnectorError(_UNREACHABLE, connector_failure(exc, "http")) from None
         if reply.status_code in (400, 401):  # invalid_grant, invalid_client
             raise self._gate.refused()
         if reply.status_code != 200:
@@ -93,8 +94,9 @@ class Gmail:
                 reply = self._http.get(
                     f"{self._api}/gmail/v1/users/me/{path}", params=params, headers={"Authorization": f"Bearer {token}"}
                 )
-            except httpx2.TransportError:
-                raise ConnectorError(_UNREACHABLE) from None
+            except httpx2.TransportError as exc:
+                from ..web_errors import connector_failure
+                raise ConnectorError(_UNREACHABLE, connector_failure(exc, "http")) from None
             if reply.status_code != 401:  # 401: the access token ran out early; get a new one, once
                 break
         assert reply is not None

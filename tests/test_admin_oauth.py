@@ -11,6 +11,31 @@ from test_admin import change, login, setup, state, web_gateway
 pytestmark = pytest.mark.anyio
 
 
+@pytest.mark.parametrize('failure,expected', [
+    ('invalid_client', 'oauth_client_rejected'), ('invalid_grant', 'oauth_code_rejected'),
+    ('network', 'oauth_network_failed'), ('timeout', 'oauth_timeout'), ('profile', 'oauth_profile_rejected'),
+])
+async def test_google_failures_report_the_specific_step_without_provider_text(tmp_path, failure, expected):
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        query = await start(http)
+        def handle(request):
+            if failure == 'network':
+                raise httpx2.ConnectError('private-provider-detail')
+            if failure == 'timeout':
+                raise httpx2.ReadTimeout('private-provider-detail')
+            if failure == 'profile' and str(request.url) == TOKEN:
+                return httpx2.Response(200, json={'access_token': 'private-access-token', 'scope': SCOPE, 'refresh_token': 'private-refresh'})
+            return httpx2.Response(403 if failure == 'profile' else 400,
+                                   json={'error': failure, 'error_description': 'private-provider-detail'})
+        gw.app.state.admin.google._http = lambda: httpx2.AsyncClient(transport=httpx2.MockTransport(handle), trust_env=False)
+        flow = query['state'][0]
+        assert (await http.get('/admin/oauth/google/callback', params={'state': flow, 'code': 'fake-code'})).status_code == 303
+        response = await http.post('/admin/api/oauth/complete', json={'id': flow})
+        assert response.status_code == 400 and response.json()['error'] == expected
+        assert 'private-' not in response.text + gw.audit_text()
+
+
 async def start(http):
     reply = await change(http, 'oauth/start', kind='gmail', id='google-mail', owner='person_a',
                          settings={'client_id':'test-web-client'}, credentials={'client_secret':'very-secret-client'})

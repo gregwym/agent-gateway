@@ -1,6 +1,7 @@
 """Opt-in browser administration. No MCP credential grants access to these routes."""
 import copy
 import hmac
+import html
 import json
 import re
 import secrets
@@ -8,8 +9,7 @@ import time
 from urllib.parse import urlsplit
 
 import anyio
-from pydantic import ValidationError
-from starlette.responses import RedirectResponse
+from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from .admin_auth import AdminAuth, COOKIE
@@ -19,6 +19,7 @@ from .config import NAME
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .upstream import list_all_tools, open_client
+from .web_errors import connector_failure, failure_response, probe_error
 
 
 class AdminController:
@@ -61,8 +62,12 @@ class AdminController:
                                   if p in state["config"]["principals"]}
         state["revision"] = self.store.state["revision"] + 1
         gateway = self._gateway(state)
-        if any(route.problem for route in gateway.routes.values()):
-            raise Refused("invalid_tool_configuration", 400)
+        for route in gateway.routes.values():
+            if route.problem:
+                raise Refused({"pin_unknown_argument": "pin_unknown_argument", "allow_values_unknown_argument": "allow_values_unknown_argument",
+                               "not_locked": "missing_tool_lock", "schema_invalid": "invalid_tool_schema",
+                               "schema_remote_ref": "remote_tool_schema", "schema_not_object": "invalid_tool_schema"}.get(
+                                   route.problem, "invalid_tool_configuration"), 400)
 
         def persist():
             self.store.save(state)
@@ -131,6 +136,7 @@ class AdminController:
                 raise Refused("unsupported_connector", 400)
             probe, arguments = CATALOG[kind_of(conn)]["probe"]
             values = self.runtime.gateway.secrets
+            problem = None
             try:
                 with anyio.fail_after(35):
                     async with open_client(conn, {n: values[n] for n in conn.secret_names()}) as client:
@@ -138,16 +144,20 @@ class AdminController:
                         if any(self.runtime.gateway.lock.get(conn.id, tool.upstream) is None or
                                digest_of(live.get(tool.upstream, {})) != self.runtime.gateway.lock.get(conn.id, tool.upstream)["sha256"]
                                for tool in conn.tools):
-                            raise Refused("tool_definitions_changed", 409)
-                        result = await client.call_tool(probe, arguments)
-                        if result.is_error:
-                            raise Refused("connector_login_or_read_failed", 422)
-            except Refused:
-                raise
-            except Exception:
-                raise Refused("connector_unavailable", 422) from None
-            self.tests[conn.id] = {"ok": True, "at": int(time.time())}
-            self.runtime.gateway.audit.write("admin_connector_test", principal=self.auth.owner, connection=conn.id, reason="ok")
+                            problem = "tool_definitions_changed"
+                        else:
+                            result = await client.call_tool(probe, arguments)
+                            if result.is_error:
+                                problem = probe_error(kind_of(conn), result)
+            except Exception as exc:
+                problem = connector_failure(exc, conn.transport)
+            # Raise after leaving MCP's task groups. A Refused raised inside the
+            # client context becomes an ExceptionGroup and loses its meaning.
+            incident = secrets.token_hex(6) if problem else None
+            self.tests[conn.id] = {"ok": problem is None, "at": int(time.time()), "reason": problem or "ok", "incident": incident}
+            self.runtime.gateway.audit.write("admin_connector_test", principal=self.auth.owner, connection=conn.id, reason=problem or "ok", detail=incident)
+            if problem:
+                raise Refused(problem, 409 if problem == "tool_definitions_changed" else 422, incident=incident)
             return {"ok": True, "read_tool": probe}
 
         self._revision(body)
@@ -160,8 +170,10 @@ class AdminController:
         raw = state["config"]
         if operation == "members/add":
             name = body.get("id")
-            if not isinstance(name, str) or not re.fullmatch(NAME, name) or name in raw["principals"]:
-                raise Refused("invalid_or_duplicate_member", 400)
+            if not isinstance(name, str) or not re.fullmatch(NAME, name):
+                raise Refused("invalid_member_name", 400)
+            if name in raw["principals"]:
+                raise Refused("duplicate_member", 400)
             if len(raw["principals"]) >= 50:
                 raise Refused("member_limit", 400)
             raw["principals"].append(name)
@@ -188,8 +200,14 @@ class AdminController:
             client = next((c for c in raw["clients"] if c["id"] == name), None)
             token = None
             if operation == "clients/create":
-                if client or len(raw["clients"]) >= 100:
-                    raise Refused("duplicate_or_too_many_clients", 400)
+                if not isinstance(name, str) or not re.fullmatch(NAME, name):
+                    raise Refused("invalid_client_name", 400)
+                if client:
+                    raise Refused("duplicate_client", 400)
+                if len(raw["clients"]) >= 100:
+                    raise Refused("client_limit", 400)
+                if body.get("principal") not in raw["principals"]:
+                    raise Refused("unknown_member", 400)
                 token = new_token()
                 raw["clients"].append({"id": name, "principal": body.get("principal"), "token_sha256": hash_token(token)})
             elif not client:
@@ -213,8 +231,10 @@ class AdminController:
                 with anyio.fail_after(35):
                     async with open_client(conn, {n: values[n] for n in conn.secret_names()}) as client:
                         definitions = {t.name: definition_of(t) for t in await list_all_tools(client)}
-            except Exception:
-                raise Refused("connector_unavailable", 422) from None
+            except Exception as exc:
+                reason, incident = connector_failure(exc, conn.transport), secrets.token_hex(6)
+                self.runtime.gateway.audit.write("admin_connector_preview", reason=reason, detail=f"{incident}:{type(exc).__name__}")
+                raise Refused(reason, 422, incident=incident) from None
             if any(tool.upstream not in definitions for tool in conn.tools):
                 raise Refused("missing_upstream_tool", 422)
             raw["connections"] = [c for c in raw["connections"] if c["id"] != conn.id] + [conn.model_dump(mode="json")]
@@ -260,6 +280,16 @@ class AdminController:
             return await self._commit(state, operation)
         if operation == "permissions/save":
             principal, name, tool = body.get("principal"), body.get("connection"), body.get("tool")
+            conn = next((c for c in raw["connections"] if c["id"] == name), None)
+            if principal not in raw["principals"]:
+                raise Refused("unknown_member", 400)
+            if not conn or not any(t["name"] == tool for t in conn["tools"]):
+                raise Refused("not_found", 404)
+            if body.get("effect") not in ("deny", "allow", "approval_required"):
+                raise Refused("invalid_permission_effect", 400)
+            if (principal != conn["owner"] and conn["owner"] not in raw["shared"]
+                    and body["effect"] != "deny" and body.get("cross_account") is not True):
+                raise Refused("cross_account_required", 400)
             for rule in list(raw["policy"]):
                 if rule["connection"] == name and principal in rule["principals"] and tool in rule["tools"]:
                     raw["policy"].remove(rule)
@@ -277,6 +307,13 @@ class AdminController:
             tool = next((t for t in conn["tools"] if t["name"] == body.get("tool")), None) if conn else None
             if not tool:
                 raise Refused("not_found", 404)
+            pin, allowed = body.get("pin", {}), body.get("allow_values", {})
+            if not isinstance(pin, dict) or not isinstance(allowed, dict):
+                raise Refused("restrictions_object_required", 400)
+            if set(pin) & set(allowed):
+                raise Refused("restriction_conflict", 400)
+            if any(not isinstance(v, list) or not v for v in allowed.values()):
+                raise Refused("allowed_values_required", 400)
             tool.update(pin=body.get("pin", {}), allow_values=body.get("allow_values", {}))
             return await self._commit(state, operation)
         raise Refused("not_found", 404)
@@ -353,12 +390,9 @@ class AdminController:
                     result = await self.operate(operation, body, session)
                 return _json(result, 200)
             except Refused as exc:
-                return _json({"error": exc.code}, exc.status)
-            except (ValidationError, TypeError, ValueError, KeyError):
-                return _json({"error": "invalid_configuration"}, 400)
+                return _json({"error": exc.code, **({"incident": exc.incident} if exc.incident else {})}, exc.status)
             except Exception as exc:
-                self.runtime.gateway.audit.write("admin_error", detail=type(exc).__name__)
-                return _json({"error": "operation_failed"}, 500)
+                return failure_response(exc, self.runtime.gateway.audit, _PAGE_HEADERS)
 
         async def google_callback(request):
             # Cross-site Google navigation has no SameSite=Strict cookie. The
@@ -370,7 +404,15 @@ class AdminController:
                 target = await self.google.callback(request.query_params)
                 return RedirectResponse(target, status_code=303, headers=_PAGE_HEADERS)
             except Refused as exc:
-                return _json({"error": exc.code}, exc.status)
+                error = _json({"error": exc.code}, exc.status)
+            except Exception as exc:
+                error = failure_response(exc, self.runtime.gateway.audit, _PAGE_HEADERS)
+            # Google callbacks are browser navigations, so render the normal UI
+            # with the error instead of leaving the person on a JSON document.
+            data = {**json.loads(error.body), "status": error.status_code}
+            marker = '<meta name="gateway-error" content="' + html.escape(json.dumps(data), quote=True) + '">'
+            page = _static("admin.html", "text/html").body.decode().replace("</head>", marker + "</head>")
+            return HTMLResponse(page, status_code=error.status_code, headers=_PAGE_HEADERS)
 
         return [Route("/", page), Route("/admin", page), Route("/admin/", page),
                 Route("/admin/oauth/google/callback", google_callback),

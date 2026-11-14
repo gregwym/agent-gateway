@@ -44,6 +44,20 @@ const ERRORS = {
   too_many_passkeys: ['Too many passkeys are registered already.', '已注册的通行密钥过多。'],
   rate_limited: ['Too many attempts. Try again in a few minutes.', '尝试次数过多，请几分钟后再试。'],
   wrong_origin: ['Open this page at the address your administrator configured.', '请通过管理员配置的地址打开此页面。'],
+  invalid_argument: ['The request format is invalid. Reload this page.', '请求格式无效，请刷新页面。'],
+  invalid_response: ['The browser returned an invalid passkey response. Retry with a supported browser.', '浏览器返回了无效的通行密钥响应，请使用支持的浏览器重试。'],
+  no_such_passkey: ['That passkey is no longer registered.', '此通行密钥已不在注册列表中。'],
+  ambiguous_passkey: ['The passkey ID matches more than one key. Use its complete ID.', '此通行密钥 ID 匹配多个密钥，请使用完整 ID。'],
+  storage_full: ['The gateway disk is full. Ask its operator to free space.', '网关磁盘已满，请让管理员释放空间。'],
+  storage_readonly: ['The gateway database is read-only. Ask its operator to fix the data mount.', '网关数据库为只读，请让管理员修复数据挂载。'],
+  storage_permission_denied: ['The gateway cannot access its state files. Ask its operator to fix file permissions.', '网关无权访问数据文件，请让管理员修复文件权限。'],
+  storage_missing: ['A required gateway file is missing. Ask its operator to restore it.', '网关所需文件缺失，请让管理员恢复。'],
+  storage_busy: ['The gateway database is busy. Wait briefly and retry.', '网关数据库正忙，请稍后重试。'],
+  storage_corrupt: ['The gateway database is damaged. Ask its operator to restore a verified backup.', '网关数据库损坏，请让管理员恢复经过验证的备份。'],
+  storage_unavailable: ['The gateway could not read or save this decision. Ask its operator to check storage using the error ID.', '网关无法读取或保存此次决定，请让管理员根据错误编号检查存储。'],
+  credential_store_unavailable: ['The gateway could not verify its encrypted credentials. Ask its operator to check the encryption key.', '网关无法验证加密凭据，请让管理员检查加密密钥。'],
+  invalid_configuration: ['The gateway configuration is invalid. Ask its operator to correct it.', '网关配置无效，请让管理员修正。'],
+  operation_failed: ['The gateway encountered an unexpected error. Ask its operator to inspect the error ID.', '网关发生未预期错误，请让管理员根据错误编号排查。'],
 };
 const t = (key) => TEXT[key][ZH ? 1 : 0];
 const app = document.getElementById('app');
@@ -60,12 +74,24 @@ const fromB64 = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '
 const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 async function api(path, body) {
-  const response = await fetch('/approvals/api/' + path, body === undefined ? {} : {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  const data = await response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  let response, data;
+  try {
+    response = await fetch('/approvals/api/' + path, {signal: controller.signal, ...(body === undefined ? {} : {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})});
+    data = await response.json();
+  } catch (error) {
+    const message = error.name === 'AbortError' ? ['The request timed out. Reload to check its status before retrying.', '请求超时，请刷新确认状态后再重试。']
+      : error.name === 'SyntaxError' ? [`The gateway returned an unreadable response (HTTP ${response?.status}).`, `网关返回了无法解析的响应（HTTP ${response?.status}）。`]
+      : ['Could not reach the gateway. Check your network and Tailscale connection.', '无法连接网关，请检查网络和 Tailscale 连接。'];
+    throw new Error(message[ZH ? 1 : 0]);
+  } finally { clearTimeout(timer); }
   if (!response.ok) {
-    const known = ERRORS[data.error];
-    throw new Error(known ? known[ZH ? 1 : 0] : String(data.error));
+    const known = ERRORS[data?.error];
+    let message = known ? known[ZH ? 1 : 0] : [`The gateway rejected this request (HTTP ${response.status}).`, `网关拒绝了此请求（HTTP ${response.status}）。`][ZH ? 1 : 0];
+    if (/^[a-f0-9]{12}$/.test(data?.incident || '')) message += (ZH ? ' 错误编号：' : ' Error ID: ') + data.incident;
+    throw new Error(message);
   }
   return data;
 }
@@ -101,7 +127,12 @@ function act(parent, label, cls, run) {
       await run();
     } catch (error) {
       status.className = 'notice bad';
-      status.textContent = t('failed') + (error.message || error.name);
+      const browserErrors = {NotAllowedError: ['Passkey verification was cancelled or timed out.', '通行密钥验证已取消或超时。'],
+        InvalidStateError: ['This passkey is already registered.', '此通行密钥已注册。'],
+        SecurityError: ['Open this page at the gateway’s configured HTTPS address.', '请通过网关配置的 HTTPS 地址打开此页面。'],
+        NotSupportedError: ['This browser or authenticator does not support the requested passkey operation.', '此浏览器或认证设备不支持此次通行密钥操作。']};
+      status.textContent = t('failed') + (browserErrors[error.name]?.[ZH ? 1 : 0] || error.message || error.name);
+      status.setAttribute('role', 'alert');
       buttons.forEach((b) => { b.disabled = false; });
     }
   });

@@ -200,6 +200,9 @@ def make_connection(body, cfg, values):
                              "GMAIL_REFRESH_TOKEN": secret("refresh_token", "GMAIL_REFRESH_TOKEN")}
     else:
         raw.update(transport="http", url=field("url"), command=[], bearer_secret=secret("token", ""))
+        parts = urlsplit(raw["url"])
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.fragment or parts.query:
+            raise Refused("https_url_required", 400)
         # Plain HTTP helpers must be exposed through an HTTPS reverse proxy. The
         # existing YAML-only escape hatch remains unavailable to web input.
     raw["tools"] = ([t.model_dump(mode="json") for t in previous.tools] if previous else

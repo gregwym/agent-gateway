@@ -20,6 +20,7 @@ Nothing is indexed or stored: every call is a search or fetch against the server
 from __future__ import annotations
 
 import imaplib
+import socket
 import ssl
 from collections.abc import Callable
 from datetime import date
@@ -46,7 +47,7 @@ class Mailbox:
     def __init__(self, host: str, port: int, username: str, password: str) -> None:
         self._host, self._port, self._username, self._password = host, port, username, password
         self._client: IMAPClient | None = None
-        self._gate = CredentialGate(_REJECTED)
+        self._gate = CredentialGate(_REJECTED, code="imap_credentials_rejected")
 
     def _connect(self) -> IMAPClient:
         self._gate.check()
@@ -70,10 +71,16 @@ class Mailbox:
                 return action(self._client)
             except ConnectorError:
                 raise
+            except ssl.SSLError:
+                self._drop()
+                raise ConnectorError(_UNREACHABLE + " TLS certificate verification or handshake failed.", "connector_tls_failed") from None
+            except socket.gaierror:
+                self._drop()
+                raise ConnectorError(_UNREACHABLE + " The server hostname could not be resolved.", "connector_dns_failed") from None
             except (imaplib.IMAP4.abort, OSError, EOFError):
                 self._drop()
                 if attempt == 2:
-                    raise ConnectorError(_UNREACHABLE) from None
+                    raise ConnectorError(_UNREACHABLE, "imap_server_unreachable") from None
             except imaplib.IMAP4.error:
                 # The server answered NO or BAD: a mailbox that does not exist, a search it cannot parse.
                 self._drop()

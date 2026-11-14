@@ -93,7 +93,23 @@ class GoogleConsent:
             flow["phase"] = "ready"
         except Exception as exc:
             flow["phase"] = "failed"
-            flow["error"] = exc.code if isinstance(exc, Refused) else "oauth_failed"
+            if isinstance(exc, Refused):
+                reason = exc.code
+            elif isinstance(exc, httpx2.TimeoutException):
+                reason = "oauth_timeout"
+            elif isinstance(exc, httpx2.TransportError):
+                reason = "oauth_network_failed"
+            elif isinstance(exc, httpx2.HTTPStatusError):
+                reason = "oauth_profile_rejected" if str(exc.request.url) == PROFILE else "oauth_failed"
+                try:
+                    reason = {"invalid_client": "oauth_client_rejected", "unauthorized_client": "oauth_client_rejected",
+                              "invalid_grant": "oauth_code_rejected", "redirect_uri_mismatch": "oauth_code_rejected"}.get(
+                                  exc.response.json().get("error"), reason)
+                except (ValueError, AttributeError, TypeError):
+                    pass
+            else:
+                reason = "oauth_invalid_response"
+            flow["error"] = reason
             flow["body"]["credentials"] = {}
         return "/admin/?gmail=" + state
 

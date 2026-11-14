@@ -102,10 +102,11 @@ _PAGE_HEADERS = {
 class Refused(Exception):
     """A request to the approval service was refused. `code` is safe to show."""
 
-    def __init__(self, code: str, status: int = 403) -> None:
+    def __init__(self, code: str, status: int = 403, *, incident: str | None = None) -> None:
         super().__init__(code)
         self.code = code
         self.status = status
+        self.incident = incident
 
 
 def _sha256(text: str) -> str:
@@ -490,12 +491,14 @@ class PasskeyApprover:
             body = None
         return body if isinstance(body, dict) else _json({"error": "invalid_argument"}, 400)
 
-    @staticmethod
-    def _answer(action: Any) -> Response:
+    def _answer(self, action: Any) -> Response:
         try:
             return _json(action(), 200)
         except Refused as refused:
-            return _json({"error": refused.code}, refused.status)
+            return _json({"error": refused.code, **({"incident": refused.incident} if refused.incident else {})}, refused.status)
+        except Exception as exc:
+            from .web_errors import failure_response
+            return failure_response(exc, self.audit, _PAGE_HEADERS)
 
 
 def _json(data: Any, status: int) -> Response:

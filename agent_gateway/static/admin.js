@@ -7,14 +7,95 @@ const dialogs = document.getElementById('dialogs');
 let csrf = '', state = null, tab = 'overview', subject = '', noticeTimer;
 let setupCode = new URLSearchParams(location.hash.slice(1)).get('setup') || '';
 let gmailResult = new URLSearchParams(location.search).get('gmail');
+const navigationError = document.querySelector('meta[name="gateway-error"]');
+if (navigationError) history.replaceState(null, '', '/admin/');
 if (location.hash) history.replaceState(null, '', location.pathname);
 const messages = {
   login_required: ['Your session expired. Sign in again.', '会话已过期，请重新登录。'],
   invalid_setup_link: ['This setup link is invalid, expired, or already used.', '设置链接无效、已过期或已被使用。'],
   verification_failed: ['Passkey verification failed. Try again.', '通行密钥验证失败，请重试。'],
   configuration_changed: ['Configuration changed in another window. Refresh and try again.', '其他窗口已修改配置，请刷新后重试。'],
-  connector_unavailable: ['Could not start or reach this connector. Check its settings.', '无法启动或连接此连接器，请检查设置。'],
+  connector_unavailable: ['Connector initialization or communication failed unexpectedly. Use the error ID to locate the gateway failure.', '连接器初始化或通信发生未预期故障，请使用错误编号定位网关故障。'],
+  connector_internal_error: ['The connector encountered an internal error while reading the service. Use the error ID to locate it.', '连接器在读取服务时发生内部错误，请使用错误编号定位。'],
   connector_login_or_read_failed: ['Login or the read check failed. Check account credentials and permissions.', '登录或读取验证失败，请检查账号凭据和权限。'],
+  imap_credentials_rejected: ['The mail server rejected the username or password. Edit this connector and check the mailbox username; iCloud requires an app-specific password.', '邮件服务器拒绝了用户名或密码。请编辑连接器，核对邮箱用户名；iCloud 需要使用 App 专用密码。'],
+  imap_server_unreachable: ['The mail server could not be reached or its TLS connection failed. Check the server, port, and network.', '无法连接邮件服务器，或 TLS 连接失败。请检查服务器地址、端口和网络。'],
+  connector_timeout: ['The connection check timed out. Check the upstream server and network, then try again.', '连接验证超时。请检查上游服务器和网络后重试。'],
+  connector_tls_failed: ['TLS certificate verification failed. Check the server certificate and gateway clock.', 'TLS 证书验证失败，请检查服务器证书和网关时间。'],
+  connector_dns_failed: ['The server hostname could not be resolved. Check its spelling and gateway DNS.', '无法解析服务器域名，请检查地址拼写和网关 DNS。'],
+  connector_network_failed: ['The network connection failed or was closed. Check the service address, port, and network access.', '网络连接失败或被关闭，请检查服务地址、端口及网络访问。'],
+  connector_executable_missing: ['The connector program is missing on the gateway. Repair its deployment.', '网关缺少连接器程序，请修复部署。'],
+  connector_executable_denied: ['The gateway cannot execute the connector program. Check host file permissions.', '网关无权执行连接器程序，请检查主机文件权限。'],
+  connector_process_exited: ['The connector process exited before completing the request. Check its required settings and host installation.', '连接器进程在请求完成前退出，请检查必要配置及主机安装。'],
+  connector_protocol_error: ['The connector rejected the MCP request or returned an invalid protocol response.', '连接器拒绝了 MCP 请求，或返回了无效的协议响应。'],
+  connector_auth_rejected: ['The upstream service rejected the saved token. Update this connector’s credentials.', '上游服务拒绝了已保存的 Token，请更新连接器凭据。'],
+  connector_access_denied: ['The upstream account lacks permission for this read operation. Check its grants.', '上游账号没有执行此次读取的权限，请检查授权。'],
+  connector_endpoint_missing: ['The service returned HTTP 404. Check the complete MCP endpoint URL.', '服务返回 HTTP 404，请检查完整的 MCP 接口地址。'],
+  connector_rate_limited: ['The upstream service rate-limited this request. Wait before retrying.', '上游服务限制了请求频率，请稍后重试。'],
+  connector_http_error: ['The upstream service returned an HTTP error. Check that the configured URL serves MCP and that the service is healthy.', '上游服务返回 HTTP 错误，请检查该地址是否提供 MCP 服务，以及服务是否正常。'],
+  connector_request_rejected: ['The upstream service refused the read request. Check account access and service settings.', '上游服务拒绝了读取请求，请检查账号访问权限和服务配置。'],
+  connector_resource_missing: ['The upstream calendar or resource no longer exists. Check the service URL.', '上游日历或资源不存在，请检查服务地址。'],
+  caldav_credentials_rejected: ['The calendar server rejected the username or password. Check the Apple Account and app-specific password.', '日历服务器拒绝了用户名或密码，请核对 Apple 账号和 App 专用密码。'],
+  caldav_server_unreachable: ['The calendar server connection failed. Check its HTTPS URL, certificate, and network.', '日历服务器连接失败，请检查 HTTPS 地址、证书和网络。'],
+  gmail_authorization_rejected: ['Google rejected the stored authorization. Check the OAuth client and authorize this account again.', 'Google 拒绝了已保存的授权，请核对 OAuth 客户端并重新授权此账号。'],
+  gmail_server_unreachable: ['The gateway could not connect to Google. Check DNS, TLS, and outbound HTTPS access.', '网关无法连接 Google，请检查 DNS、TLS 和出站 HTTPS 访问。'],
+  gmail_request_rejected: ['Gmail refused the read request or is temporarily unavailable. Check account/API access and retry later.', 'Gmail 拒绝了读取请求或暂不可用，请检查账号及 API 访问并稍后重试。'],
+  reminders_permission_required: ['macOS has not granted Reminders access to the helper. Enable it on the helper Mac.', 'macOS 尚未授予辅助程序提醒事项访问权限，请在运行辅助程序的 Mac 上授权。'],
+  already_initialized: ['Setup is already complete. Sign in with the administrator passkey.', '首次设置已完成，请使用管理员通行密钥登录。'],
+  not_initialized: ['The administrator has no passkey yet. Open the private setup link first.', '管理员尚未注册通行密钥，请先打开私密设置链接。'],
+  expired_ceremony: ['Passkey verification expired. Start it again.', '通行密钥验证已过期，请重新开始。'],
+  rate_limited: ['Too many passkey attempts are in progress. Wait a few minutes and retry.', '正在进行的通行密钥验证过多，请几分钟后重试。'],
+  invalid_argument: ['The request format is invalid. Reload the page and check the form.', '请求格式无效，请刷新页面并检查表单。'],
+  csrf_required: ['The page’s login verification no longer matches. Refresh or sign in again.', '页面的登录校验已失效，请刷新或重新登录。'],
+  request_too_large: ['The submitted form is too large. Reduce the argument restrictions or pasted content.', '提交的表单过大，请减少参数限制或粘贴内容。'],
+  not_found: ['This member, token, connector, or tool no longer exists. Refresh the page.', '此成员、Token、连接器或工具已不存在，请刷新页面。'],
+  unknown_member: ['The selected member no longer exists. Refresh and select an existing member.', '选择的成员不存在，请刷新并选择现有成员。'],
+  invalid_member_name: ['Member IDs must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', '成员 ID 须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
+  duplicate_member: ['This member ID already exists. Choose another ID.', '此成员 ID 已存在，请使用其他 ID。'],
+  member_limit: ['The gateway has reached its limit of 50 members. Remove an unused member first.', '网关已达到 50 个成员的上限，请先移除不再使用的成员。'],
+  cannot_remove_member: ['The administrator identity cannot be removed; other members must still exist.', '不能移除管理员身份；其他待移除成员必须仍然存在。'],
+  invalid_client_name: ['Agent IDs must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', 'Agent ID 须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
+  duplicate_client: ['This Agent ID already exists. Choose another ID or rotate its token.', '此 Agent ID 已存在，请使用其他 ID，或轮换已有 Token。'],
+  client_limit: ['The gateway has reached its limit of 100 agents. Revoke an unused agent first.', '网关已达到 100 个 Agent 的上限，请先撤销不再使用的 Agent。'],
+  connector_limit: ['The gateway has reached its limit of 50 connectors. Remove an unused connector first.', '网关已达到 50 个连接器的上限，请先移除不再使用的连接器。'],
+  unsupported_connector: ['This custom connector has no built-in read check. Configure it on the gateway host.', '此自定义连接器没有内置的读取验证，请在网关主机上配置。'],
+  missing_upstream_tool: ['The connector did not provide a tool required by its template. Check the connector version.', '连接器没有提供模板要求的工具，请检查连接器版本。'],
+  too_many_drafts: ['There are already 16 pending previews or authorizations. Complete one or wait 10 minutes for expiry.', '已有 16 个待处理预览或授权，请先完成一个，或等待 10 分钟过期。'],
+  review_required: ['Check the box confirming that you reviewed the tool definitions before applying.', '请先勾选已审阅工具定义，再应用连接器。'],
+  https_url_required: ['Use an HTTPS service URL without embedded credentials, query parameters, or a fragment.', '请使用 HTTPS 服务地址，且不要在地址中包含凭据、查询参数或片段。'],
+  invalid_timezone: ['The time zone is unknown. Use an IANA name such as America/Los_Angeles or UTC.', '无法识别此时区，请使用 America/Los_Angeles 或 UTC 等 IANA 时区名称。'],
+  missing_host: ['Enter the IMAP server hostname.', '请填写 IMAP 服务器域名。'],
+  missing_port: ['Enter the TLS port.', '请填写 TLS 端口。'],
+  missing_timezone: ['Enter the calendar time zone.', '请填写日历时区。'],
+  invalid_permission_effect: ['Choose Deny, Allow, or Require approval.', '请选择拒绝、允许或需要审批。'],
+  cross_account_required: ['This grants access to another person’s account. Select the explicit cross-account consent checkbox.', '此操作会开放其他个人账号，请勾选明确的跨账号授权选项。'],
+  restrictions_object_required: ['Fixed arguments and allowed values must each be a JSON object.', '固定参数和允许值必须分别为 JSON 对象。'],
+  restriction_conflict: ['The same argument cannot be both fixed and restricted to allowed values.', '同一个参数不能同时设为固定参数和允许值限制。'],
+  allowed_values_required: ['Each allowed-values entry must be a non-empty JSON array.', '每个允许值条目必须是非空 JSON 数组。'],
+  oauth_already_used: ['This Google callback was already used. Start authorization again.', '此次 Google 回调已使用，请重新发起授权。'],
+  oauth_wrong_session: ['Google authorization belongs to another login session. Continue in the original session or start again.', '此次 Google 授权属于另一个登录会话，请回到原会话或重新授权。'],
+  oauth_not_ready: ['Google authorization has not finished. Complete it before continuing.', 'Google 授权尚未完成，请先完成授权。'],
+  oauth_refresh_token_missing: ['Google did not issue a refresh token. Reauthorize and allow offline access.', 'Google 没有返回刷新令牌，请重新授权并允许离线访问。'],
+  oauth_client_rejected: ['Google rejected the OAuth client ID or secret. Check the Web application client settings.', 'Google 拒绝了 OAuth 客户端 ID 或密钥，请检查 Web 应用客户端配置。'],
+  oauth_code_rejected: ['Google rejected the authorization code or callback URL. Check the exact redirect URI and authorize again.', 'Google 拒绝了授权码或回调地址，请核对完整重定向 URI 并重新授权。'],
+  oauth_network_failed: ['The gateway could not reach Google’s authorization server. Check outbound HTTPS access.', '网关无法连接 Google 授权服务器，请检查出站 HTTPS 访问。'],
+  oauth_profile_rejected: ['Google did not allow the Gmail account check. Confirm Gmail API access and the read-only grant.', 'Google 拒绝了 Gmail 账号验证，请确认 Gmail API 访问和只读授权。'],
+  oauth_timeout: ['Google authorization timed out. Check network access and start authorization again.', 'Google 授权超时，请检查网络访问并重新授权。'],
+  oauth_invalid_response: ['Google returned an invalid authorization or account response. Start authorization again.', 'Google 返回了无效的授权或账号响应，请重新授权。'],
+  pin_unknown_argument: ['A fixed argument does not exist in this tool’s reviewed schema. Remove that argument.', '固定参数包含工具定义中不存在的参数，请移除此参数。'],
+  allow_values_unknown_argument: ['An allowed-values restriction names an argument absent from this tool’s schema.', '允许值限制使用了工具定义中不存在的参数。'],
+  missing_tool_lock: ['A tool has no reviewed definition. Edit and preview this connector again.', '工具缺少已审阅的定义，请编辑并重新预览连接器。'],
+  invalid_tool_schema: ['The connector’s tool schema is invalid. Fix the connector before applying it.', '连接器的工具参数定义无效，请修复连接器后再应用。'],
+  remote_tool_schema: ['The tool schema references a remote document. Only self-contained schemas are allowed.', '工具定义引用了远程文档；网关仅允许自包含的参数定义。'],
+  storage_full: ['The gateway disk is full. Free space on the host, then retry.', '网关磁盘已满，请释放主机空间后重试。'],
+  storage_readonly: ['The gateway data directory is read-only. Fix its host mount permissions.', '网关数据目录为只读，请修正主机挂载权限。'],
+  storage_permission_denied: ['The gateway cannot access its saved state. Fix the data-directory ownership and permissions.', '网关无权访问保存的数据，请修正数据目录的所有者和权限。'],
+  storage_missing: ['A required gateway state or key file is missing. Restore it on the host.', '网关所需的数据或密钥文件缺失，请在主机上恢复。'],
+  storage_busy: ['The gateway database is locked by another operation. Wait briefly and retry.', '网关数据库被另一操作占用，请稍后重试。'],
+  storage_corrupt: ['The gateway database is damaged. Restore a verified backup on the host.', '网关数据库损坏，请在主机上恢复经过验证的备份。'],
+  storage_unavailable: ['The gateway could not read or save its state. Check host storage; use the error ID to locate the failure.', '网关无法读取或保存数据，请检查主机存储，并用错误编号定位故障。'],
+  credential_store_unavailable: ['The encrypted credential store could not be read or verified. Check its file and encryption key on the host.', '无法读取或验证加密凭据存储，请检查主机上的加密文件和密钥。'],
+  operation_failed: ['The server encountered an unexpected error. Use the error ID to locate it before retrying.', '服务器发生未预期错误，请用错误编号定位后重试。'],
   invalid_configuration: ['Check the values and account-sharing permission.', '请检查输入值和跨账号授权选项。'],
   invalid_display_name: ['Use 1–80 characters without control characters.', '显示名称须为 1–80 个字符，不能包含控制字符。'],
   invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
@@ -52,14 +133,21 @@ function notify(text) {
   node.setAttribute('role', 'status'); node.textContent = text; node.style.display = 'block';
   clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { if (box) node.remove(); else node.style.display = 'none'; }, 5500);
 }
-function errorText(error) { return error.name === 'NotAllowedError' ? tr('Passkey operation cancelled or timed out.', '通行密钥操作已取消或超时。') : error.message; }
+function errorText(error) {
+  const known = {NotAllowedError: ['Passkey operation cancelled or timed out.', '通行密钥操作已取消或超时。'],
+    InvalidStateError: ['This passkey is already registered. Use it to sign in.', '此通行密钥已注册，请用它登录。'],
+    SecurityError: ['The browser rejected this passkey origin. Open the configured HTTPS address.', '浏览器拒绝了此通行密钥来源，请打开配置的 HTTPS 地址。'],
+    NotSupportedError: ['This browser or authenticator does not support the requested passkey operation.', '此浏览器或认证设备不支持此次通行密钥操作。'],
+    AbortError: ['The browser cancelled this operation. Try again.', '浏览器取消了此次操作，请重试。']};
+  return known[error.name] ? tr(...known[error.name]) : error.message;
+}
 function showError(source, error) {
-  const box = source.closest('dialog');
-  if (!box?.open || !box.isConnected) { notify(errorText(error)); return; }
+  const dialog = source.closest('dialog');
+  const box = dialog?.open && dialog.isConnected ? dialog : app;
   let message = box.querySelector('.operation-error');
   if (!message) {
     message = el(box, 'p', '', 'error operation-error'); message.setAttribute('role', 'alert'); message.tabIndex = -1;
-    box.insertBefore(message, box.children[2] || null);
+    box.insertBefore(message, box === app ? box.firstChild : box.children[2] || null);
   }
   message.textContent = errorText(error); message.scrollIntoView({block: 'nearest'}); message.focus();
 }
@@ -72,21 +160,34 @@ async function api(path, body) {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: JSON.stringify(body)})});
     data = await response.json();
   } catch (error) {
-    throw new Error(error.name === 'AbortError' ? tr('The request timed out. Refresh to check its status before retrying.', '请求超时，请刷新确认状态后再重试。')
+    throw new Error(error.name === 'SyntaxError' ? tr(`The gateway returned an unreadable response (HTTP ${response?.status}). Refresh and check the service.`, `网关返回了无法解析的响应（HTTP ${response?.status}），请刷新并检查服务。`)
+      : error.name === 'AbortError' ? tr('The request timed out. Refresh to check its status before retrying.', '请求超时，请刷新确认状态后再重试。')
       : tr('Could not reach the gateway. Check your connection and try again.', '无法连接网关，请检查连接后重试。'));
   } finally { clearTimeout(timer); }
   if (!response.ok) {
     if (response.status === 401) { csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); }
-    const known = messages[data.error];
-    throw new Error(known ? tr(...known) : tr('Could not complete: ', '未能完成：') + data.error);
+    throw serverError(data, response.status);
   }
   return data;
+}
+function serverError(data, status) {
+    const known = messages[data?.error];
+    let message = known ? tr(...known) : tr(`The server rejected this request (HTTP ${status}).`, `服务器拒绝了此请求（HTTP ${status}）。`);
+    const reasons = {missing: ['required field', '必填字段缺失'], string_pattern_mismatch: ['invalid name format: lowercase letters, numbers, underscores, or hyphens', '名称格式无效：仅支持小写字母、数字、下划线或连字符'],
+      string_type: ['must be text', '必须是文本'], dict_type: ['must be a JSON object', '必须是 JSON 对象'], list_type: ['must be an array', '必须是数组'],
+      literal_error: ['unsupported choice', '选项无效'], extra_forbidden: ['unknown field', '不支持此字段']};
+    for (const field of Array.isArray(data?.fields) ? data.fields : []) {
+      if (typeof field.path === 'string' && /^[a-zA-Z0-9_.]{1,160}$/.test(field.path)) message += ` ${field.path}: ${tr(...(reasons[field.reason] || ['invalid field value or configuration combination', '字段值或配置组合不合法']))}.`;
+    }
+    if (/^[a-f0-9]{12}$/.test(data?.incident || '')) message += tr(' Error ID: ', ' 错误编号：') + data.incident;
+    return new Error(message);
 }
 function button(parent, label, action, cls = '', busyLabel = '') {
   const node = el(parent, 'button', label, cls); node.type = 'button';
   node.addEventListener('click', async () => {
     node.disabled = true;
     node.setAttribute('aria-busy', 'true');
+    app.querySelector('.operation-error')?.remove();
     node.closest('dialog')?.querySelector('.operation-error')?.remove();
     if (busyLabel) node.textContent = busyLabel;
     try { await action(); } catch (error) { showError(node, error); }
@@ -268,12 +369,18 @@ function connections() {
   const grid = el(app, 'div', undefined, 'grid');
   for (const conn of state.connections) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', conn.id, 'connector-title'); el(card, 'p', identityLabel(conn.owner) + ' · ' + (state.catalog[conn.kind]?.label || tr('Custom YAML connector', 'YAML 自定义连接器')), 'muted');
-    el(card, 'span', conn.test?.ok ? tr('Read check passed', '读取验证通过') : conn.connected ? tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证') : tr('Connecting tools', '正在连接工具'), 'badge');
+    const failed = conn.test?.ok === false;
+    el(card, 'span', failed ? tr('Read check failed', '读取验证失败') : conn.test?.ok ? tr('Read check passed', '读取验证通过') : conn.connected ? tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证') : tr('Connecting tools', '正在连接工具'), failed ? 'badge bad' : 'badge');
+    if (failed) el(card, 'p', serverError({error: conn.test.reason, incident: conn.test.incident}, 422).message, 'error').setAttribute('role', 'alert');
     if (conn.kind === 'demo') el(card, 'p', tr('Synthetic data. Notes reset when the connector restarts.', '模拟数据。连接器重启后笔记会重置。'), 'hint');
     if (conn.kind === 'reminders') el(card, 'p', tr('Experimental. Requires a helper in the account owner’s Mac login session.', '实验性功能。需要在账号所有者的 Mac 登录会话中运行辅助服务。'), 'hint');
     const actions = el(card, 'div', undefined, 'actions');
     if (conn.kind) {
-      button(actions, tr('Test connection', '验证连接'), async () => { await api('connections/test', {id: conn.id}); await refresh(); notify(tr('Read-only connection check passed.', '只读连接验证通过。')); }, 'primary');
+      button(actions, tr('Test connection', '验证连接'), async () => {
+        try { await api('connections/test', {id: conn.id}); }
+        catch (error) { if (state) await refresh(); throw error; }
+        await refresh(); notify(tr('Read-only connection check passed.', '只读连接验证通过。'));
+      }, 'primary', tr('Testing connection…', '正在验证连接…'));
       button(actions, tr('Edit & review', '编辑并审阅'), () => connectorForm(conn));
     }
     button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permission rules will be removed.', '该连接器的工具和权限规则将一起移除。'), async () => mutate('connections/remove', {id: conn.id})), 'danger');
@@ -310,6 +417,7 @@ function connectorForm(existing) {
       }, 'primary');
     }
     if (['imap', 'caldav'].includes(kind.value)) el(dynamic, 'p', tr('iCloud uses an app-specific password. The connector exposes read operations only.', 'iCloud 使用 App 专用密码。连接器只提供读取操作。'), 'hint');
+    if (kind.value === 'imap') el(dynamic, 'p', tr('For iCloud Mail, use the mailbox username (the part before @icloud.com), or try the full iCloud Mail address.', 'iCloud Mail 用户名通常为邮箱地址中 @icloud.com 前面的部分；也可以尝试完整的 iCloud 邮箱地址。'), 'muted');
   }
   kind.addEventListener('change', fields); fields();
   function values() {
@@ -341,7 +449,7 @@ async function resumeGoogle() {
   if (!gmailResult) return;
   const id = gmailResult; gmailResult = null; history.replaceState(null, '', '/admin/');
   try { const result = await api('oauth/complete', {id}); tab = 'connections'; render(); showReview(result); }
-  catch (error) { notify(errorText(error)); }
+  catch (error) { showError(app, error); }
 }
 function permissions() {
   el(app, 'h1', tr('Inspect permissions', '检查权限'));
@@ -365,12 +473,20 @@ function permissions() {
       const box = modal(tr('Argument limits', '参数限制')); el(box, 'p', tr('These restrictions apply to everyone using this exposed tool. Fixed arguments are hidden from agents. Changes invalidate pending approvals.', '这些限制适用于所有调用此工具的身份。固定参数对 Agent 隐藏。修改会使未使用的审批失效。'), 'muted');
       const pin = field(box, tr('Fixed arguments (JSON object)', '固定参数（JSON 对象）'), 'pin', JSON.stringify(tool.pin, null, 2), 'textarea');
       const allow = field(box, tr('Allowed values (JSON object of arrays)', '允许值（值为数组的 JSON 对象）'), 'allow_values', JSON.stringify(tool.allow_values, null, 2), 'textarea');
-      button(box, tr('Save restrictions', '保存限制'), async () => { await mutate('tools/restrict', {connection: conn.id, tool: tool.name, pin: JSON.parse(pin.value), allow_values: JSON.parse(allow.value)}); box.close(); }, 'primary');
+      button(box, tr('Save restrictions', '保存限制'), async () => {
+        let fixed, allowed;
+        try { fixed = JSON.parse(pin.value); } catch { throw new Error(tr('Fixed arguments: invalid JSON. Check quotes and commas.', '固定参数：JSON 格式错误，请检查引号和逗号。')); }
+        try { allowed = JSON.parse(allow.value); } catch { throw new Error(tr('Allowed values: invalid JSON. Check quotes and commas.', '允许值：JSON 格式错误，请检查引号和逗号。')); }
+        await mutate('tools/restrict', {connection: conn.id, tool: tool.name, pin: fixed, allow_values: allowed}); box.close();
+      }, 'primary');
     });
   }
 }
 async function main() {
-  try { const status = await api('status'); if (status.authenticated) { csrf = status.csrf; await refresh(); await resumeGoogle(); } else await welcome(status.initialized); }
+  try {
+    const status = await api('status'); if (status.authenticated) { csrf = status.csrf; await refresh(); await resumeGoogle(); } else await welcome(status.initialized);
+    if (navigationError) { const error = JSON.parse(navigationError.content); showError(app, serverError(error, error.status)); }
+  }
   catch (error) { app.replaceChildren(); el(app, 'p', errorText(error), 'error'); }
 }
 main();

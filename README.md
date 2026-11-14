@@ -173,6 +173,11 @@ custom connectors remain a host configuration task.
 Connector preview shows progress and reports validation or network errors inside
 the open dialog, retaining entered values for correction. Preview reads tool
 definitions; the separate read check verifies account access.
+Read-check failures stay on the connector card, with separate reasons for rejected
+credentials, TLS/DNS/network failures, provider permissions, and changed tool
+definitions. Other form errors stay on the current page or dialog. Server errors
+include an error ID that can be matched to the audit log without exposing passwords
+or upstream response bodies; OAuth callback failures also render the normal console.
 
 Web changes override the five account sections (`principals`, `shared`, `clients`,
 `connections`, `policy`) from YAML after the first save. `agw check` includes those
