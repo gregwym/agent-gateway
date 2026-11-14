@@ -6,7 +6,7 @@
 
 ## 1. 结论
 
-- 自己写一个很小的 Gateway：核心约 2,250 行 Python（含注释），审批页面约 200 行，自带的 Connector 约 1,400 行。
+- 自己实现家庭账号隔离、审批、可选网页管理和连接器封装。
   协议、传输、鉴权中间件、加密、WebAuthn、IMAP、CalDAV 全部复用成熟库。
 - 身份只来自客户端出示的 Bearer Token：一个 Token 对应一个 client，一个 client 对应一个 principal。
 - 每个 `(service, account)` 是一条独立的上游连接，只拿到自己账号的凭据。
@@ -18,7 +18,7 @@
   没有配置审批页面时，`approval_required` 的工具永远不会执行。目前没有任何自带的写工具。
 - 真正的安全边界是 **Gateway 运行在哪台机器上**，代码管不了这件事。
 - **Connector 和审批都只对本地的替身服务测试过**（见第 10 节），没有连过真实的 iCloud、Google 账号，
-  也没有用真实的浏览器和认证器走过审批。需要你亲自验证的清单在 [deployment.md](deployment.md) 的「需要你亲自验证的事」一节。
+  真实 Chromium 加虚拟认证器已覆盖注册、管理和审批；实体认证器尚未实测。真实账号的检查清单见 [deployment.md](deployment.md)。
 
 ## 2. 现成开源方案评估（2026-11）
 
@@ -26,7 +26,7 @@
 |---|---|---|---|
 | [TBXark/mcp-proxy](https://github.com/TBXark/mcp-proxy) | Go 单二进制，MIT | 每个上游一个路径，各自的 `authTokens`；`toolFilter` 白名单 | 没有「principal」概念（按路径+Token 拼出来）；无定义锁定、无参数固定、无结构化审计、无密钥存储、调用路径上没有审批挂载点 |
 | [agentgateway](https://github.com/agentgateway/agentgateway) | Rust，Apache-2.0 | JWT 鉴权 + CEL 规则按 `jwt.sub` / `mcp.tool.name` 授权，会过滤 `tools/list` | 需要自己签发 JWT；功能面大（A2A、LLM 路由、xDS）；同样没有定义锁定、参数固定和凭据存储 |
-| [MCPHub](https://github.com/samanhappy/mcphub) | TypeScript，Apache-2.0 | 用户、分组、Dashboard | 带管理后台和数据库，正是本项目不想要的那部分复杂度 |
+| [MCPHub](https://github.com/samanhappy/mcphub) | TypeScript，Apache-2.0 | 用户、分组、Dashboard | 仍需验证账号隔离、工具定义锁定与精确调用审批的语义 |
 | [docker/mcp-gateway](https://github.com/docker/mcp-gateway) | Go，MIT | 容器化运行上游、按 profile 的工具白名单 | 围绕 Docker Desktop MCP Toolkit 和 catalog 设计；没有按调用者的身份隔离 |
 | [IBM ContextForge](https://github.com/IBM/mcp-context-forge) | Python，Apache-2.0 | 几乎什么都有 | 企业级体量：RBAC、多租户、插件、Redis/数据库 |
 | [sparfenyuk/mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) | Python，MIT | stdio ↔ HTTP 传输桥 | 只是桥，没有身份和策略 |
@@ -63,7 +63,7 @@ Agent ──HTTP(Streamable)──► /mcp
 
 每一步失败都是拒绝。第 2、3 步的拒绝对 Agent 表现为同一个 `Unknown tool`，无法探测别人有哪些工具。
 
-数据模型只有五个概念，全部写在一个 YAML 里：
+调用权限模型有五个概念，由 YAML 或网页管理的加密状态声明：
 
 | 概念 | 含义 |
 |---|---|
@@ -76,9 +76,10 @@ Agent ──HTTP(Streamable)──► /mcp
 「principal + service + account + tool + resource」的映射方式：service 和 account 是 connection 的属性，
 resource 用 `pin` / `allow_values` 表达（同一个上游工具可以用不同的暴露名、不同的 pin 暴露多次）。
 
-刻意没有的东西：管理 API、热加载、通配符、角色。改权限 = 在 Gateway 主机上改文件并重启。
-唯一的数据库是启用审批后的一个 SQLite 文件（待审批的请求和 Passkey 公钥），唯一的网页是审批页面。
-Agent 通过网络能改变的 Gateway 状态只有一种：发起一个待审批的请求（每个 client 同时最多 5 个）。
+默认仍是 YAML + 重启。显式配置 `admin` 后，`/admin/` 提供 Passkey 管理员会话和受保护的管理 API。
+管理员由主机配置的 `admin.owner` 指定，普通家庭成员、MCP Token、Tailscale 可达性都不授予管理角色。
+SQLite 保存审批、公钥和管理员会话；`admin.enc` 加密保存网页修改的配置、凭据和工具锁。
+Agent 通过 MCP 能改变的管理状态仍只有发起待审批请求（每个 client 同时最多 5 个）。
 
 ### 模块
 
@@ -95,6 +96,8 @@ Agent 通过网络能改变的 Gateway 状态只有一种：发起一个待审�
 | `passkey.py`、`static/` | Passkey 审批：请求的存储、WebAuthn 验证、审批页面 |
 | `audit.py` | JSONL 审计日志，字段白名单 |
 | `cli.py` | `agw serve / check / lock / token / secret / approval` |
+| `admin*.py`、`static/admin.*` | 一次性初始化、Passkey 管理会话、成员和 Token、连接器目录、Google 网页授权、权限编辑 |
+| `runtime.py` | 等待在途 MCP 请求结束，原子切换有效配置；Token 鉴权在相同读取租约内 |
 | `connectors/` | 自带的 Connector，每个是一个独立进程；Gateway 核心不引用它们 |
 
 ## 4. 复用与自研
@@ -373,7 +376,7 @@ Amazon 的 SP-API 是卖家接口，不是消费者订单接口。
 | OS Keychain / 外部 Secret Manager | 没有，只有加密文件。`SecretStore` 是一个四个方法的协议，以后可以替换 |
 | 主密钥轮换命令 | 没有。重新 `secret init` 并重新录入凭据 |
 | 审批的主动通知（推送、消息） | 没有。等待地址由 Agent 转告 |
-| 热加载、管理 API | 刻意没有 |
+| 网页配置、管理 API | 显式启用 `admin` 后可用；主机路径、管理员身份、域名和任意进程命令不开放给网页 |
 
 ## 10. 安全测试对照
 
@@ -400,6 +403,25 @@ Amazon 的 SP-API 是卖家接口，不是消费者订单接口。
 | 提醒事项经两层网关 | `test_reminders_gateway.py` | 两个独立 EventKit 替身进程；真实 HTTP 网关串联；列表、详情、完成状态、账号隔离、审计脱敏 |
 | 容器部署 | `test_deployment.py` | 实际镜像、独立临时卷；非 root、只读挂载、无 capabilities、审批跨重启保留、Connector 恢复 |
 | 示例配置可用 | `test_config.py` | 两份示例填好后能加载；household 示例引用的工具名和 pin 参数在 Connector 里真实存在 |
+| 网页初始化和管理权限 | `test_admin.py` | 一次性初始化、域名和 UV 校验、会话撤销、CSRF、成员不能成为管理员、写盘失败、在途调用与 Token 撤销 |
+| 网页 Google 授权 | `test_admin_oauth.py` | 仿 Google；state 和 PKCE、会话绑定、只读 scope、令牌不回浏览器、撤销和过期 |
+| 网页完整操作 | `test_admin_browser.py` | 英文桌面、中文手机；注册、成员、Token、连接器审阅和验证、跨账号授权、参数限制、退出再登录 |
+
+### 网页管理的额外边界
+
+首次设置链接由主机生成，24 小时有效，保存在权限 `0600` 的 `admin-setup-link` 文件里；公共页面不返回此链接。
+注册码和会话 Cookie 在数据库中只保存哈希。管理员身份固定在 YAML 中，家庭成员邀请只注册该成员的审批 Passkey。
+HTTPS 管理会话使用 `__Host-`、Secure、HttpOnly、SameSite=Strict Cookie，最多一小时；每个 POST 需要精确 Origin、JSON，
+已登录操作还需要会话专属 CSRF Token。MCP Bearer Token 不被管理入口接受。
+
+网页只提供固定 Connector 目录，不能上传脚本或任意设置命令。新增或编辑连接器先生成绑定当前会话和配置版本的临时预览，
+用户确认工具定义后才持久化。预览和 OAuth 中间凭据仅在内存保留，10 分钟过期并定期清理；Google Token 留在服务端。
+工具进程可启动不代表真实账号登录成功，所以「工具已连接」与实际只读验证分别显示。
+
+新配置先经完整模型和工具 schema 校验，再等待在途请求结束（最多 30 秒），原子写入加密状态并切换运行实例。
+等待超时或写盘失败不会发布新配置。鉴权在请求租约内，所以撤销的 Token 不能在新配置里继续使用旧鉴权结果。
+网页配置版本参与审批绑定；每次更新会取消未使用审批，即使在状态写入后发生崩溃，旧审批也不能用于新配置。
+管理会话意味着能修改权限、登记成员公钥及录入凭据，应只在可信的人用的浏览器中登录。它不属于 Agent 的接入配置。
 
 替身服务和真实服务的差别是这些测试证明不了的部分：Apple 和 Google 的服务器对边界情况的处理（非 ASCII 搜索、
 超大邮箱、限流、特殊的登录名形式）只能在真实账号上发现。

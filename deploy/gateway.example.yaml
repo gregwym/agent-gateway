@@ -3,8 +3,9 @@
 # (`agw secret set`). Until then it is rejected, on purpose.
 # For real accounts (iCloud Mail, calendars, Gmail) see gateway.household.example.yaml.
 #
-# Read once at startup. No hot reload, no admin API: changing access means editing
-# this file on the gateway host and restarting. Unknown keys are errors.
+# YAML mode: read once at startup; changing access means editing this file and
+# restarting. Optional web management is shown in gateway.web.example.yaml.
+# Unknown keys are errors.
 #
 # Relative paths are relative to this file. The layout assumed here:
 #   <home>/config/gateway.yaml   <home>/secrets/   <home>/key/   <home>/state/

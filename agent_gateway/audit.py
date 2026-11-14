@@ -21,7 +21,7 @@ FIELDS = frozenset(
     {
         "client", "principal", "tool", "connection", "service", "account", "upstream_tool",
         "decision", "reason", "duration_ms", "result_bytes", "is_error", "arg_keys",
-        "remote", "detail", "approval", "approver",
+        "remote", "detail", "approval", "approver", "revision",
     }
 )  # fmt: skip
 

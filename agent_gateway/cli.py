@@ -62,12 +62,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(args.config)
     gateway = Gateway(cfg, Lock.load(cfg.lock_file), resolve_secrets(cfg), Audit(cfg.audit.path, cfg.audit.retention_days))
+    app = build_app(gateway)
+    gateway = app.state.runtime.gateway
     unusable = {name: route.problem for name, route in gateway.routes.items() if route.problem}
     for name, problem in unusable.items():
         logging.getLogger("agent_gateway").warning("tool %s is not served: %s", name, problem)
     gateway.audit.write("startup", detail=f"tools={len(gateway.routes)} unusable={len(unusable)}")
     uvicorn.run(
-        build_app(gateway),
+        app,
         host=args.host or cfg.server.host,
         port=args.port or cfg.server.port,
         log_level="info",
@@ -84,6 +86,12 @@ def cmd_check(args: argparse.Namespace) -> int:
     lock = Lock.load(cfg.lock_file)
     # Built without secrets: this only inspects routes, it never connects.
     gateway = Gateway(cfg, lock, {name: "" for c in cfg.connections for name in c.secret_names()}, Audit(None))
+    if cfg.admin:
+        from .admin_config import ManagedStore
+        gateway.secrets = resolve_secrets(cfg)
+        store = ManagedStore(gateway)
+        cfg, lock, values = store.effective(store.state)
+        gateway = Gateway(cfg, lock, values, Audit(None))
     policy = Policy(cfg)
     problems: list[str] = []
 
@@ -128,7 +136,8 @@ def cmd_check(args: argparse.Namespace) -> int:
             hint = " (run `agw lock`)" if route.problem == "not_locked" else ""
             problems.append(f"tool {name} will not be served: {route.problem}{hint}")
     try:
-        resolve_secrets(cfg)
+        if not cfg.admin:
+            resolve_secrets(cfg)
     except (SecretStoreError, ConfigError) as exc:
         problems.append(str(exc))
 
@@ -247,6 +256,11 @@ def cmd_approval(args: argparse.Namespace) -> int:
     from .passkey import PasskeyApprover, Refused
 
     cfg = load_config(args.config)
+    if cfg.admin:
+        from .admin_config import ManagedStore
+        base = Gateway(cfg, Lock.load(cfg.lock_file), resolve_secrets(cfg), Audit(None))
+        store = ManagedStore(base)
+        cfg, _, _ = store.effective(store.state)
     if cfg.approvals is None:
         raise ConfigError("no `approvals:` section is configured")
     approver = PasskeyApprover(cfg.approvals, Audit(cfg.audit.path, cfg.audit.retention_days), cfg.audit.retention_days)
@@ -282,6 +296,21 @@ def cmd_approval(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_admin(args: argparse.Namespace) -> int:
+    from .admin_auth import AdminAuth
+    from .passkey import PasskeyApprover, Refused
+    cfg = load_config(args.config)
+    if not cfg.admin:
+        raise ConfigError("web administration is not enabled")
+    approver = PasskeyApprover(cfg.approvals, Audit(cfg.audit.path, cfg.audit.retention_days))
+    try:
+        print(AdminAuth(cfg, approver).setup_link(rotate=args.rotate))
+        return 0
+    except Refused as exc:
+        print(f"error: {exc.code}", file=sys.stderr)
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agw", description="Personal / family MCP gateway")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -310,6 +339,10 @@ def main(argv: list[str] | None = None) -> int:
     p_approval.add_argument("action", choices=["enroll", "passkeys", "forget", "requests", "cancel"])
     p_approval.add_argument("name", nargs="?", help="a person (enroll), a passkey id (forget) or a request id (cancel)")
     p_approval.set_defaults(func=cmd_approval)
+    p_admin = with_config("admin", "get the private first-run web setup link")
+    p_admin.add_argument("action", choices=["setup"])
+    p_admin.add_argument("--rotate", action="store_true", help="invalidate the previous setup link")
+    p_admin.set_defaults(func=cmd_admin)
 
     args = parser.parse_args(argv)
     os.umask(0o077)  # whatever these commands write (lock file, secret store, audit log) is owner-only

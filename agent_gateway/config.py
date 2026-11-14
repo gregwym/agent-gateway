@@ -1,7 +1,7 @@
 """Configuration: the single place where clients, connections and policy are declared.
 
-Everything here is static. There is no admin API and no hot reload: the file is
-read once at startup, and a change needs a restart by whoever controls the host.
+The host file is read at startup. Optional web administration stores encrypted
+overrides for account/client/policy sections; host settings remain immutable.
 Unknown keys are rejected so a typo cannot silently widen or drop a rule.
 """
 
@@ -88,6 +88,14 @@ class ClientCfg(_Model):
     id: str = Field(pattern=NAME)
     principal: str
     token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AdminCfg(_Model):
+    """Opt-in web administration; the host assigns the administrator identity."""
+
+    owner: str = Field(pattern=NAME)
+    state: Path
+    session_seconds: int = Field(1800, ge=60, le=3600)
 
 
 class ToolCfg(_Model):
@@ -185,6 +193,7 @@ class Config(_Model):
     audit: AuditCfg
     secrets: SecretsCfg | None = None
     approvals: ApprovalsCfg | None = None
+    admin: AdminCfg | None = None
     lock_file: Path = Path("tools.lock.json")
     principals: list[str] = Field(min_length=1)
     # Principals whose accounts are meant to be shared, e.g. `household`.
@@ -200,6 +209,11 @@ class Config(_Model):
                 raise ValueError(f"invalid principal name {principal!r}")
         _unique("principal", self.principals)
         known = set(self.principals)
+        if self.admin:
+            if not self.approvals or not self.secrets:
+                raise ValueError("admin requires approvals and an encrypted secrets store")
+            if self.admin.owner not in known or self.admin.owner in self.shared:
+                raise ValueError("admin.owner must name a non-shared principal")
         for name in self.shared:
             if name not in known:
                 raise ValueError(f"shared: unknown principal {name!r}")
@@ -318,4 +332,6 @@ def load_config(path: str | Path) -> Config:
         )
     if cfg.approvals:
         updates["approvals"] = cfg.approvals.model_copy(update={"store": located(cfg.approvals.store)})
+    if cfg.admin:
+        updates["admin"] = cfg.admin.model_copy(update={"state": located(cfg.admin.state)})
     return cfg.model_copy(update=updates)

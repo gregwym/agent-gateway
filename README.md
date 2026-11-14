@@ -15,11 +15,11 @@ the upstream calls with **credentials the agent never sees**.
                                  arguments → audit
 ```
 
-The gateway is about 2,250 lines of Python (comments included) on top of the official
-[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk); the bundled
-read-only connectors are about 1,400 more. There is no admin API and no dashboard:
-one YAML file, one lock file, one encrypted secret file, one audit log and, when
-approvals are enabled, one SQLite file and one web page.
+The gateway uses the official [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
+It can be managed with YAML and CLI commands, or an **opt-in web console** with
+passkey administrator login, family onboarding, agent tokens, connector setup,
+and permission checks. Web-managed configuration and credentials are encrypted;
+the host's YAML, key and original secret store stay read-only.
 
 **Status.** The gateway core, passkey approval and read-only connectors for iCloud
 Mail, iCloud Calendar and Gmail are implemented and tested against local stand-ins
@@ -61,6 +61,11 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
 - **Read-only connectors included.** iCloud Mail (IMAP), iCloud Calendar (CalDAV) and
   Gmail, one process per account, searching and reading on demand: no mailbox is
   synchronised or indexed. See [bundled connectors](#bundled-connectors).
+- **Browser onboarding and administration.** A private, one-time setup link creates
+  the administrator passkey. Sign in to add members, invite their passkeys, issue,
+  rotate or revoke agent tokens, review connector definitions, test read access,
+  and edit per-tool permissions and argument limits. Agent bearer tokens cannot
+  access the console. Gmail offers browser OAuth with read-only consent.
 
 ## What it does not do
 
@@ -88,7 +93,7 @@ Read this list before trusting it with real accounts. Details and reasons are in
   results are returned as they are. The gateway bounds what a misled model can
   *do* (its tools, its accounts); it does not stop the model from being misled.
 - **Only MCP tools.** Resources, prompts, sampling and elicitation are not proxied.
-- **No TLS, no rate limiting, no hot reload, no OS-keychain backend, no OAuth for
+- **No built-in TLS, no general rate limiting, no OS-keychain backend, no OAuth for
   clients.** Put it on a tailnet or behind a TLS terminator.
 - **No generic HTTP, shell or SSH tools, by design.**
 
@@ -130,6 +135,45 @@ To try the approval flow, run `agw approval enroll person_a` and open the link i
 prints in a browser on the same machine (the example config uses
 `http://localhost:8080`) to create a passkey. Call `a_notes_add` again: the answer
 now names a page where the request waits. Open it, approve, and repeat the same call.
+
+## Web onboarding
+
+Start from [gateway.web.example.yaml](deploy/gateway.web.example.yaml) for an empty
+gateway, or add this to an existing configuration that already enables approvals
+and encrypted credentials:
+
+```yaml
+admin:
+  owner: person_a                   # a non-shared principal, assigned by the host
+  state: ../state/admin.enc
+```
+
+The operator initializes the master key once (`agw secret init`) and starts the
+gateway. On first startup the private setup URL is saved as
+`state/admin-setup-link` (mode `0600`, valid for 24 hours); `agw admin setup`
+prints it, and `agw admin setup --rotate` replaces an expired/lost link. Give it
+directly to the intended administrator. Opening the public home page does not
+grant ownership. If that principal already has a passkey, sign in with it instead.
+
+From then on use `/admin/`: register the administrator passkey, add household
+members, connect an account (or demo notes), review its definitions, run its read
+check, and create a separate token for each agent. Tokens are shown once. Members
+receive a private 15-minute passkey registration link; membership alone does not
+make someone an administrator. The console is available in English and Chinese.
+
+Changes wait up to 30 seconds for active calls to finish, then atomically save and
+apply; busy calls leave the configuration unchanged. Every change invalidates
+outstanding approvals. Sessions last 30 minutes, are revocable, and cannot be
+used as MCP tokens. Host paths, administrator identity, origin, and subprocess
+commands cannot be changed through the browser. Connectors use a fixed catalog;
+custom connectors remain a host configuration task.
+
+Web changes override the five account sections (`principals`, `shared`, `clients`,
+`connections`, `policy`) from YAML after the first save. `agw check` includes those
+changes. Back up `admin.enc` and `approvals.sqlite` along with the original files;
+keep the encryption key separately. Disabling web administration also disables
+its overrides, so migration back to YAML requires an intentional host-side export.
+See [deployment instructions](docs/deployment.md#网页-onboarding-可选).
 
 ## Docker Compose
 

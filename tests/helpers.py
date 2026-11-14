@@ -179,6 +179,7 @@ class Running:
     base: str
     gateway: Gateway
     cfg: Config
+    app: Any = None
 
     def audit(self) -> list[dict[str, Any]]:
         path = self.cfg.audit.path
@@ -200,9 +201,8 @@ async def running_gateway(config_path: Path, approver: Any = None, *, port: int 
     cfg = load_config(config_path)
     audit = Audit(cfg.audit.path, cfg.audit.retention_days)
     gateway = Gateway(cfg, Lock.load(cfg.lock_file), resolve_secrets(cfg), audit, approver=approver)
-    server = uvicorn.Server(
-        uvicorn.Config(build_app(gateway), host="127.0.0.1", port=port, log_level="error", **SERVE_OPTIONS)
-    )
+    app = build_app(gateway)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", **SERVE_OPTIONS))
     async with anyio.create_task_group() as tg:
         tg.start_soon(server.serve)
         with anyio.fail_after(15):
@@ -211,7 +211,7 @@ async def running_gateway(config_path: Path, approver: Any = None, *, port: int 
         port = server.servers[0].sockets[0].getsockname()[1]
         base = f"http://127.0.0.1:{port}"
         try:
-            yield Running(url=f"{base}/mcp", base=base, gateway=gateway, cfg=cfg)
+            yield Running(url=f"{base}/mcp", base=base, gateway=gateway, cfg=cfg, app=app)
         finally:
             server.should_exit = True
             audit.close()
