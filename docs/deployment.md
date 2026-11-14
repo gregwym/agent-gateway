@@ -323,9 +323,56 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 
 哪一项和预期不符，把现象和对应时间的审计日志行（里面没有内容）发给我就够定位了。
 
+## 网页 onboarding（可选）
+
+使用 `deploy/gateway.web.example.yaml` 可以从空网关开始；也可以在已启用 `approvals` 和 `secrets` 的配置里加：
+
+```yaml
+admin:
+  owner: person_a
+  state: ../state/admin.enc
+  session_seconds: 1800
+```
+
+`owner` 必须是现有的非共享身份，由部署者指定。`approvals.origin` 填最终 HTTPS 域名，`server.allowed_hosts`
+填对应的主机名。以 Tailscale Services 发布时，两处都用 Service 的域名。主机端发布 Service 和控制台批准主机后，
+还需要一条允许客户端访问 `svc:<服务名>` 的 `tcp:443` grant；主机批准不会自动授予客户端访问权限。
+
+部署者初始化一次主密钥（`docker compose run --rm admin secret init`），启动后首次设置链接会写在
+`data/state/admin-setup-link`。也可运行 `docker compose run --rm admin admin setup` 查看；链接丢失或过期用
+`docker compose run --rm admin admin setup --rotate` 更新。链接 24 小时有效，只能成功初始化一次；注册后文件删除。
+把此链接私下交给管理员。若该身份已有 Passkey，则直接打开 `/admin/` 登录，不再生成初始化链接。
+
+管理员随后全部在网页操作：
+
+1. 打开设置链接，用 Touch ID、设备密码或安全密钥创建 Passkey。
+2. 在「家庭成员」添加个人或共享身份；个人使用网页生成的 15 分钟邀请链接注册审批 Passkey。
+3. 在「连接器」添加模拟笔记、IMAP、CalDAV、Gmail 或 HTTPS Reminders helper，审阅工具定义后应用。
+4. 点「验证连接」执行一次真正的只读请求。只启动了工具进程不表示上游账号凭据有效。
+5. 在「权限」选择身份，查看/修改工具授权；跨个人账号需要勾选明确授权。参数限制适用于该暴露工具的所有调用方。
+6. 在「Agent 接入」创建独立 Token，复制一次显示的值及 MCP 地址到客户端。轮换和撤销在网页即时生效。
+
+Gmail 可直接点「通过 Google 授权」。在 Google Cloud 创建 **Web 应用** OAuth 客户端，把网页显示的
+`https://<网关域名>/admin/oauth/google/callback` 登记为重定向 URI。需要 `gmail.readonly`、离线授权和刷新令牌；
+服务端校验 scope、state、PKCE，并在审阅时显示已授权邮箱供核对。刷新令牌不会返回浏览器。
+也可以在网页录入已有刷新令牌；原来的 Desktop OAuth CLI 仍可用于 YAML 部署。
+Google Cloud 的测试用户/发布设置仍由账号所有者完成，相关限制见上面的 Gmail 一节和
+[Google 的 Web Server OAuth 文档](https://developers.google.com/identity/protocols/oauth2/web-server)。
+
+网页新增凭据和配置保存在 `admin.enc`，主密钥、原有 YAML/lock/secret 挂载继续只读。备份需包含该加密文件和
+`approvals.sqlite`，主密钥单独保存。第一次网页保存后，五个账号配置段由加密状态覆盖 YAML；主机设置仍来自 YAML。
+网页不支持任意命令/自定义连接器部署。停用 `admin` 会停用这些覆盖，迁回 YAML 前需由部署者整理出有效配置。
+
+管理会话默认 30 分钟。变更等待正在执行的调用结束，最多 30 秒；超时可稍后重试。每次修改会使旧审批失效。
+最后一个管理员 Passkey 不能从网页删除；所有设备都丢失时，由主机管理员用 `agw approval enroll <admin.owner>`
+生成恢复注册链接，再从网页撤销丢失的 Passkey。
+
 ## 9. 日常操作
 
-**改权限**：改 `gateway.yaml` → `check` → `docker compose restart gateway`。没有热加载，这是有意的。
+启用网页管理时，优先使用 `/admin/` 完成成员、Token、连接器和权限操作；`agw check` 会显示包含网页覆盖的有效配置。
+以下命令流程用于未启用网页管理的 YAML 模式。
+
+**改权限**：改 `gateway.yaml` → `check` → `docker compose restart gateway`。
 
 **上游工具定义变了**：Gateway 会自动下线该工具，并在审计日志里写一条 `tool_blocked`（`definition_changed` /
 `missing_upstream`）。处理方式：`lock` 看 diff → 确认无害后 `lock --write` → 重启。升级 Connector 版本后必然要走一遍。
@@ -355,6 +402,7 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 |---|---|---|
 | `key/master.key` | 解密 `secrets.enc` 的密钥 | **只**放密码管理器，不进入任何自动备份 |
 | `secrets/secrets.enc` | 加密后的上游凭据 | 可以随常规备份；没有密钥时无法解开 |
+| `state/admin.enc` | 网页管理的配置、Token 哈希、工具定义和加密凭据（启用网页时） | 与配置一起备份，主密钥仍单独保存 |
 | `config/gateway.yaml`、`config/tools.lock.json` | 配置和已审阅的工具定义；只含 Token 的哈希 | 常规备份，或放私有仓库 |
 | `state/approvals.sqlite` | 已登记 Passkey 的公钥、近期审批请求 | 可以备份，也可以不备份：丢了的后果是每个人重新登记一次。它不含私钥，但含待处理请求的参数 |
 | `state/audit/` | 审计日志 | 按需 |

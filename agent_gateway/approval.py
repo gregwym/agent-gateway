@@ -54,6 +54,7 @@ class ApprovalRequest:
     owner: str = ""
     # The principals whose decision counts: the account's owner, or every person for a shared account.
     approvers: tuple[str, ...] = ()
+    configuration_revision: str = ""
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     created_at: float = field(default_factory=time.time)
     ttl_seconds: int = 300
@@ -76,6 +77,7 @@ class ApprovalRequest:
                     "account": self.account,
                     "upstream_tool": self.upstream_tool,
                     "arguments_sha256": self.arguments_sha256,
+                    **({"configuration_revision": self.configuration_revision} if self.configuration_revision else {}),
                 }
             )
         ).hexdigest()

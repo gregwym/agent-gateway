@@ -174,6 +174,9 @@ class Gateway:
         approver: Approver | None = None,
     ) -> None:
         self.cfg = cfg
+        self.lock = lock
+        self.secrets = dict(secrets)
+        self.configuration_revision = ""
         self.audit = audit
         self.policy = Policy(cfg)
         self.approver: Approver = approver or make_approver(cfg, audit)
@@ -285,6 +288,7 @@ class Gateway:
             arguments=final_arguments,
             owner=route.conn.owner,
             approvers=self.cfg.approvers_of(route.conn),
+            configuration_revision=self.configuration_revision,
         )
         decision = await self.approver.authorize(request)
         approval = decision.approval_id
@@ -353,18 +357,35 @@ class _AuditAuthFailures:
 
 
 def build_app(gateway: Gateway) -> Starlette:
+    from .runtime import Runtime
+
+    runtime = Runtime(gateway)
+    admin = None
+    if gateway.cfg.admin:
+        from .admin import AdminController
+        admin = AdminController(runtime)
+    gateway = runtime.gateway
     cfg = gateway.cfg
+
+    async def list_tools(ctx, params):
+        return await runtime.gateway.list_tools(ctx, params)
+
+    async def call_tool(ctx, params):
+        return await runtime.gateway.call_tool(ctx, params)
     server: Server[Any] = Server(
         "agent-gateway",
         version=__version__,
-        on_list_tools=gateway.list_tools,
-        on_call_tool=gateway.call_tool,
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
         # Called before the caller is known, so it must not reveal anything: no schema, no validation.
         get_tool_input_schema=lambda name: None,
     )
     server.middleware.clear()  # the SDK's default is a telemetry hook; the gateway emits none
 
     hosts = list(cfg.server.allowed_hosts)
+    if admin and not hosts:
+        from urllib.parse import urlsplit
+        hosts = [urlsplit(cfg.approvals.origin).netloc]
     manager = StreamableHTTPSessionManager(
         app=server,
         # Stateless: every request is authenticated and authorised on its own, and
@@ -376,17 +397,28 @@ def build_app(gateway: Gateway) -> Starlette:
         ),
     )
     # The SDK's bearer backend + guard: no valid token, no MCP.
-    mcp_endpoint = RequireAuthMiddleware(StreamableHTTPASGIApp(manager), required_scopes=[])
+    class Verifier:
+        async def verify_token(self, token):
+            return await StaticTokenVerifier(list(runtime.gateway.cfg.clients)).verify_token(token)
+
+    authenticated = AuthenticationMiddleware(
+        RequireAuthMiddleware(StreamableHTTPASGIApp(manager), required_scopes=[]),
+        backend=BearerAuthBackend(Verifier()),
+    )
+
+    class MCPEndpoint:
+        async def __call__(self, scope, receive, send):
+            async with runtime.lease():
+                await authenticated(scope, receive, send)
+
+    mcp_endpoint = MCPEndpoint()
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        async with manager.run(), anyio.create_task_group() as tg:
-            for upstream in gateway.upstreams.values():
-                tg.start_soon(upstream.run)
-            try:
-                yield
-            finally:
-                tg.cancel_scope.cancel()
+        async with manager.run(), runtime.run():
+            if admin:
+                runtime.tasks.start_soon(admin.sweep)
+            yield
 
     async def healthz(request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
@@ -395,15 +427,18 @@ def build_app(gateway: Gateway) -> Starlette:
     # bearer token, and nothing on it changes anything without a passkey.
     approval_routes = getattr(gateway.approver, "http_routes", list)()
 
-    return Starlette(
+    app = Starlette(
         routes=[
             Route("/mcp", endpoint=mcp_endpoint),
             Route("/healthz", endpoint=healthz, methods=["GET"]),
             *approval_routes,
+            *(admin.http_routes() if admin else []),
         ],
         middleware=[
             Middleware(_AuditAuthFailures, audit=gateway.audit),
-            Middleware(AuthenticationMiddleware, backend=BearerAuthBackend(StaticTokenVerifier(list(cfg.clients)))),
         ],
         lifespan=lifespan,
     )
+    app.state.runtime = runtime
+    app.state.admin = admin
+    return app

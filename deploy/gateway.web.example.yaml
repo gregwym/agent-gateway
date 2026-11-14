@@ -1,0 +1,23 @@
+# Empty first-run configuration for browser onboarding. Change the HTTPS origin
+# and administrator identity before publishing it. The defaults allow local trials.
+server:
+  host: 127.0.0.1
+  port: 8080
+  allowed_hosts: ["localhost:8080"]
+audit:
+  path: ../state/audit/audit.jsonl
+secrets:
+  path: ../secrets/secrets.enc
+  key_file: ../key/master.key
+lock_file: tools.lock.json
+approvals:
+  origin: http://localhost:8080
+  store: ../state/approvals.sqlite
+admin:
+  owner: person_a
+  state: ../state/admin.enc
+principals: [person_a, household]
+shared: [household]
+clients: []
+connections: []
+policy: []

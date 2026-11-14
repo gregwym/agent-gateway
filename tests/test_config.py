@@ -33,6 +33,24 @@ def test_unknown_keys_are_rejected_everywhere(tmp_path):
     rejected(tmp_path, lambda raw: raw["server"].update(debug=True) if "server" in raw else raw.update(server={"debug": True}))
 
 
+def test_web_admin_requires_host_assigned_owner_and_encrypted_state(tmp_path):
+    from pathlib import Path
+    import yaml
+    raw = yaml.safe_load((Path(__file__).resolve().parent.parent / 'deploy/gateway.web.example.yaml').read_text())
+    target = tmp_path / 'gateway.yaml'
+    target.write_text(yaml.safe_dump(raw))
+    cfg = load_config(target)
+    assert cfg.admin.owner == 'person_a'
+    assert not cfg.clients and not cfg.connections
+    assert cfg.admin.state == tmp_path.parent / 'state/admin.enc'
+    for changes in ({'admin':{'owner':'household','state':'admin.enc'}},
+                    {'admin':{'owner':'unknown','state':'admin.enc'}},
+                    {'approvals':None}, {'secrets':None}):
+        target.write_text(yaml.safe_dump({**raw, **changes}))
+        with pytest.raises(ConfigError):
+            load_config(target)
+
+
 def test_there_are_no_wildcards(tmp_path):
     assert "is not a tool of connection" in rejected(tmp_path, lambda raw: raw["policy"][0].update(tools=["*"]))
     assert "is not a tool of connection" in rejected(tmp_path, lambda raw: raw["policy"][0].update(tools=["a_*"]))

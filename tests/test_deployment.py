@@ -33,7 +33,7 @@ def docker(*args, input=None, check=True):
 
 
 @contextmanager
-def deployed():
+def deployed(*, admin=False):
     image = os.environ["AGW_TEST_IMAGE"]
     name = "agw-acceptance-" + uuid.uuid4().hex[:12]
     volumes = {part: f"{name}-{part}" for part in ("config", "key", "secrets", "state")}
@@ -48,6 +48,8 @@ def deployed():
         for client in config["clients"]:
             client["token_sha256"] = hash_token(tokens[client["principal"]])
         config["approvals"]["origin"] = "http://localhost"
+        if admin:
+            config['admin'] = {'owner':'person_a','state':'../state/admin.enc'}
         seed = """
 import json, os, sys
 from pathlib import Path
@@ -169,3 +171,44 @@ else: raise AssertionError('demo connector was not running')
         for private in (TOKEN_A, TOKEN_B, TOKEN_HOUSE, note["text"], "fake-container-secret-"):
             assert private not in audit
         assert '"event":"approval_decided"' in audit
+
+
+async def test_web_onboarding_in_readonly_container_and_state_survives_restart():
+    with deployed(admin=True) as (name, image, mounts, base):
+        await healthy(base)
+        link = docker('exec', name, 'cat', '/state/admin-setup-link')
+        key = Authenticator()
+        headers = {'Host':'localhost','Origin':'http://localhost'}
+        async with httpx2.AsyncClient(base_url=base, headers=headers, trust_env=False) as http:
+            ceremony = (await http.post('/admin/api/auth/begin', json={'action':'setup','code':link.split('#setup=')[1]})).json()
+            registered = await http.post('/admin/api/auth/finish', json={'ceremony_id':ceremony['ceremony_id'], 'response':key.response(ceremony)})
+            assert registered.status_code == 200, registered.text
+            csrf = registered.json()['csrf']
+            http.headers['X-CSRF-Token'] = csrf
+            created = await http.post('/admin/api/clients/create', json={'revision':0,'id':'web-agent','principal':'person_a'})
+            assert created.status_code == 200, created.text
+            token = created.json()['token']
+            preview = await http.post('/admin/api/connections/preview', json={'revision':1,'id':'web-notes','owner':'person_a','kind':'demo'})
+            assert preview.status_code == 200, preview.text
+            applied = await http.post('/admin/api/connections/apply', json={'revision':1,'draft':preview.json()['draft'],'reviewed':True})
+            assert applied.status_code == 200, applied.text
+            cookies = http.cookies
+        docker('restart', name)
+        port = docker('port', name, '8080/tcp').rsplit(':',1)[1]
+        base = f'http://127.0.0.1:{port}'
+        await healthy(base)
+        async with httpx2.AsyncClient(base_url=base, headers=headers, cookies=cookies, trust_env=False) as http:
+            saved = await http.get('/admin/api/state')
+            assert saved.status_code == 200, saved.text
+            assert saved.json()['revision'] == 2
+            assert any(c['id']=='web-notes' for c in saved.json()['connections'])
+            assert token not in saved.text
+        async with agent(base + '/mcp', token, Host='localhost') as client:
+            assert 'web_notes_list' in await tool_names(client)
+            result = await client.call_tool('web_notes_list', {'folder':'inbox'})
+            assert not result.is_error and 'person_a' in text_of(result)
+        check = "from pathlib import Path; assert not Path('/state/admin-setup-link').exists(); assert Path('/state/admin.enc').stat().st_mode & 0o777 == 0o600"
+        docker('exec', name, 'python', '-c', check)
+        metadata = json.loads(docker('inspect', name))[0]
+        assert metadata['HostConfig']['ReadonlyRootfs']
+        assert not next(m for m in metadata['Mounts'] if m['Destination']=='/config')['RW']
