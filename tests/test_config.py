@@ -173,7 +173,7 @@ async def test_check_prints_the_access_table(tmp_path, capsys):
     household = out.split("\n  household\n", 1)[1]
     assert "a_family_notes" in household and "account of person_a" in household and "pinned: folder" in household
     assert "a_list_notes" not in household and "b_list_notes" not in household
-    assert "approval_required" in out and "never runs: no approval channel yet" in out
+    assert "approval_required" in out and "never runs: no `approvals:` section" in out
     assert "restricted: folder" in out and out.rstrip().endswith("OK")
     assert hash_token(TOKEN_A) not in out and "upstream-key" not in out
 

@@ -5,6 +5,7 @@
     agw lock   -c gateway.yaml [--write]  review / record upstream tool definitions
     agw token                           mint a client token and its hash
     agw secret -c gateway.yaml init|set NAME|rm NAME|list
+    agw approval -c gateway.yaml enroll PERSON|passkeys|forget ID|requests|cancel ID
 
 All of these are run by a human on the gateway host. None is reachable over the network.
 """
@@ -18,6 +19,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any
 
 import anyio
@@ -108,7 +110,10 @@ def cmd_check(args: argparse.Namespace) -> int:
             if route.problem:
                 notes.append(f"NOT SERVED ({route.problem})")
             if effect == "approval_required":
-                notes.append("never runs: no approval channel yet")
+                if cfg.approvals is None:
+                    notes.append("never runs: no `approvals:` section")
+                else:
+                    notes.append("each call needs a passkey approval by " + " or ".join(cfg.approvers_of(route.conn)))
             target = f"{route.conn.service}/{route.conn.account}:{route.tool.upstream}"
             print(f"    {effect:<17} {name:<32} {target}" + (f"  [{'; '.join(notes)}]" if notes else ""))
         if not rows:
@@ -231,6 +236,52 @@ def cmd_secret(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- approval ---------------------------------------------------------------------
+
+
+def _ago(stamp: int | None) -> str:
+    return "-" if not stamp else time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
+
+
+def cmd_approval(args: argparse.Namespace) -> int:
+    from .passkey import PasskeyApprover, Refused
+
+    cfg = load_config(args.config)
+    if cfg.approvals is None:
+        raise ConfigError("no `approvals:` section is configured")
+    approver = PasskeyApprover(cfg.approvals, Audit(cfg.audit.path, cfg.audit.retention_days), cfg.audit.retention_days)
+    try:
+        if args.action == "passkeys":
+            for key in approver.passkeys():
+                print(f"{key['id'][:16]}  {key['principal']:<20} registered {_ago(key['created'])}")
+            return 0
+        if args.action == "requests":
+            for row in approver.requests():
+                who = f"{row['client']} ({row['principal']})"
+                decided = f" by {row['decided_by']}" if row["decided_by"] else ""
+                result = f" -> {row['outcome']}" if row["outcome"] else ""
+                print(f"{row['id']}  {row['status'] + decided + result:<28} {_ago(row['created'])}  {row['tool']}  {who}")
+            return 0
+        if not args.name:
+            raise ConfigError(f"`agw approval {args.action}` needs an argument")
+        if args.action == "enroll":
+            people = [p for p in cfg.principals if p not in cfg.shared]
+            if args.name not in people:
+                raise ConfigError(f"{args.name!r} is not a person in this config (choose from: {', '.join(people)})")
+            print(f"Open this link on the device that holds {args.name}'s passkeys (valid for 15 minutes, works once):")
+            print(f"  {approver.new_enrollment(args.name)}")
+            print("Whoever opens it first becomes an approver for that person's accounts. Send it over a private channel.")
+        elif args.action == "forget":
+            print(f"removed a passkey of {approver.forget_passkey(args.name)}")
+        else:
+            approver.cancel(args.name)
+            print("cancelled")
+        return 0
+    except Refused as refused:
+        print(f"error: {refused.code}", file=sys.stderr)
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agw", description="Personal / family MCP gateway")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -255,6 +306,10 @@ def main(argv: list[str] | None = None) -> int:
     p_secret.add_argument("action", choices=["init", "set", "rm", "list"])
     p_secret.add_argument("name", nargs="?")
     p_secret.set_defaults(func=cmd_secret)
+    p_approval = with_config("approval", "manage passkeys and approval requests")
+    p_approval.add_argument("action", choices=["enroll", "passkeys", "forget", "requests", "cancel"])
+    p_approval.add_argument("name", nargs="?", help="a person (enroll), a passkey id (forget) or a request id (cancel)")
+    p_approval.set_defaults(func=cmd_approval)
 
     args = parser.parse_args(argv)
     os.umask(0o077)  # whatever these commands write (lock file, secret store, audit log) is owner-only

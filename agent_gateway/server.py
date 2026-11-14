@@ -10,7 +10,8 @@ Order of checks in a call, each one failing closed:
   3. policy        (principal, tool) must not be `deny`; default is deny
   4. definition    the tool must be locked and unchanged upstream
   5. arguments     validated against the schema the agent was shown; pins applied
-  6. approval      `approval_required` asks the approver (which refuses, for now)
+  6. approval      `approval_required` asks the approver; without a human decision
+                   bound to this exact call, nothing runs
   7. upstream call with that account's credentials, a timeout, a size limit
   8. scrub         known secret values are removed from whatever comes back
 """
@@ -45,7 +46,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
-from .approval import ApprovalRequest, Approver, DenyAllApprover, arguments_digest
+from .approval import NOT_EXECUTED, ApprovalRequest, Approver, DenyAllApprover, arguments_digest
 from .audit import Audit
 from .auth import StaticTokenVerifier, caller_of
 from .config import Config, ConnectionCfg, ToolCfg
@@ -154,6 +155,15 @@ def _error(text: str) -> types.CallToolResult:
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)], is_error=True)
 
 
+def make_approver(cfg: Config, audit: Audit) -> Approver:
+    """The config decides only whether a place to ask people exists; never who says yes."""
+    if cfg.approvals is None:
+        return DenyAllApprover()
+    from .passkey import PasskeyApprover  # imported only when used, so the core does not need WebAuthn
+
+    return PasskeyApprover(cfg.approvals, audit, retention_days=cfg.audit.retention_days)
+
+
 class Gateway:
     def __init__(
         self,
@@ -166,7 +176,7 @@ class Gateway:
         self.cfg = cfg
         self.audit = audit
         self.policy = Policy(cfg)
-        self.approver: Approver = approver or DenyAllApprover()
+        self.approver: Approver = approver or make_approver(cfg, audit)
         self.scrubber = Scrubber(list(secrets.values()))
         self.upstreams: dict[str, Upstream] = {}
         self.routes: dict[str, ToolRoute] = {}
@@ -260,22 +270,44 @@ class Gateway:
 
         final_arguments = {**arguments, **route.tool.pin}
 
-        if effect == "approval_required":
-            request = ApprovalRequest(
-                principal=who.principal,
-                client_id=who.client_id,
-                tool=route.tool.name,
-                connection=route.conn.id,
-                service=route.conn.service,
-                account=route.conn.account,
-                upstream_tool=route.tool.upstream,
-                arguments_sha256=arguments_digest(final_arguments),
-            )
-            decision = await self.approver.authorize(request)
-            if not decision.approved:
-                done("deny", f"approval:{decision.reason}")
-                return _error("This action needs human approval and was not executed.")
+        if effect != "approval_required":
+            return await self._run(route, final_arguments, done, "ok")
 
+        request = ApprovalRequest(
+            principal=who.principal,
+            client_id=who.client_id,
+            tool=route.tool.name,
+            connection=route.conn.id,
+            service=route.conn.service,
+            account=route.conn.account,
+            upstream_tool=route.tool.upstream,
+            arguments_sha256=arguments_digest(final_arguments),
+            arguments=final_arguments,
+            owner=route.conn.owner,
+            approvers=self.cfg.approvers_of(route.conn),
+        )
+        decision = await self.approver.authorize(request)
+        approval = decision.approval_id
+        if not decision.approved:
+            done("deny", f"approval:{decision.reason}", approval=approval)
+            # The approver's own wording (where the request waits); it is gateway code, not upstream text.
+            return _error(decision.message or NOT_EXECUTED)
+        # From here the approval is spent, whatever happens. Tell the approver how it ended.
+        outcome = "internal_error"
+
+        def approved_done(decision_: str, reason: str, **extra: Any) -> None:
+            nonlocal outcome
+            outcome = reason if decision_ == "error" else ("tool_error" if extra.get("is_error") else "ok")
+            done(decision_, reason, approval=approval, **extra)
+
+        try:
+            return await self._run(route, final_arguments, approved_done, "approved")
+        finally:
+            if approval is not None:
+                with anyio.CancelScope(shield=True):
+                    await self.approver.finished(approval, outcome)
+
+    async def _run(self, route: ToolRoute, final_arguments: dict[str, Any], done: Any, ok_reason: str) -> types.CallToolResult:
         try:
             result = await self.upstreams[route.conn.id].call(route.tool.upstream, final_arguments)
         except UpstreamError as exc:
@@ -290,7 +322,7 @@ class Gateway:
             done("error", "result_too_large", result_bytes=size)
             return _error("The result is too large to return. Narrow the request.")
         clean = types.CallToolResult.model_validate(payload)
-        done("allow", "ok" if effect == "allow" else "approved", result_bytes=size, is_error=bool(clean.is_error))
+        done("allow", ok_reason, result_bytes=size, is_error=bool(clean.is_error))
         return clean
 
 
@@ -359,8 +391,16 @@ def build_app(gateway: Gateway) -> Starlette:
     async def healthz(request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
 
+    # The approval page, if there is one. It is reached by people, not by agents: it takes no
+    # bearer token, and nothing on it changes anything without a passkey.
+    approval_routes = getattr(gateway.approver, "http_routes", list)()
+
     return Starlette(
-        routes=[Route("/mcp", endpoint=mcp_endpoint), Route("/healthz", endpoint=healthz, methods=["GET"])],
+        routes=[
+            Route("/mcp", endpoint=mcp_endpoint),
+            Route("/healthz", endpoint=healthz, methods=["GET"]),
+            *approval_routes,
+        ],
         middleware=[
             Middleware(_AuditAuthFailures, audit=gateway.audit),
             Middleware(AuthenticationMiddleware, backend=BearerAuthBackend(StaticTokenVerifier(list(cfg.clients)))),

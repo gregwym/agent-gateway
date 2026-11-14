@@ -1,7 +1,7 @@
 """Security audit log: one JSON object per line, metadata only.
 
 Recorded: who called what, on which account, the decision and why, timing and
-sizes, and the *names* of the arguments. Never recorded: argument values,
+sizes, the *names* of the arguments, and for approvals the request id and who decided. Never recorded: argument values,
 results, tokens or secrets. Files rotate daily and are deleted after
 `retention_days`.
 """
@@ -21,7 +21,7 @@ FIELDS = frozenset(
     {
         "client", "principal", "tool", "connection", "service", "account", "upstream_tool",
         "decision", "reason", "duration_ms", "result_bytes", "is_error", "arg_keys",
-        "remote", "detail",
+        "remote", "detail", "approval", "approver",
     }
 )  # fmt: skip
 

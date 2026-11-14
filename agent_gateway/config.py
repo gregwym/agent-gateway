@@ -51,6 +51,37 @@ class SecretsCfg(_Model):
     key_file: Path
 
 
+class ApprovalsCfg(_Model):
+    """The passkey approval page. Without this section an `approval_required` tool never runs.
+
+    There is nothing here that approves on its own: the section only says where
+    people decide and how long a request and a decision stay valid.
+    """
+
+    # What a person types into the browser, e.g. https://gateway.example.ts.net. Passkeys are
+    # bound to this hostname by the browser, so changing it later means enrolling again.
+    origin: str
+    store: Path
+    request_ttl_seconds: int = Field(600, ge=60, le=86_400)  # how long a request waits for a decision
+    grant_ttl_seconds: int = Field(600, ge=30, le=3_600)  # how long an approved call may be used, once
+
+    @model_validator(mode="after")
+    def _check(self) -> ApprovalsCfg:
+        parts = urlsplit(self.origin)
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+            raise ValueError("approvals.origin must look like https://host[:port]")
+        if parts.path or parts.query or parts.fragment:
+            raise ValueError("approvals.origin must not have a path, query string or fragment")
+        # Browsers only offer passkeys on https, with localhost as the one exception.
+        if parts.scheme == "http" and parts.hostname != "localhost":
+            raise ValueError("approvals.origin must be https (http is accepted for localhost only)")
+        return self
+
+    @property
+    def rp_id(self) -> str:
+        return urlsplit(self.origin).hostname or ""
+
+
 class ClientCfg(_Model):
     """One credential. A client is bound to exactly one principal, forever."""
 
@@ -153,6 +184,7 @@ class Config(_Model):
     server: ServerCfg = ServerCfg()
     audit: AuditCfg
     secrets: SecretsCfg | None = None
+    approvals: ApprovalsCfg | None = None
     lock_file: Path = Path("tools.lock.json")
     principals: list[str] = Field(min_length=1)
     # Principals whose accounts are meant to be shared, e.g. `household`.
@@ -212,6 +244,12 @@ class Config(_Model):
 
     def connection(self, conn_id: str) -> ConnectionCfg:
         return next(c for c in self.connections if c.id == conn_id)
+
+    def approvers_of(self, conn: ConnectionCfg) -> tuple[str, ...]:
+        """Whose decision counts for a call on this account: its owner, or every person if it is shared."""
+        if conn.owner in self.shared:
+            return tuple(p for p in self.principals if p not in self.shared)
+        return (conn.owner,)
 
 
 def _matches(pattern: str, value: str) -> bool:
@@ -278,4 +316,6 @@ def load_config(path: str | Path) -> Config:
         updates["secrets"] = cfg.secrets.model_copy(
             update={"path": located(cfg.secrets.path), "key_file": located(cfg.secrets.key_file)}
         )
+    if cfg.approvals:
+        updates["approvals"] = cfg.approvals.model_copy(update={"store": located(cfg.approvals.store)})
     return cfg.model_copy(update=updates)

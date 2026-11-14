@@ -1,8 +1,9 @@
-"""`approval_required`: today it means "never runs". The hook is tested with a test double.
+"""`approval_required` in the gateway core: the default refuses, and the hook is narrow.
 
-There is no approval system yet (no human channel, no pending store). These
-tests pin down the two things that do exist: the default refuses everything,
-and the hook binds a decision to the caller and to the exact arguments.
+Without an `approvals:` section nothing that needs approval ever runs. The
+hook itself is tested with a test double: it is asked on every call, with the
+caller's identity and the exact arguments. The real approver (passkeys) is
+tested in test_passkey.py.
 """
 
 from __future__ import annotations
@@ -57,6 +58,9 @@ class OneShotApprover:
             return ApprovalDecision(False, "already_used")
         self.used = True
         return ApprovalDecision(True, "test")
+
+    async def finished(self, approval_id: str, outcome: str) -> None:
+        raise AssertionError("no approval id was given, so there is nothing to report on")
 
 
 async def test_the_hook_binds_a_decision_to_caller_and_exact_arguments(tmp_path):

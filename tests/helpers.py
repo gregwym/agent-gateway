@@ -149,23 +149,25 @@ async def write_lock(config_path: Path) -> None:
     await _lock(load_config(config_path), True, None)
 
 
-_BASE_LOCK: str | None = None
+_LOCKS: dict[str, str] = {}
 
 
 async def prepare(directory: Path, raw: dict[str, Any] | None = None, *, lock: bool = True) -> Path:
-    """Write config + secrets (+ lock file) for a test. The base lock is computed once per run."""
-    global _BASE_LOCK
-    path = write_config(directory, raw if raw is not None else base_config())
+    """Write config + secrets (+ lock file) for a test.
+
+    A lock file depends only on the connections, so it is computed once per
+    distinct set of connections and reused for the rest of the run.
+    """
+    raw = raw if raw is not None else base_config()
+    path = write_config(directory, raw)
     if not lock:
         return path
-    if raw is None or raw == base_config():
-        if _BASE_LOCK is None:
-            await write_lock(path)
-            _BASE_LOCK = (directory / "tools.lock.json").read_text(encoding="utf-8")
-        else:
-            (directory / "tools.lock.json").write_text(_BASE_LOCK, encoding="utf-8")
-    else:
+    key = json.dumps(raw["connections"], sort_keys=True)
+    if key not in _LOCKS:
         await write_lock(path)
+        _LOCKS[key] = (directory / "tools.lock.json").read_text(encoding="utf-8")
+    else:
+        (directory / "tools.lock.json").write_text(_LOCKS[key], encoding="utf-8")
     return path
 
 

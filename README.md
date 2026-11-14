@@ -20,9 +20,9 @@ It is about 1,600 lines of Python (comments included) on top of the official
 database, no web UI and no admin API: one YAML file, one lock file, one encrypted
 secret file, one audit log.
 
-**Status: Phase 1.** The gateway itself is complete and tested. It ships with a demo
-connector only; real services (iCloud Mail, calendars, Gmail) are Phase 2, and human
-approval is Phase 3. See [what it does not do](#what-it-does-not-do).
+**Status.** The gateway core and passkey approval are implemented and tested. Connectors
+for real services (iCloud Mail, calendars, Gmail) are being added. See
+[what it does not do](#what-it-does-not-do).
 
 ## What it does
 
@@ -47,8 +47,10 @@ approval is Phase 3. See [what it does not do](#what-it-does-not-do).
   Errors shown to agents are fixed strings.
 - **Audit without content.** One JSON line per call and per failed login: who, which
   tool, which account, outcome, sizes, argument *names*. No argument values, no results.
-- **A place for approval.** A rule can say `approval_required`. Until an approval
-  channel exists, such a tool is visible and **never runs**.
+- **Approval by passkey.** A rule can say `approval_required`. Such a call waits until
+  the account's owner approves that exact call (same client, account, tool and
+  arguments) with a passkey, runs once, and needs a new approval the next time.
+  Without an `approvals:` section such a tool is visible and **never runs**.
 
 ## What it does not do
 
@@ -61,7 +63,9 @@ Read this list before trusting it with real accounts. Details and reasons are in
 - **It cannot tell which person is talking to a shared agent.** A token proves which
   *client* is calling. A token stored where another agent can read it proves nothing.
   Agents that serve both people must be given a `household` client.
-- **Approval is not implemented.** Only the interface and the refusing default exist.
+- **Approval has not been exercised with a real browser and authenticator here.** The
+  tests drive the server with a software passkey. Whoever can edit the config or the
+  approval store on the host can bypass it.
 - **"Read-only" is an allowlist, not a credential property.** Hiding write tools does
   not make an IMAP app-specific password read-only. A buggy or malicious connector
   can do whatever its credential allows.
