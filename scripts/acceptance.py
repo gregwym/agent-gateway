@@ -55,6 +55,7 @@ def main() -> int:
                                        stderr=subprocess.STDOUT, text=True)
             for line in process.stdout:
                 saved.write(line)
+                saved.flush()
                 print(line, end="", flush=True)
             code = process.wait()
         report["checks"].append({"name": name, "exit_code": code,
@@ -84,7 +85,7 @@ def main() -> int:
             check("image", ["docker", "build", "-t", image, "."])
             env["AGW_TEST_IMAGE"] = image
         junit = output / "junit.xml"
-        check("pytest", [sys.executable, "-m", "pytest", "-q", "--tb=short", f"--junitxml={junit}"], env=env)
+        check("pytest", [sys.executable, "-m", "pytest", "-v", "--tb=short", "-o", "faulthandler_timeout=120", f"--junitxml={junit}"], env=env)
         if source_fingerprint() != report["source_sha256"]:
             raise RuntimeError("Source changed during acceptance; rerun against a stable snapshot")
         report["status"] = "passed"
