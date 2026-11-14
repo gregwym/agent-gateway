@@ -161,7 +161,9 @@ def make_approver(cfg: Config, audit: Audit) -> Approver:
         return DenyAllApprover()
     from .passkey import PasskeyApprover  # imported only when used, so the core does not need WebAuthn
 
-    return PasskeyApprover(cfg.approvals, audit, retention_days=cfg.audit.retention_days)
+    approver = PasskeyApprover(cfg.approvals, audit, retention_days=cfg.audit.retention_days)
+    approver.name_of = cfg.name_of
+    return approver
 
 
 class Gateway:
@@ -202,7 +204,7 @@ class Gateway:
             route.exposed
             for name, route in self.routes.items()
             if route.exposed is not None
-            and self.policy.effect(who.principal, name) != "deny"
+            and self.policy.effect(who.principal, name, who.client_id) != "deny"
             and self.problem(route) is None
         ]
         return types.ListToolsResult(tools=tools)
@@ -237,7 +239,7 @@ class Gateway:
             duration = int((time.monotonic() - started) * 1000)
             self.audit.write("tool_call", decision=decision, reason=reason, duration_ms=duration, **record, **extra)
 
-        effect = self.policy.effect(who.principal, name) if route is not None else "deny"
+        effect = self.policy.effect(who.principal, name, who.client_id) if route is not None else "deny"
         if route is None or effect == "deny":
             done("deny", "unknown_tool" if route is None else "policy_deny")
             raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)

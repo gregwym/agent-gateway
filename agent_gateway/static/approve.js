@@ -146,8 +146,7 @@ function row(list, label, value) {
 
 function showRequest(request) {
   const identity = (id) => {
-    const name = request.display_names?.[id] || id;
-    return name !== id ? `${name} (${id})` : id;
+    return request.names?.[id] || id;
   };
   app.replaceChildren();
   const open = request.status === 'pending' || request.status === 'approved';
@@ -156,7 +155,7 @@ function showRequest(request) {
     : request.status === 'used' ? 'hint_used' : 'hint_gone'), 'muted');
 
   const facts = el(el(app, 'div', undefined, 'card'), 'dl');
-  row(facts, t('requested_by'), request.client + ' · ' + identity(request.principal));
+  row(facts, t('requested_by'), request.client);
   row(facts, t('account'), request.service + ' / ' + request.account);
   row(facts, t('tool'), request.tool + ' (' + request.upstream_tool + ')');
   if (request.status === 'pending') row(facts, t('decides'), request.approvers.map(identity).join(', '));

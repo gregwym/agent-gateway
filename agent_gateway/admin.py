@@ -13,7 +13,7 @@ from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from .admin_auth import AdminAuth, COOKIE
-from .admin_config import CATALOG, ManagedStore, kind_of, make_connection, settings_of
+from .admin_config import CATALOG, ManagedStore, kind_of, make_connection, member_name, settings_of
 from .auth import hash_token, new_token
 from .config import NAME
 from .lock import Lock, definition_of, digest_of
@@ -27,7 +27,7 @@ class AdminController:
         self.runtime = runtime
         self.store = ManagedStore(runtime.gateway)
         self.auth = AdminAuth(runtime.gateway.cfg, runtime.gateway.approver)
-        self.auth.approver.display_name = self.store.name_of
+        self.auth.approver.name_of = self.store.name_of
         self.mutex = anyio.Lock()
         self.drafts = {}
         self.tests = {}
@@ -56,10 +56,12 @@ class AdminController:
             raise Refused("configuration_changed", 409)
 
     async def _commit(self, state, action):
-        # A connector draft can predate a cosmetic rename. Keep the latest names;
-        # display-only edits never change approval bindings or restart upstreams.
-        state["display_names"] = {p: name for p, name in self.store.state.get("display_names", {}).items()
-                                  if p in state["config"]["principals"]}
+        # Renames do not restart connectors or invalidate approvals. A draft must
+        # keep the latest canonical names without overwriting newly added members.
+        for kind in ("members", "households"):
+            names = {m["id"]: m["name"] for m in self.store.state["config"][kind]}
+            for member in state["config"][kind]:
+                member["name"] = names.get(member["id"], member["name"])
         state["revision"] = self.store.state["revision"] + 1
         gateway = self._gateway(state)
         for route in gateway.routes.values():
@@ -95,16 +97,20 @@ class AdminController:
                 route = gw.routes[tool.name]
                 tools.append({"name": tool.name, "upstream": tool.upstream, "pin": tool.pin,
                               "allow_values": tool.allow_values, "problem": gw.problem(route),
-                              "permissions": {p: gw.policy.effect(p, tool.name) for p in gw.cfg.principals}})
+                              "permissions": {c.id: gw.policy.effect(c.subject, tool.name, c.id) for c in gw.cfg.clients}})
             connections.append({"id": conn.id, "kind": kind_of(conn), "owner": conn.owner,
+                                "household": gw.cfg.household_of(conn.owner), "approvers": list(gw.cfg.approvers_of(conn)),
                                 "settings": settings_of(conn), "tools": tools,
                                 "connected": gw.upstreams[conn.id]._client is not None,
                                 "test": self.tests.get(conn.id)})
         return {"revision": self.store.state["revision"], "owner": self.auth.owner,
                 "mcp_url": gw.cfg.approvals.origin + "/mcp",
-                "members": [{"id": p, "display_name": self.store.name_of(p), "shared": p in gw.cfg.shared,
-                             "passkeys": sum(k["principal"] == p for k in keys)} for p in gw.cfg.principals],
-                "clients": [{"id": c.id, "principal": c.principal, "fingerprint": c.token_sha256[:12]} for c in gw.cfg.clients],
+                "households": [{"id": h.id, "name": self.store.name_of(h.id)} for h in gw.cfg.households],
+                "members": [{"id": m.id, "name": self.store.name_of(m.id), "household": m.household,
+                             "passkeys": sum(k["principal"] == m.id for k in keys)} for m in gw.cfg.members],
+                "clients": [{"id": c.id, "household": c.household, "fingerprint": c.token_sha256[:12],
+                             "tool_count": sum(gw.policy.effect(c.subject, t.name, c.id) != "deny"
+                                               for conn in gw.cfg.connections for t in conn.tools)} for c in gw.cfg.clients],
                 "connections": connections, "passkeys": keys,
                 "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()}}
 
@@ -161,34 +167,41 @@ class AdminController:
             return {"ok": True, "read_tool": probe}
 
         self._revision(body)
-        if operation == "members/rename":
-            self.store.rename(body.get("id"), body.get("display_name"))
+        if operation in ("members/rename", "households/rename"):
+            kind = "members" if operation == "members/rename" else "households"
+            if not any(m["id"] == body.get("id") for m in self.store.state["config"][kind]):
+                raise Refused("unknown_member" if kind == "members" else "unknown_household", 400)
+            self.store.rename(body.get("id"), body.get("name"))
             self.runtime.gateway.audit.write("admin_updated", principal=self.auth.owner, detail=operation,
                                              revision=self.store.state["revision"])
             return {"revision": self.store.state["revision"]}
         state = self.store.candidate()
         raw = state["config"]
         if operation == "members/add":
-            name = body.get("id")
-            if not isinstance(name, str) or not re.fullmatch(NAME, name):
-                raise Refused("invalid_member_name", 400)
-            if name in raw["principals"]:
-                raise Refused("duplicate_member", 400)
-            if len(raw["principals"]) >= 50:
-                raise Refused("member_limit", 400)
-            raw["principals"].append(name)
             if body.get("shared") is True:
-                raw["shared"].append(name)
+                raise Refused("shared_identity_removed", 400)
+            name = member_name(body.get("name", body.get("id")))
+            identity = body.get("id", "member_" + secrets.token_hex(8))
+            if not isinstance(identity, str) or not re.fullmatch(NAME, identity):
+                raise Refused("invalid_argument", 400)
+            if identity in raw["principals"] or any(m["name"].casefold() == name.casefold() for m in raw["members"]):
+                raise Refused("duplicate_member", 400)
+            home = body.get("household", raw["households"][0]["id"])
+            if home not in raw["shared"]:
+                raise Refused("unknown_household", 400)
+            if len(raw["members"]) >= 50:
+                raise Refused("member_limit", 400)
+            raw["principals"].append(identity)
+            raw["members"].append({"id": identity, "name": name, "household": home})
             return await self._commit(state, operation)
         if operation == "members/remove":
             name = body.get("id")
-            if name == self.auth.owner or name not in raw["principals"]:
+            if name == self.auth.owner or not any(m["id"] == name for m in raw["members"]):
                 raise Refused("cannot_remove_member", 400)
-            if (any(c["principal"] == name for c in raw["clients"]) or any(c["owner"] == name for c in raw["connections"])
-                    or any(name in p["principals"] for p in raw["policy"])):
+            if any(c.get("principal") == name for c in raw["clients"]) or any(c["owner"] == name for c in raw["connections"]):
                 raise Refused("member_in_use", 409)
             raw["principals"].remove(name)
-            raw["shared"] = [p for p in raw["shared"] if p != name]
+            raw["members"] = [m for m in raw["members"] if m["id"] != name]
             with self.auth.approver._db() as db:
                 db.execute("DELETE FROM credentials WHERE principal=?", (name,))
                 db.execute("DELETE FROM enrollments WHERE principal=?", (name,))
@@ -206,10 +219,11 @@ class AdminController:
                     raise Refused("duplicate_client", 400)
                 if len(raw["clients"]) >= 100:
                     raise Refused("client_limit", 400)
-                if body.get("principal") not in raw["principals"]:
-                    raise Refused("unknown_member", 400)
+                home = body.get("household")
+                if home not in raw["shared"]:
+                    raise Refused("unknown_household", 400)
                 token = new_token()
-                raw["clients"].append({"id": name, "principal": body.get("principal"), "token_sha256": hash_token(token)})
+                raw["clients"].append({"id": name, "household": home, "token_sha256": hash_token(token)})
             elif not client:
                 raise Refused("not_found", 404)
             elif operation == "clients/rotate":
@@ -217,6 +231,8 @@ class AdminController:
                 client["token_sha256"] = hash_token(token)
             else:
                 raw["clients"].remove(client)
+                raw["policy"] = [{**r, "clients": [c for c in r["clients"] if c != name]}
+                                 for r in raw["policy"] if any(c != name for c in r["clients"])]
             result = await self._commit(state, operation)
             if token:
                 result.update(token=token, fingerprint=hash_token(token)[:12], mcp_url=self.runtime.gateway.cfg.approvals.origin + "/mcp")
@@ -239,10 +255,7 @@ class AdminController:
                 raise Refused("missing_upstream_tool", 422)
             raw["connections"] = [c for c in raw["connections"] if c["id"] != conn.id] + [conn.model_dump(mode="json")]
             existing = any(c.id == conn.id for c in cfg.connections)
-            if not existing:
-                for tool in conn.tools:
-                    raw["policy"].append({"principals": [conn.owner], "connection": conn.id, "tools": [tool.name],
-                                          "effect": "approval_required" if tool.upstream == "add_note" else "allow"})
+            # Ownership never grants an Agent access. Every new connector starts denied.
             state["secrets"].update(added)
             lock = Lock()
             for tool in conn.tools:
@@ -279,28 +292,28 @@ class AdminController:
             state["secrets"] = {k: v for k, v in state["secrets"].items() if k in referenced}
             return await self._commit(state, operation)
         if operation == "permissions/save":
-            principal, name, tool = body.get("principal"), body.get("connection"), body.get("tool")
+            client_id, name, tool = body.get("client"), body.get("connection"), body.get("tool")
             conn = next((c for c in raw["connections"] if c["id"] == name), None)
-            if principal not in raw["principals"]:
-                raise Refused("unknown_member", 400)
+            client = next((c for c in raw["clients"] if c["id"] == client_id), None)
+            if not client:
+                raise Refused("unknown_agent", 400)
             if not conn or not any(t["name"] == tool for t in conn["tools"]):
                 raise Refused("not_found", 404)
             if body.get("effect") not in ("deny", "allow", "approval_required"):
                 raise Refused("invalid_permission_effect", 400)
-            if (principal != conn["owner"] and conn["owner"] not in raw["shared"]
-                    and body["effect"] != "deny" and body.get("cross_account") is not True):
-                raise Refused("cross_account_required", 400)
+            cfg, _, _ = self.store.effective(state)
+            if client["household"] != cfg.household_of(conn["owner"]) and body["effect"] != "deny":
+                raise Refused("outside_household", 400)
             for rule in list(raw["policy"]):
-                if rule["connection"] == name and principal in rule["principals"] and tool in rule["tools"]:
+                if rule["connection"] == name and client_id in rule["clients"] and tool in rule["tools"]:
                     raw["policy"].remove(rule)
-                    other_people = [p for p in rule["principals"] if p != principal]
+                    other_agents = [p for p in rule["clients"] if p != client_id]
                     other_tools = [t for t in rule["tools"] if t != tool]
-                    if other_people:
-                        raw["policy"].append({**rule, "principals": other_people})
+                    if other_agents:
+                        raw["policy"].append({**rule, "clients": other_agents})
                     if other_tools:
-                        raw["policy"].append({**rule, "principals": [principal], "tools": other_tools})
-            raw["policy"].append({"connection": name, "principals": [principal], "tools": [tool],
-                                  "effect": body.get("effect"), "cross_account": body.get("cross_account") is True})
+                        raw["policy"].append({**rule, "clients": [client_id], "tools": other_tools})
+            raw["policy"].append({"connection": name, "clients": [client_id], "tools": [tool], "effect": body["effect"]})
             return await self._commit(state, operation)
         if operation == "tools/restrict":
             conn = next((c for c in raw["connections"] if c["id"] == body.get("connection")), None)

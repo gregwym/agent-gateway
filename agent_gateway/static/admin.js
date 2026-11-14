@@ -50,8 +50,13 @@ const messages = {
   request_too_large: ['The submitted form is too large. Reduce the argument restrictions or pasted content.', '提交的表单过大，请减少参数限制或粘贴内容。'],
   not_found: ['This member, token, connector, or tool no longer exists. Refresh the page.', '此成员、Token、连接器或工具已不存在，请刷新页面。'],
   unknown_member: ['The selected member no longer exists. Refresh and select an existing member.', '选择的成员不存在，请刷新并选择现有成员。'],
-  invalid_member_name: ['Member IDs must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', '成员 ID 须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
-  duplicate_member: ['This member ID already exists. Choose another ID.', '此成员 ID 已存在，请使用其他 ID。'],
+  invalid_member_name: ['Enter a name of 1–80 characters without control characters.', '名字需为 1–80 个字符，不能包含控制字符。'],
+  duplicate_member: ['This member name already exists. Choose a different name.', '已有成员使用这个名字，请使用不同名字。'],
+  duplicate_household: ['This household name already exists.', '此家庭名称已存在。'],
+  unknown_household: ['This household no longer exists. Refresh and select a household.', '此家庭已不存在，请刷新并选择所属家庭。'],
+  unknown_agent: ['Select an existing Agent before assigning tool permissions.', '请先选择现有 Agent，再配置工具权限。'],
+  outside_household: ['The Agent and connection belong to different households.', '此 Agent 与连接不属于同一个家庭。'],
+  shared_identity_removed: ['A household is not a member. Add a person here; choose the household as owner for shared connections.', '家庭不是成员。请在这里添加个人，共享连接的所有者请选择家庭。'],
   member_limit: ['The gateway has reached its limit of 50 members. Remove an unused member first.', '网关已达到 50 个成员的上限，请先移除不再使用的成员。'],
   cannot_remove_member: ['The administrator identity cannot be removed; other members must still exist.', '不能移除管理员身份；其他待移除成员必须仍然存在。'],
   invalid_client_name: ['Agent IDs must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', 'Agent ID 须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
@@ -97,7 +102,6 @@ const messages = {
   credential_store_unavailable: ['The encrypted credential store could not be read or verified. Check its file and encryption key on the host.', '无法读取或验证加密凭据存储，请检查主机上的加密文件和密钥。'],
   operation_failed: ['The server encountered an unexpected error. Use the error ID to locate it before retrying.', '服务器发生未预期错误，请用错误编号定位后重试。'],
   invalid_configuration: ['Check the values and account-sharing permission.', '请检查输入值和跨账号授权选项。'],
-  invalid_display_name: ['Use 1–80 characters without control characters.', '显示名称须为 1–80 个字符，不能包含控制字符。'],
   invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
   invalid_connector: ['Some connector fields are invalid. Check the form.', '连接器字段无效，请检查表单。'],
   invalid_imap_server: ['Check the IMAP server name and TLS port (1–65535).', '请检查 IMAP 服务器地址及 TLS 端口（1–65535）。'],
@@ -286,17 +290,18 @@ async function welcome(initialized) {
 }
 async function mutate(path, data) { const result = await api(path, {revision: state.revision, ...data}); await refresh(); return result; }
 async function refresh() { state = await api('state'); render(); }
-function nameOf(id) { return state.members.find(member => member.id === id)?.display_name || id; }
-function identityLabel(id) { const name = nameOf(id); return name === id ? id : `${name} (${id})`; }
-function renameMember(member) {
-  const box = modal(tr('Edit display name', '修改显示名称'));
-  const name = field(box, tr('Display name', '显示名称'), 'display_name', member.display_name || member.id,
+function nameOf(id) { return [...state.members, ...state.households].find(member => member.id === id)?.name || id; }
+function identityLabel(id) { return nameOf(id); }
+function householdOptions() { return state.households.map(h => [h.id, h.name]); }
+function renameMember(member, kind = 'members') {
+  const box = modal(tr('Edit name', '修改名称'));
+  const name = field(box, tr('Name', '名字'), 'name', member.name,
     'text', tr('Your permissions and existing passkeys stay the same.', '修改名称不会改变权限和现有通行密钥。'));
   name.maxLength = 80; name.required = true;
   button(box, tr('Save name', '保存名称'), async () => {
     if (!name.reportValidity()) return;
-    await mutate('members/rename', {id: member.id, display_name: name.value}); box.close();
-    notify(tr('Display name updated.', '显示名称已更新。'));
+    await mutate(kind + '/rename', {id: member.id, name: name.value}); box.close();
+    notify(tr('Name updated.', '名字已更新。'));
   }, 'primary');
 }
 function render() {
@@ -316,9 +321,9 @@ function overview() {
   el(hero, 'code', state.mcp_url, 'url');
   const grid = el(app, 'div', undefined, 'grid');
   for (const [key, count, title, hint] of [
-    ['members', state.members.length, tr('Household identities', '家庭身份'), tr('People and shared accounts stay separate.', '个人身份与共享身份分开管理。')],
+    ['members', state.members.length, tr('Household members', '家庭成员'), tr('Members and agents belong to a household.', '成员和 Agent 都有明确的家庭归属。')],
     ['connections', state.connections.length, tr('Account connectors', '账号连接器'), tr('Start with demo notes, or connect your accounts.', '可先用模拟笔记，也可连接你的账号。')],
-    ['agents', state.clients.length, tr('Agent credentials', 'Agent 凭据'), tr('Each token belongs to exactly one identity.', '每个 Token 只对应一个身份。')]]) {
+    ['agents', state.clients.length, tr('Agent credentials', 'Agent 凭据'), tr('Each agent has its own tool permissions.', '每个 Agent 单独配置工具权限。')]]) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'p', String(count), 'count'); el(card, 'h3', title); el(card, 'p', hint, 'muted');
     button(card, tr('Manage', '管理'), () => { tab = key; render(); });
   }
@@ -326,25 +331,31 @@ function overview() {
   el(card, 'h2', tr('Try the complete flow', '走一遍完整流程'));
   const steps = el(card, 'ol', undefined, 'steps');
   for (const text of [tr('Add or review a connector. Demo notes need no external account.', '添加或检查连接器。模拟笔记无需外部账号。'),
-    tr('Run its read-only connection check.', '运行只读连接验证。'), tr('Inspect the permissions for each identity.', '检查各身份拥有的权限。'),
+    tr('Run its read-only connection check.', '运行只读连接验证。'), tr('Grant specific tools to your agent.', '为 Agent 授予所需工具的权限。'),
     tr('Create an agent token and connect it to the MCP endpoint above.', '创建 Agent Token，并连接上面的 MCP 地址。')]) el(steps, 'li', text);
 }
 function members() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Household members', '家庭成员'));
+  for (const household of state.households) {
+    const card = el(app, 'section', undefined, 'card'); el(card, 'h2', household.name);
+    el(card, 'p', tr('This household contains its members, agents, and shared accounts. Tool access is granted to individual agents.', '家庭包含成员、Agent 和共享账号。工具权限逐个授予 Agent。'), 'muted');
+    button(card, tr('Rename household', '修改家庭名称'), () => renameMember(household, 'households'));
+  }
   button(head, tr('Add member', '添加成员'), () => {
-    const box = modal(tr('Add member', '添加成员')); const name = field(box, tr('Identity name', '身份名称'), 'member_id', '', 'text', tr('Lowercase letters, numbers, underscores, or hyphens.', '使用小写字母、数字、下划线或连字符。'));
-    const shared = checkbox(box, tr('Shared household identity (no personal passkey)', '共享家庭身份（不注册个人通行密钥）'));
-    button(box, tr('Add', '添加'), async () => { await mutate('members/add', {id: name.value, shared: shared.checked}); box.close(); }, 'primary');
+    const box = modal(tr('Add member', '添加成员')); const name = field(box, tr('Name', '名字'), 'member_name');
+    name.required = true; name.maxLength = 80;
+    const household = select(box, tr('Household', '所属家庭'), 'household', householdOptions());
+    button(box, tr('Add', '添加'), async () => { if (!name.reportValidity()) return; await mutate('members/add', {name: name.value, household: household.value}); box.close(); }, 'primary');
   }, 'primary');
   const grid = el(app, 'div', undefined, 'grid');
   for (const member of state.members) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', nameOf(member.id));
-    if (nameOf(member.id) !== member.id) el(card, 'small', member.id, 'muted');
-    el(card, 'span', member.id === state.owner ? tr('Administrator', '管理员') : member.shared ? tr('Shared', '共享') : tr('Personal', '个人'), 'badge');
-    el(card, 'p', member.shared ? tr('Give shared agents this identity.', '共享 Agent 使用此身份。') : tr(`${member.passkeys} passkey(s) registered`, `已注册 ${member.passkeys} 个通行密钥`), 'muted');
+    el(card, 'span', member.id === state.owner ? tr('Administrator', '管理员') : tr('Member', '成员'), 'badge');
+    el(card, 'p', nameOf(member.household), 'muted');
+    el(card, 'p', tr(`${member.passkeys} passkey(s) registered`, `已注册 ${member.passkeys} 个通行密钥`), 'muted');
     const actions = el(card, 'div', undefined, 'actions');
     button(actions, tr('Edit name', '修改名称'), () => renameMember(member));
-    if (!member.shared) button(actions, tr('Register a passkey', '注册通行密钥'), async () => {
+    button(actions, tr('Register a passkey', '注册通行密钥'), async () => {
       const result = await api('members/enroll', {id: member.id}); secretResult(tr('Private registration link', '私密注册链接'), result.url, true);
     });
     if (member.id !== state.owner) button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove member?', '移除此成员？'), identityLabel(member.id), async () => mutate('members/remove', {id: member.id})), 'danger');
@@ -359,16 +370,19 @@ function agents() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Agent access', 'Agent 接入'));
   button(head, tr('Create agent token', '创建 Agent Token'), () => {
     const box = modal(tr('Create agent token', '创建 Agent Token')); const name = field(box, tr('Agent name', 'Agent 名称'), 'client_id');
-    const principal = select(box, tr('Identity', '身份'), 'principal', state.members.map(m => [m.id, identityLabel(m.id)]), state.owner);
-    el(box, 'p', tr('For an agent shared by several people, choose the shared household identity.', '多人共享的 Agent 应选择共享家庭身份。'), 'hint');
-    button(box, tr('Create token', '创建 Token'), async () => { const result = await mutate('clients/create', {id: name.value, principal: principal.value}); box.close(); secretResult(tr('Save your agent token', '保存 Agent Token'), result.token, false, result.fingerprint); }, 'primary');
+    const household = select(box, tr('Household', '所属家庭'), 'household', householdOptions());
+    el(box, 'p', tr('A new agent starts with no tool access. Assign its permissions after creating the token.', '新 Agent 默认没有工具权限。创建 Token 后，请为它配置权限。'), 'hint');
+    button(box, tr('Create token', '创建 Token'), async () => { const result = await mutate('clients/create', {id: name.value, household: household.value}); box.close(); secretResult(tr('Save your agent token', '保存 Agent Token'), result.token, false, result.fingerprint); }, 'primary');
   }, 'primary');
   el(app, 'code', state.mcp_url, 'url');
   const table = el(el(app, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
-  for (const name of [tr('Agent', 'Agent'), tr('Identity', '身份'), tr('Credentials', '凭据')]) el(heading, 'th', name);
+  for (const name of [tr('Agent', 'Agent'), tr('Household / access', '家庭 / 权限'), tr('Credentials', '凭据')]) el(heading, 'th', name);
   const body = el(table, 'tbody');
   for (const client of state.clients) {
-    const row = el(body, 'tr'); el(row, 'td', client.id); el(row, 'td', identityLabel(client.principal)); const actions = el(el(row, 'td'), 'div', undefined, 'actions');
+    const row = el(body, 'tr'); el(row, 'td', client.id); const access = el(row, 'td'); el(access, 'div', nameOf(client.household));
+    el(access, 'p', client.tool_count ? tr(`${client.tool_count} tool(s) granted`, `已授权 ${client.tool_count} 个工具`) : tr('No tools granted. MCP will return an empty tool list.', '尚未授权工具，MCP 将返回空工具列表。'), 'muted');
+    button(access, tr('Configure permissions', '配置权限'), () => { subject = client.id; tab = 'permissions'; render(); });
+    const actions = el(el(row, 'td'), 'div', undefined, 'actions');
     el(actions, 'code', tr('Check code: ', '核对码：') + client.fingerprint, 'token-fingerprint');
     button(actions, tr('Check token', '核对 Token'), () => checkToken(client));
     button(actions, tr('Rotate token', '轮换 Token'), () => confirmAction(tr('Replace this token?', '替换此 Token？'), tr('The old token will stop working immediately.', '旧 Token 将立即失效。'), async () => { const result = await mutate('clients/rotate', {id: client.id}); secretResult(tr('Save your new token', '保存新 Token'), result.token, false, result.fingerprint); }));
@@ -427,7 +441,7 @@ function connectorForm(existing) {
   const name = field(fixed, tr('Connector name', '连接器名称'), 'connection_id', existing?.id || '', 'text', tr('Up to 32 lowercase letters, numbers, underscores, or hyphens.', '最多 32 个小写字母、数字、下划线或连字符。')); name.disabled = !!existing;
   name.required = true; name.maxLength = 32; name.pattern = '[a-z][a-z0-9_\\-]{0,31}';
   name.title = tr('Start with a lowercase letter; use lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，只用小写字母、数字、下划线或连字符。');
-  const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', state.members.map(m => [m.id, identityLabel(m.id)]), existing?.owner || state.owner); owner.disabled = !!existing;
+  const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
   const dynamic = el(form, 'div'); let settings = {}, credentials = {};
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     url: tr('HTTPS service URL', '服务 HTTPS 地址'), timezone: tr('Time zone', '时区'), password: tr('App-specific password', 'App 专用密码'),
@@ -471,7 +485,7 @@ function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
   el(review, 'p', result.connection + ' · ' + identityLabel(result.owner), 'muted');
   if (result.google_account) el(review, 'p', tr('Authorized Google account: ', '已授权的 Google 账号：') + result.google_account, 'hint');
-  el(review, 'p', tr('These descriptions and schemas are what agents will see. New connectors initially grant access only to their account owner.', 'Agent 将看到这些描述和参数定义。新连接器默认只授权给账号所有者。'), 'hint');
+  el(review, 'p', tr('These descriptions and schemas are what authorized agents will see. New connectors grant no access until you assign tools to an Agent.', '已获授权的 Agent 将看到这些描述和参数定义。新连接器默认不开放工具，需要逐个授予 Agent 权限。'), 'hint');
   for (const definition of result.definitions) { el(review, 'h3', definition.name); el(review, 'pre', JSON.stringify(definition, null, 2)); }
   const checked = checkbox(review, tr('I reviewed these definitions and permissions.', '我已审阅这些工具定义和权限。'));
   const apply = button(review, tr('Apply connector', '应用连接器'), async () => {
@@ -487,21 +501,29 @@ async function resumeGoogle() {
 function permissions() {
   el(app, 'h1', tr('Inspect permissions', '检查权限'));
   el(app, 'p', tr('Unlisted access is denied. Approval-required tools still need a separate passkey decision for each exact call.', '未授权的访问默认拒绝。需要审批的工具，每次调用仍须对具体内容进行通行密钥审批。'), 'muted');
-  if (!state.members.some(m => m.id === subject)) subject = state.owner;
-  const person = select(app, tr('Inspect as', '以此身份检查'), 'inspect_principal', state.members.map(m => [m.id, identityLabel(m.id)]), subject);
-  person.addEventListener('change', () => { subject = person.value; render(); });
+  if (!state.clients.length) {
+    el(app, 'p', tr('Create an Agent token first, then assign its tools here.', '请先创建 Agent Token，再在这里为它配置工具权限。'));
+    button(app, tr('Create agent token', '创建 Agent Token'), () => { tab = 'agents'; render(); }); return;
+  }
+  if (!state.clients.some(c => c.id === subject)) subject = state.clients[0].id;
+  const agent = state.clients.find(c => c.id === subject);
+  const selected = select(app, tr('Agent', 'Agent'), 'inspect_agent', state.clients.map(c => [c.id, c.id]), subject);
+  selected.addEventListener('change', () => { subject = selected.value; render(); });
+  el(app, 'p', tr('Household: ', '所属家庭：') + nameOf(agent.household), 'muted');
+  el(app, 'p', tr('These permissions apply to every person using this Agent. An Agent token does not identify the person chatting with it.', '这些权限适用于所有通过此 Agent 发起的调用。Agent Token 不识别当前和它聊天的人。'), 'hint');
+  if (!state.connections.some(c => c.household === agent.household)) el(app, 'p', tr('This household has no connections yet. Add a connector first.', '此家庭尚无连接，请先添加连接器。'), 'muted');
   const table = el(el(app, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
   for (const label of [tr('Tool / owner', '工具 / 所有者'), tr('Access', '访问权限'), tr('Changes', '修改')]) el(heading, 'th', label);
   const body = el(table, 'tbody');
-  for (const conn of state.connections) for (const tool of conn.tools) {
+  for (const conn of state.connections.filter(c => c.household === agent.household)) for (const tool of conn.tools) {
     const row = el(body, 'tr'); const info = el(row, 'td'); el(info, 'strong', tool.name); el(info, 'div', identityLabel(conn.owner) + ' · ' + conn.id, 'muted');
     if (tool.problem) el(info, 'span', tr('Disabled: ', '已停用：') + tool.problem, 'badge bad');
     if (Object.keys(tool.pin).length) el(info, 'pre', JSON.stringify(tool.pin));
     const settings = el(row, 'td'); const effect = select(settings, tr('Effect', '权限效果'), 'effect', [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow', '允许')], ['approval_required', tr('Require approval', '需要审批')]], tool.permissions[subject]);
-    const cross = conn.owner !== subject && !state.members.find(m => m.id === conn.owner)?.shared;
-    const confirmed = cross ? checkbox(settings, tr('Explicitly share access to this other account', '明确允许访问另一人的账号'), tool.permissions[subject] !== 'deny') : null;
+    el(settings, 'p', tr('If approval is required: ', '需要审批时由以下成员批准：') + conn.approvers.map(nameOf).join(tr(' or ', ' 或 ')), 'hint');
+    if (!conn.approvers.some(id => state.members.find(m => m.id === id)?.passkeys)) el(settings, 'p', tr('No approver has a passkey yet. Register one before using approval-required tools.', '审批人尚未注册通行密钥，需要审批的工具暂时无法执行。'), 'hint');
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');
-    button(actions, tr('Save access', '保存权限'), async () => { await mutate('permissions/save', {principal: subject, connection: conn.id, tool: tool.name, effect: effect.value, cross_account: confirmed?.checked || false}); notify(tr('Permissions updated.', '权限已更新。')); });
+    button(actions, tr('Save access', '保存权限'), async () => { await mutate('permissions/save', {client: subject, connection: conn.id, tool: tool.name, effect: effect.value}); notify(tr('Permissions updated.', '权限已更新。')); });
     button(actions, tr('Argument limits', '参数限制'), () => {
       const box = modal(tr('Argument limits', '参数限制')); el(box, 'p', tr('These restrictions apply to everyone using this exposed tool. Fixed arguments are hidden from agents. Changes invalidate pending approvals.', '这些限制适用于所有调用此工具的身份。固定参数对 Agent 隐藏。修改会使未使用的审批失效。'), 'muted');
       const pin = field(box, tr('Fixed arguments (JSON object)', '固定参数（JSON 对象）'), 'pin', JSON.stringify(tool.pin, null, 2), 'textarea');

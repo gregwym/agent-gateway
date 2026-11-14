@@ -1,7 +1,7 @@
 # agent-gateway
 
 A small, self-hosted MCP gateway for a household. Personal AI agents connect to
-one MCP endpoint; the gateway decides **who is calling** from the credential the
+one MCP endpoint; the gateway identifies **which Agent is calling** from the credential the
 agent presents, shows that caller **only the tools they were given**, and makes
 the upstream calls with **credentials the agent never sees**.
 
@@ -33,6 +33,14 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
 
 ## What it does
 
+- **Households, members, and independent Agent grants.** In the web console, members
+  and Agents belong to a household. A connector is owned by a member or by the
+  household. Only individual Agents receive tool permissions; household membership
+  and account ownership grant no tool access. New Agents and connectors start denied.
+  A shared Agent has one permission set for every person using it. Personal-account
+  approval requires its owner's passkey; a household account can be approved by a
+  member of that household. The legacy YAML identity rules below remain supported
+  for deployments without web administration.
 - **Identity from the token, nothing else.** Each client has its own bearer token,
   bound to exactly one principal (`person_a`, `person_b`, `household`). Tool
   arguments, headers, cookies and session ids cannot change who the caller is.
@@ -160,9 +168,17 @@ members, connect an account (or demo notes), review its definitions, run its rea
 check, and create a separate token for each agent. Tokens are shown once. Members
 receive a private 15-minute passkey registration link; membership alone does not
 make someone an administrator. The console is available in English and Chinese.
-Click your name in the header, or **Members → Edit name**, to change a display
-name. Identity IDs, permissions, passkeys, sessions, and pending approvals stay
-the same. The name is saved in the encrypted administration state.
+Click your name in the header, or **Members → Edit name**, to change your name.
+There is one editable name, stored on the member record; internal credential and
+ownership keys stay stable and are not shown as a second name. Passkeys, sessions,
+permissions, and pending approvals survive a rename. Names support Unicode and
+spaces; duplicate member names are rejected.
+
+In **Agents → Configure permissions**, select the specific Agent and grant each
+tool **Allow**, **Require approval**, or **Deny**. The page identifies the account
+owner and who must approve. A zero-tool Agent explicitly explains why MCP returns
+an empty list. Being in the same household does not identify the current human
+speaker or make one Agent inherit another Agent's permissions.
 
 Access and connector changes wait up to 30 seconds for active calls to finish, then atomically save and
 apply; busy calls leave the configuration unchanged. These changes invalidate
@@ -183,12 +199,21 @@ compares a pasted value locally in the browser, including whitespace/Bearer-pref
 mistakes; the pasted value is never sent or saved. Clipboard failures are shown
 explicitly and select the full value for manual copying. Checking does not rotate a token.
 
-Web changes override the five account sections (`principals`, `shared`, `clients`,
-`connections`, `policy`) from YAML after the first save. `agw check` includes those
+Web changes override account sections (`households`, `members`, `clients`,
+`connections`, `policy`, and legacy identity keys) from YAML after the first save. `agw check` includes those
 changes. Back up `admin.enc` and `approvals.sqlite` along with the original files;
 keep the encryption key separately. Disabling web administration also disables
 its overrides, so migration back to YAML requires an intentional host-side export.
 See [deployment instructions](docs/deployment.md#网页-onboarding-可选).
+
+On upgrade to 0.3, web configuration with zero or one legacy shared identity is
+normalized into a household and member records. Each existing Agent retains exactly
+its effective permissions and token; old grants without an existing Agent do not
+grant access to future Agents. Existing names, passkeys and ownership bindings are
+preserved. Startup performs no state-file write; the next administrator edit saves
+the new format. More than one legacy shared identity requires an explicit host-side
+membership migration. After saving the new format, rollback to 0.2 requires restoring
+the matching protected backup of configuration/state as well as the older image.
 
 ## Docker Compose
 

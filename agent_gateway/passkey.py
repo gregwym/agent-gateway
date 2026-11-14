@@ -162,12 +162,11 @@ class PasskeyApprover:
     def _url(self, request_id: str) -> str:
         return f"{self.cfg.origin}/approvals/r/{request_id}"
 
-    def display_name(self, principal: str) -> str:
+    def name_of(self, principal: str) -> str:
         return principal
 
     def identity_label(self, principal: str) -> str:
-        name = self.display_name(principal)
-        return f"{name} ({principal})" if name != principal else principal
+        return self.name_of(principal)
 
     # -- the Approver interface ---------------------------------------------------
 
@@ -285,7 +284,7 @@ class PasskeyApprover:
         people = {row["principal"], row["owner"], *shown["approvers"]}
         if row["decided_by"]:
             people.add(row["decided_by"])
-        shown["display_names"] = {p: self.display_name(p) for p in people}
+        shown["names"] = {p: self.name_of(p) for p in people}
         return shown
 
     def _credentials(self, db: sqlite3.Connection, principals: list[str]) -> list[sqlite3.Row]:
@@ -325,7 +324,7 @@ class PasskeyApprover:
                 if len(existing) >= _MAX_PASSKEYS_PER_PERSON:
                     raise Refused("too_many_passkeys")
                 options, state = self._server.register_begin(
-                    {"id": principal.encode("utf-8"), "name": principal, "displayName": self.display_name(principal)},
+                    {"id": principal.encode("utf-8"), "name": self.name_of(principal), "displayName": self.name_of(principal)},
                     [AttestedCredentialData(bytes(r["data"])) for r in existing],
                     resident_key_requirement=ResidentKeyRequirement.REQUIRED,
                     user_verification=UserVerificationRequirement.REQUIRED,

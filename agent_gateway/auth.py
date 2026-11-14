@@ -56,7 +56,7 @@ class StaticTokenVerifier:
         if match is None:
             return None
         # The raw token is not kept: nothing downstream needs it.
-        return AccessToken(token="", client_id=match.id, scopes=[], subject=match.principal)
+        return AccessToken(token="", client_id=match.id, scopes=[], subject=match.subject)
 
 
 def caller_of(request: Any) -> Caller | None:

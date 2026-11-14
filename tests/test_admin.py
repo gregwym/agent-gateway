@@ -139,16 +139,16 @@ async def test_live_tokens_permissions_and_restart_persistence(tmp_path):
     port = free_port()
     async with web_gateway(tmp_path, port=port) as (gw, http, origin, path):
         key, _ = await setup(http, origin, path)
-        reply = await change(http, 'clients/create', id='new-agent', principal='person_a')
+        reply = await change(http, 'clients/create', id='new-agent', household='household')
         assert reply.status_code == 200, reply.text
         token = reply.json()['token']
         visible = (await rpc(origin, token)).json()['result']['tools']
-        assert 'a_list_notes' in {t['name'] for t in visible}
+        assert visible == []
         assert token not in json.dumps(await state(http)) and token not in gw.audit_text()
         assert token.encode() not in (tmp_path / 'admin.enc').read_bytes()
         invalid = await change(http, 'permissions/save', principal='person_b', connection='notes-a', tool='a_list_notes', effect='allow')
         assert invalid.status_code == 400
-        shared = await change(http, 'permissions/save', principal='person_b', connection='notes-a', tool='a_list_notes', effect='allow', cross_account=True)
+        shared = await change(http, 'permissions/save', client='agent-b', connection='notes-a', tool='a_list_notes', effect='allow', cross_account=True)
         assert shared.status_code == 200, shared.text
         rotated = await change(http, 'clients/rotate', id='new-agent')
         newer = rotated.json()['token']
@@ -178,7 +178,8 @@ async def test_connector_review_probe_restrictions_and_encrypted_secret(tmp_path
         assert (await change(http, 'connections/apply', draft=draft, reviewed=True)).status_code == 200
         assert (await http.post('/admin/api/connections/test', json={'id': 'work'})).status_code == 200
         visible = (await rpc(origin, TOKEN_A)).json()['result']['tools']
-        assert 'work_list' in {t['name'] for t in visible}
+        assert 'work_list' not in {t['name'] for t in visible}
+        assert (await change(http, 'permissions/save', client='agent-a', connection='work', tool='work_list', effect='allow')).status_code == 200
         limited = await change(http, 'tools/restrict', connection='work', tool='work_list', pin={'folder':'family'}, allow_values={})
         assert limited.status_code == 200
         reply = (await rpc(origin, TOKEN_A, 'tools/call', {'name':'work_list','arguments':{}})).json()
@@ -227,11 +228,11 @@ async def test_failed_save_is_atomic_and_configuration_change_invalidates_approv
         def fail(*args):
             raise OSError('test disk full')
         monkeypatch.setattr(controller.store.file, 'set', fail)
-        assert (await change(http, 'clients/create', id='atomic', principal='person_a')).status_code == 500
+        assert (await change(http, 'clients/create', id='atomic', household='household')).status_code == 500
         assert (await state(http))['revision'] == 0
         assert (await rpc(origin, TOKEN_A)).status_code == 200
         monkeypatch.setattr(controller.store.file, 'set', original)
-        assert (await change(http, 'clients/create', id='atomic', principal='person_a')).status_code == 200
+        assert (await change(http, 'clients/create', id='atomic', household='household')).status_code == 200
         response = (await rpc(origin, TOKEN_A, 'tools/call', {'name':'a_add_note','arguments':note})).json()
         assert response['result']['isError']
         assert request_id_in(response['result']['content'][0]['text']) != request_id
@@ -241,7 +242,8 @@ async def test_failed_save_is_atomic_and_configuration_change_invalidates_approv
 async def test_revocation_drains_inflight_calls_and_drafts_are_session_bound(tmp_path):
     async with web_gateway(tmp_path) as (gw, http, origin, path):
         key, _ = await setup(http, origin, path)
-        token = (await change(http, 'clients/create', id='slow-agent', principal='person_a')).json()['token']
+        token = (await change(http, 'clients/create', id='slow-agent', household='household')).json()['token']
+        assert (await change(http, 'permissions/save', client='slow-agent', connection='notes-a', tool='a_slow', effect='allow')).status_code == 200
         order = []
         async def running_call():
             answer = await rpc(origin, token, 'tools/call', {'name':'a_slow','arguments':{'seconds':0.25}})

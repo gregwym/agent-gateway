@@ -44,7 +44,7 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
     async with admin_page(tmp_path, locale) as (page, origin):
         label = 'Greg <b>林</b>'
         await page.locator('.profile-name').click()
-        await page.get_by_label(t('Display name', '显示名称'), exact=True).fill(label)
+        await page.get_by_label(t('Name', '名字'), exact=True).fill(label)
         await page.get_by_role('button', name=t('Save name', '保存名称'), exact=True).click()
         await playwright.expect(page.locator('.profile-name')).to_have_text(label)
         assert await page.locator('.profile-name b').count() == 0
@@ -58,7 +58,7 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         pending = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'a_add_note', 'arguments': {'folder': 'inbox', 'text': 'name UI test'}})).json()
         request_id = request_id_in(pending['result']['content'][0]['text'])
         await page.goto(origin + '/approvals/r/' + request_id)
-        await playwright.expect(page.locator('dl')).to_contain_text(label + ' (person_a)')
+        await playwright.expect(page.locator('dl')).to_contain_text(label)
         assert await page.locator('dl b').count() == 0
         await page.goto(origin + '/admin/')
         await page.get_by_role('button', name=t('Connectors', '连接器'), exact=True).click()

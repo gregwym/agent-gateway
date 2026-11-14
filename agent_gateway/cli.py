@@ -97,14 +97,15 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     print("Clients")
     for client in cfg.clients:
-        print(f"  {client.id:<28} -> {client.principal}")
+        print(f"  {client.id:<28} -> {cfg.name_of(client.household or client.subject)}")
 
     print("\nAccess (default: deny)")
-    for principal in cfg.principals:
-        print(f"  {principal}")
+    subjects = [(c.id, c.subject) for c in cfg.clients] if cfg.households else [(None, p) for p in cfg.principals]
+    for client_id, principal in subjects:
+        print(f"  {client_id or principal}")
         rows = 0
         for name, route in gateway.routes.items():
-            effect = policy.effect(principal, name)
+            effect = policy.effect(principal, name, client_id)
             if effect == "deny":
                 continue
             rows += 1
@@ -127,7 +128,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         if not rows:
             print("    (nothing)")
 
-    granted = {name for name in gateway.routes for p in cfg.principals if policy.effect(p, name) != "deny"}
+    granted = {name for name in gateway.routes for client_id, p in subjects if policy.effect(p, name, client_id) != "deny"}
     print()
     for name, route in gateway.routes.items():
         if name not in granted:
@@ -264,6 +265,7 @@ def cmd_approval(args: argparse.Namespace) -> int:
     if cfg.approvals is None:
         raise ConfigError("no `approvals:` section is configured")
     approver = PasskeyApprover(cfg.approvals, Audit(cfg.audit.path, cfg.audit.retention_days), cfg.audit.retention_days)
+    approver.name_of = cfg.name_of
     try:
         if args.action == "passkeys":
             for key in approver.passkeys():

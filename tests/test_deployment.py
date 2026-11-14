@@ -185,15 +185,20 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
             assert registered.status_code == 200, registered.text
             csrf = registered.json()['csrf']
             http.headers['X-CSRF-Token'] = csrf
-            renamed = await http.post('/admin/api/members/rename', json={'revision':0,'id':'person_a','display_name':'Container owner'})
+            renamed = await http.post('/admin/api/members/rename', json={'revision':0,'id':'person_a','name':'Container owner'})
             assert renamed.status_code == 200, renamed.text
-            created = await http.post('/admin/api/clients/create', json={'revision':0,'id':'web-agent','principal':'person_a'})
+            created = await http.post('/admin/api/clients/create', json={'revision':0,'id':'web-agent','household':'household'})
             assert created.status_code == 200, created.text
             token = created.json()['token']
             preview = await http.post('/admin/api/connections/preview', json={'revision':1,'id':'web-notes','owner':'person_a','kind':'demo'})
             assert preview.status_code == 200, preview.text
             applied = await http.post('/admin/api/connections/apply', json={'revision':1,'draft':preview.json()['draft'],'reviewed':True})
             assert applied.status_code == 200, applied.text
+            async with agent(base + '/mcp', token, Host='localhost') as client:
+                assert not await tool_names(client)
+            granted = await http.post('/admin/api/permissions/save', json={'revision':2,'client':'web-agent',
+                'connection':'web-notes','tool':'web_notes_list','effect':'allow'})
+            assert granted.status_code == 200, granted.text
             cookies = http.cookies
         docker('restart', name)
         port = docker('port', name, '8080/tcp').rsplit(':',1)[1]
@@ -202,8 +207,8 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
         async with httpx2.AsyncClient(base_url=base, headers=headers, cookies=cookies, trust_env=False) as http:
             saved = await http.get('/admin/api/state')
             assert saved.status_code == 200, saved.text
-            assert saved.json()['revision'] == 2
-            assert next(m for m in saved.json()['members'] if m['id']=='person_a')['display_name'] == 'Container owner'
+            assert saved.json()['revision'] == 3
+            assert next(m for m in saved.json()['members'] if m['id']=='person_a')['name'] == 'Container owner'
             assert any(c['id']=='web-notes' for c in saved.json()['connections'])
             assert token not in saved.text
         async with agent(base + '/mcp', token, Host='localhost') as client:

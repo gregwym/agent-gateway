@@ -8,16 +8,15 @@ import json
 import re
 import secrets
 import sys
-import unicodedata
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .config import Config, ConnectionCfg
+from .config import Config, ConnectionCfg, validate_name
 from .credentials import EncryptedFileStore
 from .lock import Lock, digest_of
 from .passkey import Refused
 
-SECTIONS = ("principals", "shared", "clients", "connections", "policy")
+SECTIONS = ("principals", "shared", "households", "members", "clients", "connections", "policy")
 CATALOG = {
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
@@ -37,14 +36,11 @@ CATALOG = {
 }
 
 
-def display_name(value):
-    if not isinstance(value, str):
-        raise Refused("invalid_display_name", 400)
-    value = value.strip()
-    if not 1 <= len(value) <= 80 or any(unicodedata.category(c) in ("Cc", "Cs") or
-            unicodedata.bidirectional(c) in ("LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI") for c in value):
-        raise Refused("invalid_display_name", 400)
-    return value
+def member_name(value):
+    try:
+        return validate_name(value)
+    except ValueError:
+        raise Refused("invalid_member_name", 400) from None
 
 
 class ManagedStore:
@@ -58,6 +54,46 @@ class ManagedStore:
             self.state = json.loads(self.file.get("state"))
         # Fail closed on a malformed/corrupt state file, including tool locks.
         self.effective(self.state)
+        self.state = self.upgrade(self.state)
+
+    def upgrade(self, state):
+        """Normalize legacy web state without changing any existing Agent's grants.
+
+        No disk write at startup: the next administrator edit persists this format.
+        Credential IDs, client subjects, token hashes and approval revisions survive.
+        """
+        cfg, _, _ = self.effective(state)
+        if cfg.households:
+            result = copy.deepcopy(state)
+            result.update(schema=2, config={key: cfg.model_dump(mode="json")[key] for key in SECTIONS})
+            result.pop("display_names", None)
+            return result
+        if len(cfg.shared) > 1:
+            raise ValueError("legacy shared identities need an explicit household membership migration")
+        from .policy import Policy
+        policy = Policy(cfg)
+        result = copy.deepcopy(state)
+        raw = {key: cfg.model_dump(mode="json")[key] for key in SECTIONS}
+        home = cfg.shared[0] if cfg.shared else "household"
+        suffix = 0
+        while home in cfg.principals and home not in cfg.shared:
+            suffix += 1
+            home = f"home_{suffix}"
+        names = result.pop("display_names", {})
+        raw["households"] = [{"id": home, "name": names.get(home, "Home")}]
+        raw["members"] = [{"id": p, "name": names.get(p, p), "household": home}
+                          for p in cfg.principals if p not in cfg.shared]
+        raw["principals"] = [m["id"] for m in raw["members"]] + [home]
+        raw["shared"] = [home]
+        for client in raw["clients"]:
+            client["household"] = home
+        raw["policy"] = [{"clients": [c.id], "connection": conn.id, "tools": [tool.name], "effect": effect}
+                         for c in cfg.clients for conn in cfg.connections for tool in conn.tools
+                         if (effect := policy.effect(c.subject, tool.name, c.id)) != "deny"]
+        result.update(schema=2, config=raw)
+        normalized, _, _ = self.effective(result)
+        result["config"] = {key: normalized.model_dump(mode="json")[key] for key in SECTIONS}
+        return result
 
     def effective(self, state):
         raw = self.base.model_dump(mode="json")
@@ -65,12 +101,12 @@ class ManagedStore:
             raise ValueError("managed state contains host-only settings")
         raw.update(state["config"])
         cfg = Config.model_validate(raw)
-        names = state.get("display_names", {})
+        names = state.get("display_names", {})  # read-only upgrade input from releases before 0.3
         if not isinstance(names, dict) or set(names) - set(cfg.principals):
-            raise ValueError("display names must belong to existing members")
+            raise ValueError("names must belong to existing members")
         for value in names.values():
-            if display_name(value) != value:
-                raise ValueError("display names must be trimmed")
+            if member_name(value) != value:
+                raise ValueError("names must be trimmed")
         entries = copy.deepcopy(self.base_lock.entries)
         for connection, definitions in state["locks"].items():
             for entry in definitions.values():
@@ -94,14 +130,19 @@ class ManagedStore:
         self.state = state
 
     def name_of(self, principal):
-        return self.state.get("display_names", {}).get(principal, principal)
+        raw = self.state["config"]
+        return next((m["name"] for key in ("members", "households") for m in raw.get(key, []) if m["id"] == principal), principal)
 
     def rename(self, principal, value):
         cfg, _, _ = self.effective(self.state)
         if principal not in cfg.principals:
             raise Refused("unknown_member", 400)
         state = copy.deepcopy(self.state)
-        state.setdefault("display_names", {})[principal] = display_name(value)
+        name = member_name(value)
+        kind = "members" if principal not in cfg.shared else "households"
+        if any(m["id"] != principal and m["name"].casefold() == name.casefold() for m in state["config"][kind]):
+            raise Refused("duplicate_member" if kind == "members" else "duplicate_household", 400)
+        next(m for m in state["config"][kind] if m["id"] == principal)["name"] = name
         self.save(state)
 
 

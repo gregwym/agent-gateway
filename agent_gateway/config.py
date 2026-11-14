@@ -10,12 +10,13 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 NAME = r"^[a-z][a-z0-9_-]{0,47}$"
 # Deliberately narrower than what MCP allows: no dots, so names survive every client.
@@ -83,11 +84,37 @@ class ApprovalsCfg(_Model):
 
 
 class ClientCfg(_Model):
-    """One credential. A client is bound to exactly one principal, forever."""
+    """One Agent credential, with its own grants and a household membership."""
 
     id: str = Field(pattern=NAME)
-    principal: str
+    principal: str | None = None  # legacy audit/binding identity; never a grant in the household model
+    household: str | None = None
     token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @property
+    def subject(self) -> str:
+        return self.principal or self.household or ""
+
+
+def validate_name(value: str) -> str:
+    if (not isinstance(value, str) or not 1 <= len(value.strip()) <= 80 or
+            any(unicodedata.category(c) in ("Cc", "Cs") or unicodedata.bidirectional(c) in
+                ("LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI") for c in value)):
+        raise ValueError("name must contain 1 to 80 characters without control characters")
+    return value.strip()
+
+
+class HouseholdCfg(_Model):
+    id: str = Field(pattern=NAME)
+    name: str
+    _name = field_validator("name", mode="before")(validate_name)
+
+
+class MemberCfg(_Model):
+    id: str = Field(pattern=NAME)  # immutable credential/ownership key, not a second name
+    name: str
+    household: str
+    _name = field_validator("name", mode="before")(validate_name)
 
 
 class AdminCfg(_Model):
@@ -179,13 +206,20 @@ class ConnectionCfg(_Model):
 
 
 class RuleCfg(_Model):
-    principals: list[str] = Field(min_length=1)
+    principals: list[str] = []  # legacy host configuration only
+    clients: list[str] = []
     connection: str
     tools: list[str] = Field(min_length=1)  # exposed names; no wildcards
     effect: Effect
     # Must be set to grant a principal access to an account it does not own
     # (unless the owner is listed under `shared`). Guards against copy-paste grants.
     cross_account: bool = False
+
+    @model_validator(mode="after")
+    def _subjects(self):
+        if bool(self.principals) == bool(self.clients):
+            raise ValueError("a rule must select either Agents or legacy principals")
+        return self
 
 
 class Config(_Model):
@@ -195,12 +229,24 @@ class Config(_Model):
     approvals: ApprovalsCfg | None = None
     admin: AdminCfg | None = None
     lock_file: Path = Path("tools.lock.json")
-    principals: list[str] = Field(min_length=1)
+    principals: list[str] = Field(default_factory=list, min_length=1)
     # Principals whose accounts are meant to be shared, e.g. `household`.
     shared: list[str] = []
+    households: list[HouseholdCfg] = []
+    members: list[MemberCfg] = []
     clients: list[ClientCfg]
     connections: list[ConnectionCfg]
     policy: list[RuleCfg] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def _identity_keys(cls, raw):
+        if isinstance(raw, dict) and raw.get("households"):
+            raw = dict(raw)
+            key = lambda item: item.id if isinstance(item, _Model) else item["id"]
+            raw.setdefault("principals", [key(m) for m in raw.get("members", [])] + [key(h) for h in raw["households"]])
+            raw.setdefault("shared", [key(h) for h in raw["households"]])
+        return raw
 
     @model_validator(mode="after")
     def _check(self) -> Config:
@@ -209,6 +255,18 @@ class Config(_Model):
                 raise ValueError(f"invalid principal name {principal!r}")
         _unique("principal", self.principals)
         known = set(self.principals)
+        homes = {h.id for h in self.households}
+        if homes:
+            _unique("household", [h.id for h in self.households])
+            _unique("member", [m.id for m in self.members])
+            _unique("member name", [m.name.casefold() for m in self.members])
+            _unique("household name", [h.name.casefold() for h in self.households])
+            if homes & {m.id for m in self.members} or known != homes | {m.id for m in self.members} or set(self.shared) != homes:
+                raise ValueError("identity keys must match members and households")
+            if any(m.household not in homes for m in self.members):
+                raise ValueError("member belongs to an unknown household")
+        elif self.members:
+            raise ValueError("members need a household")
         if self.admin:
             if not self.approvals or not self.secrets:
                 raise ValueError("admin requires approvals and an encrypted secrets store")
@@ -221,8 +279,12 @@ class Config(_Model):
         _unique("client id", [c.id for c in self.clients])
         _unique("client token", [c.token_sha256 for c in self.clients], show=False)
         for client in self.clients:
-            if client.principal not in known:
+            if homes and client.household not in homes:
+                raise ValueError(f"client {client.id}: unknown household")
+            if client.subject not in known:
                 raise ValueError(f"client {client.id}: unknown principal {client.principal!r}")
+            if homes and self.household_of(client.subject) != client.household:
+                raise ValueError(f"client {client.id}: identity is outside its household")
 
         _unique("connection id", [c.id for c in self.connections])
         _unique("(service, account)", [f"{c.service}/{c.account}" for c in self.connections])
@@ -241,6 +303,14 @@ class Config(_Model):
             conn = by_id.get(rule.connection)
             if conn is None:
                 raise ValueError(f"{where}: unknown connection {rule.connection!r}")
+            if homes and rule.principals:
+                raise ValueError(f"{where}: household configuration requires per-Agent grants")
+            for client_id in rule.clients:
+                client = next((c for c in self.clients if c.id == client_id), None)
+                if client is None:
+                    raise ValueError(f"{where}: unknown Agent {client_id!r}")
+                if homes and client.household != self.household_of(conn.owner) and rule.effect != "deny":
+                    raise ValueError(f"{where}: cannot grant access outside the Agent's household")
             exposed = {t.name for t in conn.tools}
             for tool in rule.tools:
                 if tool not in exposed:
@@ -262,8 +332,18 @@ class Config(_Model):
     def approvers_of(self, conn: ConnectionCfg) -> tuple[str, ...]:
         """Whose decision counts for a call on this account: its owner, or every person if it is shared."""
         if conn.owner in self.shared:
+            if self.households:
+                return tuple(m.id for m in self.members if m.household == conn.owner)
             return tuple(p for p in self.principals if p not in self.shared)
         return (conn.owner,)
+
+    def household_of(self, owner: str) -> str | None:
+        if any(h.id == owner for h in self.households):
+            return owner
+        return next((m.household for m in self.members if m.id == owner), None)
+
+    def name_of(self, identity: str) -> str:
+        return next((item.name for item in [*self.members, *self.households] if item.id == identity), identity)
 
 
 def _matches(pattern: str, value: str) -> bool:

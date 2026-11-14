@@ -41,19 +41,19 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
 
                 await page.get_by_role('button', name=t('Members','家庭成员'), exact=True).click()
                 await page.get_by_role('button', name=t('Add member','添加成员'), exact=True).click()
-                await page.get_by_label(t('Identity name','身份名称'), exact=True).fill('alex')
+                await page.get_by_label(t('Name','名字'), exact=True).fill('alex')
                 await page.get_by_role('button', name=t('Add','添加'), exact=True).click()
                 await playwright.expect(page.get_by_role('heading', name='alex', exact=True)).to_be_visible()
 
                 await page.get_by_role('button', name=t('Agents','Agent 接入'), exact=True).click()
                 await page.get_by_role('button', name=t('Create agent token','创建 Agent Token'), exact=True).click()
                 await page.get_by_label(t('Agent name','Agent 名称'), exact=True).fill('browser-agent')
-                await page.get_by_label(t('Identity','身份'), exact=True).select_option('person_b')
+                await page.get_by_label(t('Household','所属家庭'), exact=True).select_option('household')
                 await page.get_by_role('button', name=t('Create token','创建 Token'), exact=True).click()
                 token = await page.get_by_label(t('Agent token','Agent Token'), exact=True).input_value()
                 assert token.startswith('agw_')
                 names = {tool['name'] for tool in (await rpc(origin, token)).json()['result']['tools']}
-                assert 'b_list_notes' in names and 'a_list_notes' not in names
+                assert names == set()
                 await page.get_by_role('button', name=t('Close','关闭'), exact=True).click()
                 assert token not in await page.locator('body').inner_text()
                 await page.get_by_role('row').filter(has_text='browser-agent').get_by_role('button', name=t('Revoke','撤销'), exact=True).click()
@@ -75,10 +75,9 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await playwright.expect(connector).to_contain_text(t('Read check passed','读取验证通过'))
 
                 await page.get_by_role('button', name=t('Permissions','权限'), exact=True).click()
-                await page.get_by_label(t('Inspect as','以此身份检查'), exact=True).select_option('household')
+                await page.get_by_label(t('Agent','Agent'), exact=True).select_option('shared-agent')
                 row = page.get_by_role('row').filter(has_text='browser_notes_list')
                 await row.get_by_label(t('Effect','权限效果'), exact=True).select_option('allow')
-                await row.get_by_label(t('Explicitly share access to this other account','明确允许访问另一人的账号'), exact=True).check()
                 await row.get_by_role('button', name=t('Save access','保存权限'), exact=True).click()
                 await playwright.expect(row.get_by_label(t('Effect','权限效果'), exact=True)).to_have_value('allow')
                 await row.get_by_role('button', name=t('Argument limits','参数限制'), exact=True).click()

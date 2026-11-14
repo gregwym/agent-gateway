@@ -79,7 +79,7 @@ class AdminAuth:
                     raise Refused("invalid_setup_link")
                 target = row["code"]
                 options, state = self.approver._server.register_begin(
-                    {"id": self.owner.encode(), "name": self.owner, "displayName": self.approver.display_name(self.owner)},
+                    {"id": self.owner.encode(), "name": self.approver.name_of(self.owner), "displayName": self.approver.name_of(self.owner)},
                     resident_key_requirement=ResidentKeyRequirement.REQUIRED,
                     user_verification=UserVerificationRequirement.REQUIRED,
                 )

@@ -70,7 +70,7 @@ async def test_save_failure_has_actionable_code_and_safe_incident(tmp_path, monk
             raise failure
         monkeypatch.setattr(gw.app.state.admin.store, 'save', fail)
         response = await http.post('/admin/api/members/rename', json={
-            'revision': before['revision'], 'id': 'person_a', 'display_name': 'Test'})
+            'revision': before['revision'], 'id': 'person_a', 'name': 'Test'})
         assert response.status_code == 500 and response.json()['error'] == code
         incident = response.json()['incident']
         assert re.fullmatch(r'[a-f0-9]{12}', incident) and incident in gw.audit_text()
