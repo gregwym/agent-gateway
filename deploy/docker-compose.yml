@@ -3,7 +3,9 @@
 # Host layout (AGW_HOME, default ./data), all owned by uid 10001:
 #   config/gateway.yaml, config/tools.lock.json   read-only for the running gateway
 #   secrets/secrets.enc                            encrypted upstream credentials
-#   state/audit/                                   audit log (the only thing the gateway writes)
+#   state/audit/                                   audit log
+#   state/approvals.sqlite                         passkeys and approval requests, if `approvals:` is configured
+#                                                  (state/ is the only place the gateway writes)
 # and, kept apart so one backup job does not pick up both halves:
 #   AGW_KEY_DIR (default ./data/key)/master.key    the key for secrets.enc
 #

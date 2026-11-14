@@ -201,3 +201,70 @@ def test_token_command_prints_a_token_and_its_hash(capsys):
     lines = [line.strip() for line in capsys.readouterr().out.splitlines()]
     token = next(line for line in lines if line.startswith("agw_"))
     assert len(token) > 40 and hash_token(token) in lines
+
+
+@pytest.mark.parametrize("name", ["gateway.example.yaml", "gateway.household.example.yaml"])
+def test_the_shipped_examples_are_rejected_as_they_are_and_valid_once_filled_in(tmp_path, name):
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "deploy" / name).read_text(encoding="utf-8")
+    target = tmp_path / "config" / "gateway.yaml"
+    target.parent.mkdir()
+    target.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError):  # placeholder token hashes
+        load_config(target)
+    for index in range(text.count("PASTE_HASH_FROM_agw_token")):
+        text = text.replace("PASTE_HASH_FROM_agw_token", hash_token(f"agw_example-token-{index}-{'x' * 32}"), 1)
+    target.write_text(text, encoding="utf-8")
+    cfg = load_config(target)
+    assert {client.principal for client in cfg.clients} == {"person_a", "person_b", "household"}
+    policy, names = Policy(cfg), [tool.name for connection in cfg.connections for tool in connection.tools]
+    reach = {who: {name for name in names if policy.effect(who, name) != "deny"} for who in cfg.principals}
+    assert reach["household"] and reach["household"] < set(names)  # the shared agent gets something, never everything
+    assert not any("_mail_" in name or "_gmail_" in name for name in reach["household"])
+    assert not reach["person_a"] & {name for name in names if name.startswith("b_")}
+
+
+def test_the_household_example_names_tools_the_connectors_really_have(tmp_path):
+    """A wrong upstream name in the example would only show up at `agw lock`, on someone's real setup."""
+    from pathlib import Path
+
+    import yaml
+
+    from agent_gateway.connectors import caldav_calendar, gmail, imap_mail, reminders_eventkit
+
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    tools = {
+        "agent_gateway.connectors.imap_mail": imap_mail.build_tools(None, 1, 1),
+        "agent_gateway.connectors.caldav_calendar": caldav_calendar.build_tools(SimpleNamespace(zone=ZoneInfo("UTC"))),
+        "agent_gateway.connectors.gmail": gmail.build_tools(None, 1, 1),
+    }
+    offered = {module: {tool.name: tool for tool in found} for module, found in tools.items()}
+    raw = yaml.safe_load((Path(__file__).resolve().parent.parent / "deploy" / "gateway.household.example.yaml").read_text(encoding="utf-8"))
+    assert len(raw["connections"]) == 6
+    for connection in raw["connections"]:
+        module = connection["command"][-1]
+        assert connection["command"][:2] == ["python", "-m"] and module in offered, connection["id"]
+        for tool in connection["tools"]:
+            assert tool["upstream"] in offered[module], tool["name"]
+            assert set(tool.get("pin", {})) <= set(offered[module][tool["upstream"]].properties), tool["name"]  # real arguments
+
+    # The Reminders helper is a gateway of its own; what it exposes is what the main gateway's example asks it for.
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    target = tmp_path / "gateway.yaml"
+    helper_text = (deploy / "reminders-helper.example.yaml").read_text(encoding="utf-8")
+    target.write_text(helper_text.replace("PASTE_HASH_FROM_agw_token", hash_token("agw_example-token-" + "x" * 32)), encoding="utf-8")
+    helper = load_config(target)
+    (connection,) = helper.connections
+    assert connection.command == ["python", "-m", "agent_gateway.connectors.reminders_eventkit"]
+    assert {tool.upstream for tool in connection.tools} == {t.name for t in reminders_eventkit.build_tools(None)}
+    assert helper.secrets is None
+    assert not connection.secret_env and [client.principal for client in helper.clients] == ["person_a"]
+    lines = (deploy / "gateway.household.example.yaml").read_text(encoding="utf-8").splitlines()
+    block = lines[lines.index("  # - id: reminders-a") :]
+    block = block[: next(i for i, line in enumerate(block) if not line.startswith("  # "))]
+    (main_side,) = yaml.safe_load("\n".join(line.replace("  # ", "", 1) for line in block))
+    assert main_side["transport"] == "http" and main_side["bearer_secret"] == "reminders_helper_token_a"
+    assert {tool["upstream"] for tool in main_side["tools"]} == {tool.name for tool in connection.tools}

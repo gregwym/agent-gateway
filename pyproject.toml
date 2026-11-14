@@ -25,17 +25,35 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# The bundled connectors for IMAP mail and CalDAV calendars. The Gmail connector needs nothing extra.
+connectors = ["IMAPClient>=4.1,<5", "caldav>=3.7,<4"]
+# The one-time Google consent helper. For a computer with a browser, not for the gateway host.
+gmail-auth = ["google-auth-oauthlib>=1.2,<2"]
+# The Reminders connector, which runs natively on macOS.
+macos = ["pyobjc-framework-EventKit>=10; sys_platform == 'darwin'"]
+# The tests run the connectors against real local servers: pymap (IMAP) and Radicale (CalDAV).
+dev = [
+    "agent-gateway[connectors,gmail-auth,macos]",
+    "pytest>=8",
+    "pymap>=0.36,<0.37",
+    "Radicale>=3.5,<4",
+]
+
+browser-tests = ["playwright>=1.51,<2"]
 
 [project.scripts]
 agw = "agent_gateway.cli:main"
 
 [tool.setuptools]
-packages = ["agent_gateway"]
+packages = ["agent_gateway", "agent_gateway.connectors"]
 
 [tool.setuptools.package-data]
 agent_gateway = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "browser: Chromium approval-page acceptance with a virtual authenticator",
+    "docker: disposable container acceptance (scripts/acceptance.py --docker)",
+]
 filterwarnings = ["ignore::DeprecationWarning"]

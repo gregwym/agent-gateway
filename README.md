@@ -15,14 +15,21 @@ the upstream calls with **credentials the agent never sees**.
                                  arguments → audit
 ```
 
-It is about 1,600 lines of Python (comments included) on top of the official
-[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk). There is no
-database, no web UI and no admin API: one YAML file, one lock file, one encrypted
-secret file, one audit log.
+The gateway is about 2,250 lines of Python (comments included) on top of the official
+[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk); the bundled
+read-only connectors are about 1,400 more. There is no admin API and no dashboard:
+one YAML file, one lock file, one encrypted secret file, one audit log and, when
+approvals are enabled, one SQLite file and one web page.
 
-**Status.** The gateway core and passkey approval are implemented and tested. Connectors
-for real services (iCloud Mail, calendars, Gmail) are being added. See
-[what it does not do](#what-it-does-not-do).
+**Status.** The gateway core, passkey approval and read-only connectors for iCloud
+Mail, iCloud Calendar and Gmail are implemented and tested against local stand-ins
+(a real IMAP server, a real CalDAV server, a fake Google, and software passkeys).
+The approval page also runs in real Chromium with a virtual WebAuthn authenticator;
+Reminders is exercised through two gateway helpers with an EventKit substitute.
+**Nothing here has been run against a real iCloud or Google account or a real
+authenticator yet.** The Reminders connector is experimental. See
+[what it does not do](#what-it-does-not-do), and the checklist of what to verify
+yourself in [docs/deployment.md](docs/deployment.md) (中文).
 
 ## What it does
 
@@ -51,6 +58,9 @@ for real services (iCloud Mail, calendars, Gmail) are being added. See
   the account's owner approves that exact call (same client, account, tool and
   arguments) with a passkey, runs once, and needs a new approval the next time.
   Without an `approvals:` section such a tool is visible and **never runs**.
+- **Read-only connectors included.** iCloud Mail (IMAP), iCloud Calendar (CalDAV) and
+  Gmail, one process per account, searching and reading on demand: no mailbox is
+  synchronised or indexed. See [bundled connectors](#bundled-connectors).
 
 ## What it does not do
 
@@ -63,12 +73,17 @@ Read this list before trusting it with real accounts. Details and reasons are in
 - **It cannot tell which person is talking to a shared agent.** A token proves which
   *client* is calling. A token stored where another agent can read it proves nothing.
   Agents that serve both people must be given a `household` client.
-- **Approval has not been exercised with a real browser and authenticator here.** The
-  tests drive the server with a software passkey. Whoever can edit the config or the
-  approval store on the host can bypass it.
-- **"Read-only" is an allowlist, not a credential property.** Hiding write tools does
-  not make an IMAP app-specific password read-only. A buggy or malicious connector
-  can do whatever its credential allows.
+- **Physical passkeys have not been tested.** The approval tests cover the real
+  Chromium page and WebAuthn API with a virtual authenticator, plus server-side
+  signature checks. Whoever can edit the config or approval store can bypass it.
+- **It has not been verified against the real services.** The connectors were tested
+  against pymap, Radicale and a stand-in for Google's API. iCloud and Gmail will
+  differ somewhere.
+- **"Read-only" is a credential property only for Gmail.** The Gmail token is limited
+  to `gmail.readonly` by Google. An iCloud app-specific password can send mail and
+  change calendars; there, read-only means the connector sends only read requests.
+  macOS grants Reminders access as full access. A buggy or malicious connector can
+  do whatever its credential allows.
 - **No defence against prompt injection in content.** Mail bodies and other tool
   results are returned as they are. The gateway bounds what a misled model can
   *do* (its tools, its accounts); it does not stop the model from being misled.
@@ -110,7 +125,11 @@ curl -s http://127.0.0.1:8080/mcp \
 ```
 
 Each token lists a different set of tools. `a_notes_add` is listed for person_a and
-answers "This action needs human approval and was not executed."
+does not run: it answers "This action needs human approval and was not executed."
+To try the approval flow, run `agw approval enroll person_a` and open the link it
+prints in a browser on the same machine (the example config uses
+`http://localhost:8080`) to create a passkey. Call `a_notes_add` again: the answer
+now names a page where the request waits. Open it, approve, and repeat the same call.
 
 ## Docker Compose
 
@@ -121,7 +140,7 @@ cp gateway.example.yaml data/config/gateway.yaml      # then edit it
 sudo chown -R 10001:10001 data                        # the container runs as uid 10001
 
 docker compose build
-docker compose run --rm admin token                    # per client; paste the hashes into gateway.yaml first
+docker compose run --rm admin token                    # per client; paste the hashes into gateway.yaml
 docker compose run --rm admin secret init
 docker compose run --rm admin secret set notes_key_a   # and the others
 docker compose run --rm admin lock --write
@@ -135,12 +154,15 @@ capabilities, and config, key and secrets mounted read-only. That limits what a 
 in the gateway can do. It is not isolation from the host's administrators.
 Verified on linux/arm64 (Docker 29, Compose v5); on macOS with Colima or Docker
 Desktop the `chown` is not needed.
-Deployment constraints, backup and rotation: [docs/deployment.md](docs/deployment.md).
+Deployment constraints, real accounts, approvals, backup and rotation:
+[docs/deployment.md](docs/deployment.md).
 
 ## Configuration
 
 One file, read at startup. [deploy/gateway.example.yaml](deploy/gateway.example.yaml)
-is a complete, commented example.
+is a complete, commented demo;
+[deploy/gateway.household.example.yaml](deploy/gateway.household.example.yaml) is two
+people with iCloud Mail, iCloud Calendar and Gmail each.
 
 | Key | Meaning |
 |---|---|
@@ -148,6 +170,7 @@ is a complete, commented example.
 | `audit` | `path`, `retention_days` (one file per UTC day) |
 | `secrets` | `path` of the encrypted store, `key_file` |
 | `lock_file` | reviewed tool definitions, default `tools.lock.json` |
+| `approvals` | `origin` (the https address people open to approve), `store` (SQLite file), `request_ttl_seconds`, `grant_ttl_seconds` |
 | `principals` | the identities that exist |
 | `shared` | principals whose accounts are meant to be shared (e.g. `household`) |
 | `clients[]` | `id`, `principal`, `token_sha256`: one per credential handed out |
@@ -167,6 +190,7 @@ relative to the config file.
 | `agw lock [--write] [--connection ID]` | diff upstream tool definitions against the lock file; `--write` accepts them |
 | `agw token` | mint a client token and print its hash (the token is not stored) |
 | `agw secret init \| set NAME \| rm NAME \| list` | manage upstream credentials (values are read from a prompt or stdin, never from argv) |
+| `agw approval enroll PERSON \| passkeys \| forget ID \| requests \| cancel ID` | register a person's passkey (prints a one-time link), list or remove passkeys, list recent requests, revoke an unused approval |
 
 All take `-c FILE` or `$AGW_CONFIG`. They are run by a person on the gateway host;
 none of this is reachable over the network.
@@ -225,7 +249,27 @@ anything the model writes. If it cannot do that, give it one `household` client.
 A client-side tool filter (such as OpenClaw's `toolFilter`) is a convenience. The
 allowlist that counts is the gateway's.
 
-## Adding a real service
+## Bundled connectors
+
+Each is a small stdio MCP server, started by the gateway as
+`python -m agent_gateway.connectors.<module>` with one account's credential.
+
+| Module | Service | Tools | Credential | Read-only is enforced by |
+|---|---|---|---|---|
+| `imap_mail` | iCloud Mail (any IMAP over TLS) | `list_mailboxes`, `search_messages`, `get_message`, `get_attachment` | app-specific password | the connector only (`EXAMINE`, `BODY.PEEK`); the password itself can write |
+| `caldav_calendar` | iCloud Calendar (any CalDAV) | `list_calendars`, `list_events`, `get_event`, `check_conflicts` | app-specific password | the connector only (`PROPFIND`, `REPORT`); the password itself can write |
+| `gmail` | Gmail REST API | `search_messages`, `get_message`, `get_attachment` | OAuth refresh token | Google (scope `gmail.readonly`); the connector refuses to use a token with any other scope |
+| `reminders_eventkit` | Apple Reminders, macOS only, **experimental** | `list_lists`, `list_reminders`, `get_reminder` | none (a macOS permission) | the connector only; macOS grants full access |
+
+Messages are searched on the server and fetched one at a time; long bodies are
+returned in pages and attachments up to a size limit. A refused credential produces a
+fixed message telling the agent that a person has to act, and the connector stops
+presenting that credential for a while. `gmail_auth` is the one-time consent helper
+that produces the Gmail token. Setup for each service, and what the Reminders
+connector needs (a helper on that person's own Mac), is in
+[docs/deployment.md](docs/deployment.md).
+
+## Adding another service
 
 A connector is an ordinary MCP server that follows four rules
 ([examples/demo_connector.py](examples/demo_connector.py) is the template):
@@ -238,7 +282,9 @@ A connector is an ordinary MCP server that follows four rules
 Then: add a `connection`, store its secret with `agw secret set`, review its tools
 with `agw lock`, add `policy` rules, restart. A stdio connector runs with the
 gateway's own privileges, so its code is as trusted as the gateway's: review it and
-pin its version. Phase 2 notes for iCloud and Gmail are in [docs/design.md](docs/design.md).
+pin its version. A tool that changes something should get `effect: approval_required`.
+Why the bundled connectors were written rather than taken from existing iCloud MCP
+projects is in [docs/design.md](docs/design.md).
 
 ## Development
 
@@ -252,10 +298,33 @@ processes and cover: cross-user access, calls outside the allowlist, identity
 spoofing through arguments and headers, credential leakage, tool-name collisions,
 upstream definition changes, SSRF through URLs, redirects and schema references,
 approval bypass and replay, the exposed HTTP surface, and upstream failure.
+The connector tests run the mail connector against [pymap](https://github.com/icgood/pymap)
+behind TLS, the calendar connector against [Radicale](https://radicale.org), and the
+Gmail connector against a local stand-in for Google's token and API endpoints.
 
+For the full simulated acceptance suite (no real accounts or credentials):
+
+```sh
+pip install -e '.[dev,browser-tests]'
+python -m playwright install chromium
+python scripts/acceptance.py --docker
+```
+
+The command runs all tests, including the actual approval page in Chromium and
+Reminders through two simulated Mac helpers. With `--docker`, it also builds the
+image and checks non-root execution, read-only mounts, account isolation, approvals
+surviving restart, and connector recovery. It creates only disposable test volumes
+and removes them afterwards. Omit `--docker` when no Docker daemon is available.
+Reports (`report.json`, JUnit XML, logs and browser screenshots) are saved under
+`run/acceptance/`. The JSON report identifies the tested source snapshot.
+[GitHub Actions](.github/workflows/acceptance.yml) runs this on Linux and macOS;
+the Linux Python 3.12 job includes Docker. These simulations do not certify real
+Apple/Google accounts, physical authenticators or macOS permission prompts.
+
+The project is not published on PyPI; install it from a clone.
 `requirements.txt` pins the versions the tests ran against, with hashes, and is what
 the image installs. Regenerate it with
-`pip-compile --generate-hashes --strip-extras -o requirements.txt pyproject.toml`.
+`pip-compile --generate-hashes --strip-extras --extra connectors -o requirements.txt pyproject.toml`.
 
 ## License
 

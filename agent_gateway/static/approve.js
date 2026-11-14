@@ -8,7 +8,7 @@ const TEXT = {
   title_approved: ['Approved', '已批准'],
   title_denied: ['Declined', '已拒绝'],
   title_cancelled: ['Withdrawn', '已撤回'],
-  title_used: ['Approved and executed', '已批准并执行'],
+  title_used: ['Approval used', '批准已使用'],
   title_expired: ['Expired', '已过期'],
   hint_pending: ['Read it carefully. Approving lets the agent run exactly this, once.', '请仔细核对。批准后，Agent 只能按下面的内容执行一次。'],
   hint_approved: ['The agent can now run exactly this, once, until the time below.', 'Agent 现在可以按下面的内容执行一次，截止时间如下。'],

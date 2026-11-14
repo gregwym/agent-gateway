@@ -23,8 +23,10 @@ from helpers import (
     prepare,
     running_gateway,
     text_of,
+    tool_names,
     write_config,
 )
+from mcp import MCPError
 
 from agent_gateway.config import ConfigError, load_config
 from agent_gateway.lock import Lock
@@ -141,6 +143,26 @@ async def test_http_upstream_gets_its_own_credential_and_never_the_callers_token
     seen = json.dumps(recorder.requests)
     assert {r.get("authorization") for r in recorder.requests} == {f"Bearer {SECRETS['notes_key_a']}"}
     assert TOKEN_A not in seen
+
+
+async def test_a_gateway_can_be_the_upstream_of_another_gateway(tmp_path):
+    """The arrangement for a helper on another machine: it serves one account to one client, the main gateway."""
+    async with running_gateway(await prepare(tmp_path / "helper")) as helper:
+        raw = base_config()
+        raw["connections"][1] = {
+            "id": "notes-b", "service": "notes", "account": "person_b", "owner": "person_b", "transport": "http",
+            "url": helper.url, "bearer_secret": "helper_token", "timeout_seconds": 10,
+            "tools": [{"upstream": "b_whoami", "name": "b_whoami"}, {"upstream": "b_list_notes", "name": "b_list_notes"}],
+        }  # fmt: skip
+        secrets = {**SECRETS, "helper_token": TOKEN_B}  # the helper knows the main gateway as its client `agent-b`
+        async with running_gateway(await prepare(tmp_path / "main", raw, secrets=secrets)) as main:
+            async with agent(main.url, TOKEN_B) as b, agent(main.url, TOKEN_A) as a:
+                assert "account=person_b authenticated=yes" in text_of(await b.call_tool("b_whoami", {}))
+                assert "b_whoami" not in await tool_names(a)
+                with pytest.raises(MCPError):
+                    await a.call_tool("b_whoami", {})
+        assert [r["client"] for r in helper.audit() if r["event"] == "tool_call"] == ["agent-b"]
+        assert TOKEN_B not in main.audit_text() + helper.audit_text()
 
 
 def _with_lifespan(recorder: Recorder, inner: Any) -> Any:

@@ -1,0 +1,203 @@
+# A household of two with real accounts: iCloud Mail, iCloud Calendar and Gmail for
+# each person. Every bundled connector only reads. Replace each UPPER_CASE value.
+# The file format itself is explained in gateway.example.yaml; setup steps for each
+# service are in docs/deployment.md.
+#
+# Secrets to store first, with `agw secret set NAME`:
+#   icloud_mail_password_a/_b       app-specific passwords, one per person and use
+#   icloud_calendar_password_a/_b   (separate ones so each can be revoked on its own)
+#   gmail_client_secret             the client secret of your own Google OAuth client
+#   gmail_token_a/_b                from `python -m agent_gateway.connectors.gmail_auth`
+#
+# What "read-only" means here: Gmail's token cannot write, by Google's enforcement.
+# An iCloud app-specific password can do everything, including sending mail; for
+# iCloud the only thing that is read-only is what these connectors send.
+
+server:
+  host: 127.0.0.1
+  port: 8080
+  allowed_hosts: []          # e.g. ["gateway.your-tailnet.ts.net"] once it is reached by name
+  max_result_bytes: 8000000  # room for a 5 MB attachment after base64 encoding
+
+audit:
+  path: ../state/audit/audit.jsonl
+  retention_days: 90
+
+secrets:
+  path: ../secrets/secrets.enc
+  key_file: ../key/master.key
+
+lock_file: tools.lock.json
+
+# Nothing below needs approval, because nothing below writes. When a tool that changes
+# something is added, give it `effect: approval_required` and enable this section.
+# `origin` must be https and is what people open in their browser (see docs/deployment.md).
+# approvals:
+#   origin: https://gateway.your-tailnet.ts.net
+#   store: ../state/approvals.sqlite
+
+principals: [person_a, person_b, household]
+shared: [household]
+
+clients:
+  - id: openclaw-shared            # cannot prove which person is asking: household only
+    principal: household
+    token_sha256: PASTE_HASH_FROM_agw_token
+  - id: mausbot-person-a
+    principal: person_a
+    token_sha256: PASTE_HASH_FROM_agw_token
+  - id: mausbot-person-b
+    principal: person_b
+    token_sha256: PASTE_HASH_FROM_agw_token
+
+connections:
+  # ---- person_a -------------------------------------------------------------------
+  - id: icloud-mail-a
+    service: icloud-mail
+    account: person_a
+    owner: person_a
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.imap_mail"]
+    env: { IMAP_USERNAME: PERSON_A@icloud.com }          # server: imap.mail.me.com unless IMAP_HOST is set
+    secret_env: { IMAP_PASSWORD: icloud_mail_password_a }
+    timeout_seconds: 60
+    tools:
+      - { upstream: list_mailboxes, name: a_mail_mailboxes }
+      - { upstream: search_messages, name: a_mail_search }
+      - { upstream: get_message, name: a_mail_get }
+      - { upstream: get_attachment, name: a_mail_attachment }
+
+  - id: icloud-calendar-a
+    service: icloud-calendar
+    account: person_a
+    owner: person_a
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.caldav_calendar"]
+    env: { CALDAV_USERNAME: PERSON_A_APPLE_ID, CALDAV_TIMEZONE: Etc/UTC }   # your IANA zone, e.g. Europe/Berlin
+    secret_env: { CALDAV_PASSWORD: icloud_calendar_password_a }
+    timeout_seconds: 60
+    tools:
+      - { upstream: list_calendars, name: a_calendar_list }
+      - { upstream: list_events, name: a_calendar_events }
+      - { upstream: get_event, name: a_calendar_event }
+      - { upstream: check_conflicts, name: a_calendar_conflicts }
+      # The family calendar alone, for the shared agent. `calendar` is fixed here and
+      # is not an argument the agent can see or set. Take the id from a_calendar_list.
+      - { upstream: list_events, name: family_calendar_events, pin: { calendar: FAMILY_CALENDAR_ID } }
+      - { upstream: check_conflicts, name: family_calendar_conflicts, pin: { calendar: FAMILY_CALENDAR_ID } }
+
+  - id: gmail-a
+    service: gmail
+    account: person_a
+    owner: person_a
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.gmail"]
+    env: { GMAIL_CLIENT_ID: YOUR_CLIENT_ID.apps.googleusercontent.com }
+    secret_env: { GMAIL_CLIENT_SECRET: gmail_client_secret, GMAIL_REFRESH_TOKEN: gmail_token_a }
+    timeout_seconds: 60
+    tools:
+      - { upstream: search_messages, name: a_gmail_search }
+      - { upstream: get_message, name: a_gmail_get }
+      - { upstream: get_attachment, name: a_gmail_attachment }
+
+  # ---- person_b -------------------------------------------------------------------
+  - id: icloud-mail-b
+    service: icloud-mail
+    account: person_b
+    owner: person_b
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.imap_mail"]
+    env: { IMAP_USERNAME: PERSON_B@icloud.com }
+    secret_env: { IMAP_PASSWORD: icloud_mail_password_b }
+    timeout_seconds: 60
+    tools:
+      - { upstream: list_mailboxes, name: b_mail_mailboxes }
+      - { upstream: search_messages, name: b_mail_search }
+      - { upstream: get_message, name: b_mail_get }
+      - { upstream: get_attachment, name: b_mail_attachment }
+
+  - id: icloud-calendar-b
+    service: icloud-calendar
+    account: person_b
+    owner: person_b
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.caldav_calendar"]
+    env: { CALDAV_USERNAME: PERSON_B_APPLE_ID, CALDAV_TIMEZONE: Etc/UTC }
+    secret_env: { CALDAV_PASSWORD: icloud_calendar_password_b }
+    timeout_seconds: 60
+    tools:
+      - { upstream: list_calendars, name: b_calendar_list }
+      - { upstream: list_events, name: b_calendar_events }
+      - { upstream: get_event, name: b_calendar_event }
+      - { upstream: check_conflicts, name: b_calendar_conflicts }
+
+  - id: gmail-b
+    service: gmail
+    account: person_b
+    owner: person_b
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.gmail"]
+    env: { GMAIL_CLIENT_ID: YOUR_CLIENT_ID.apps.googleusercontent.com }
+    secret_env: { GMAIL_CLIENT_SECRET: gmail_client_secret, GMAIL_REFRESH_TOKEN: gmail_token_b }
+    timeout_seconds: 60
+    tools:
+      - { upstream: search_messages, name: b_gmail_search }
+      - { upstream: get_message, name: b_gmail_get }
+      - { upstream: get_attachment, name: b_gmail_attachment }
+
+  # ---- Reminders (experimental, not verified on real data) --------------------------
+  # Reminders can only be read on a Mac, inside that person's own login session. A second,
+  # native `agw` there serves `agent_gateway.connectors.reminders_eventkit`, and this
+  # gateway reaches it as an HTTP upstream. See docs/deployment.md before enabling it.
+  # - id: reminders-a
+  #   service: reminders
+  #   account: person_a
+  #   owner: person_a
+  #   transport: http
+  #   url: http://PERSON_A_MAC.your-tailnet.ts.net:8090/mcp
+  #   allow_plain_http: true                  # inside the tailnet only
+  #   bearer_secret: reminders_helper_token_a
+  #   tools:
+  #     - { upstream: reminders_lists, name: a_reminders_lists }
+  #     - { upstream: reminders_list, name: a_reminders_list }
+  #     - { upstream: reminders_get, name: a_reminders_get }
+
+policy:
+  - principals: [person_a]
+    connection: icloud-mail-a
+    tools: [a_mail_mailboxes, a_mail_search, a_mail_get, a_mail_attachment]
+    effect: allow
+  - principals: [person_a]
+    connection: icloud-calendar-a
+    tools: [a_calendar_list, a_calendar_events, a_calendar_event, a_calendar_conflicts]
+    effect: allow
+  - principals: [person_a]
+    connection: gmail-a
+    tools: [a_gmail_search, a_gmail_get, a_gmail_attachment]
+    effect: allow
+  # With the commented `reminders-a` connection above:
+  # - principals: [person_a]
+  #   connection: reminders-a
+  #   tools: [a_reminders_lists, a_reminders_list, a_reminders_get]
+  #   effect: allow
+
+  - principals: [person_b]
+    connection: icloud-mail-b
+    tools: [b_mail_mailboxes, b_mail_search, b_mail_get, b_mail_attachment]
+    effect: allow
+  - principals: [person_b]
+    connection: icloud-calendar-b
+    tools: [b_calendar_list, b_calendar_events, b_calendar_event, b_calendar_conflicts]
+    effect: allow
+  - principals: [person_b]
+    connection: gmail-b
+    tools: [b_gmail_search, b_gmail_get, b_gmail_attachment]
+    effect: allow
+
+  # The one thing the shared agent and the other person get: the family calendar in
+  # person_a's account. Reaching into someone's account has to be spelled out.
+  - principals: [household, person_b]
+    connection: icloud-calendar-a
+    tools: [family_calendar_events, family_calendar_conflicts]
+    effect: allow
+    cross_account: true

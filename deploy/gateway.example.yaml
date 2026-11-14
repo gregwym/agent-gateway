@@ -1,6 +1,7 @@
 # Example configuration. It runs as-is against the demo connector once the three
 # token hashes are filled in (`agw token`) and the three demo secrets are stored
 # (`agw secret set`). Until then it is rejected, on purpose.
+# For real accounts (iCloud Mail, calendars, Gmail) see gateway.household.example.yaml.
 #
 # Read once at startup. No hot reload, no admin API: changing access means editing
 # this file on the gateway host and restarting. Unknown keys are errors.
@@ -25,6 +26,13 @@ secrets:
   key_file: ../key/master.key
 
 lock_file: tools.lock.json
+
+# Where people approve calls that need it, with a passkey. Without this section a tool
+# whose effect is `approval_required` is listed and never runs. `origin` is what people
+# type into the browser; it must be https, except on localhost as here.
+approvals:
+  origin: http://localhost:8080
+  store: ../state/approvals.sqlite
 
 # Who exists. A principal is a person or the household; nothing more.
 principals: [person_a, person_b, household]
@@ -111,8 +119,8 @@ policy:
     tools: [a_notes_list, a_notes_get]
     effect: allow
 
-  # Writes go through approval. There is no approval channel yet, so this tool is
-  # visible to person_a and never runs. That is the intended Phase 1 behaviour.
+  # Writes go through approval: each call waits until person_a approves that exact
+  # call on the approval page (`agw approval enroll person_a` registers their passkey).
   - principals: [person_a]
     connection: notes-a
     tools: [a_notes_add]
