@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import sys
+import unicodedata
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,6 +37,16 @@ CATALOG = {
 }
 
 
+def display_name(value):
+    if not isinstance(value, str):
+        raise Refused("invalid_display_name", 400)
+    value = value.strip()
+    if not 1 <= len(value) <= 80 or any(unicodedata.category(c) in ("Cc", "Cs") or
+            unicodedata.bidirectional(c) in ("LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI") for c in value):
+        raise Refused("invalid_display_name", 400)
+    return value
+
+
 class ManagedStore:
     def __init__(self, gateway):
         self.base = gateway.cfg
@@ -54,6 +65,12 @@ class ManagedStore:
             raise ValueError("managed state contains host-only settings")
         raw.update(state["config"])
         cfg = Config.model_validate(raw)
+        names = state.get("display_names", {})
+        if not isinstance(names, dict) or set(names) - set(cfg.principals):
+            raise ValueError("display names must belong to existing members")
+        for value in names.values():
+            if display_name(value) != value:
+                raise ValueError("display names must be trimmed")
         entries = copy.deepcopy(self.base_lock.entries)
         for connection, definitions in state["locks"].items():
             for entry in definitions.values():
@@ -75,6 +92,17 @@ class ManagedStore:
     def save(self, state):
         self.file.set("state", json.dumps(state, ensure_ascii=False))
         self.state = state
+
+    def name_of(self, principal):
+        return self.state.get("display_names", {}).get(principal, principal)
+
+    def rename(self, principal, value):
+        cfg, _, _ = self.effective(self.state)
+        if principal not in cfg.principals:
+            raise Refused("unknown_member", 400)
+        state = copy.deepcopy(self.state)
+        state.setdefault("display_names", {})[principal] = display_name(value)
+        self.save(state)
 
 
 def kind_of(conn):
@@ -102,8 +130,10 @@ def make_connection(body, cfg, values):
     if set(body) - {"kind", "id", "owner", "settings", "credentials", "revision"}:
         raise Refused("invalid_connector", 400)
     kind, name, owner = body.get("kind"), body.get("id"), body.get("owner")
-    if kind not in CATALOG or not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+    if kind not in CATALOG:
         raise Refused("invalid_connector", 400)
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+        raise Refused("invalid_connector_name", 400)
     if owner not in cfg.principals:
         raise Refused("unknown_member", 400)
     settings, provided = body.get("settings", {}), body.get("credentials", {})
@@ -149,7 +179,7 @@ def make_connection(body, cfg, values):
         port = field("port", "993")
         host = field("host", "imap.mail.me.com")
         if not port.isdecimal() or not 1 <= int(port) <= 65535 or any(c in host for c in "/@?#"):
-            raise Refused("invalid_connector", 400)
+            raise Refused("invalid_imap_server", 400)
         raw["env"] = {"IMAP_USERNAME": field("username"), "IMAP_HOST": host, "IMAP_PORT": port}
         raw["secret_env"] = {"IMAP_PASSWORD": secret("password", "IMAP_PASSWORD")}
     elif kind == "caldav":

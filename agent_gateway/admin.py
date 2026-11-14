@@ -26,6 +26,7 @@ class AdminController:
         self.runtime = runtime
         self.store = ManagedStore(runtime.gateway)
         self.auth = AdminAuth(runtime.gateway.cfg, runtime.gateway.approver)
+        self.auth.approver.display_name = self.store.name_of
         self.mutex = anyio.Lock()
         self.drafts = {}
         self.tests = {}
@@ -54,6 +55,10 @@ class AdminController:
             raise Refused("configuration_changed", 409)
 
     async def _commit(self, state, action):
+        # A connector draft can predate a cosmetic rename. Keep the latest names;
+        # display-only edits never change approval bindings or restart upstreams.
+        state["display_names"] = {p: name for p, name in self.store.state.get("display_names", {}).items()
+                                  if p in state["config"]["principals"]}
         state["revision"] = self.store.state["revision"] + 1
         gateway = self._gateway(state)
         if any(route.problem for route in gateway.routes.values()):
@@ -92,7 +97,7 @@ class AdminController:
                                 "test": self.tests.get(conn.id)})
         return {"revision": self.store.state["revision"], "owner": self.auth.owner,
                 "mcp_url": gw.cfg.approvals.origin + "/mcp",
-                "members": [{"id": p, "shared": p in gw.cfg.shared,
+                "members": [{"id": p, "display_name": self.store.name_of(p), "shared": p in gw.cfg.shared,
                              "passkeys": sum(k["principal"] == p for k in keys)} for p in gw.cfg.principals],
                 "clients": [{"id": c.id, "principal": c.principal} for c in gw.cfg.clients],
                 "connections": connections, "passkeys": keys,
@@ -146,6 +151,11 @@ class AdminController:
             return {"ok": True, "read_tool": probe}
 
         self._revision(body)
+        if operation == "members/rename":
+            self.store.rename(body.get("id"), body.get("display_name"))
+            self.runtime.gateway.audit.write("admin_updated", principal=self.auth.owner, detail=operation,
+                                             revision=self.store.state["revision"])
+            return {"revision": self.store.state["revision"]}
         state = self.store.candidate()
         raw = state["config"]
         if operation == "members/add":

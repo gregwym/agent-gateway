@@ -16,6 +16,17 @@ const messages = {
   connector_unavailable: ['Could not start or reach this connector. Check its settings.', '无法启动或连接此连接器，请检查设置。'],
   connector_login_or_read_failed: ['Login or the read check failed. Check account credentials and permissions.', '登录或读取验证失败，请检查账号凭据和权限。'],
   invalid_configuration: ['Check the values and account-sharing permission.', '请检查输入值和跨账号授权选项。'],
+  invalid_display_name: ['Use 1–80 characters without control characters.', '显示名称须为 1–80 个字符，不能包含控制字符。'],
+  invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
+  invalid_connector: ['Some connector fields are invalid. Check the form.', '连接器字段无效，请检查表单。'],
+  invalid_imap_server: ['Check the IMAP server name and TLS port (1–65535).', '请检查 IMAP 服务器地址及 TLS 端口（1–65535）。'],
+  missing_username: ['Enter the account email or username.', '请填写账号邮箱或用户名。'],
+  missing_password: ['Enter the app-specific password.', '请填写 App 专用密码。'],
+  missing_client_id: ['Enter the Google OAuth client ID.', '请填写 Google OAuth 客户端 ID。'],
+  missing_client_secret: ['Enter the Google OAuth client secret.', '请填写 Google OAuth 客户端密钥。'],
+  missing_refresh_token: ['Authorize with Google, or enter an existing refresh token.', '请先通过 Google 授权，或填写已有刷新令牌。'],
+  missing_url: ['Enter the service HTTPS URL.', '请填写服务 HTTPS 地址。'],
+  missing_token: ['Enter the helper bearer token.', '请填写辅助服务 Bearer Token。'],
   member_in_use: ['Remove this member’s clients, connectors, and permissions first.', '请先移除此成员的 Agent、连接器和权限。'],
   last_admin_passkey: ['Keep at least one administrator passkey.', '必须保留至少一个管理员通行密钥。'],
   tool_definitions_changed: ['Tool definitions changed. Edit and review this connector again.', '工具定义已变化，请编辑并重新审阅此连接器。'],
@@ -36,14 +47,34 @@ function el(parent, tag, text, cls) {
   parent.append(node); return node;
 }
 function notify(text) {
-  const node = document.getElementById('notice'); node.textContent = text; node.style.display = 'block';
-  clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { node.style.display = 'none'; }, 5500);
+  const box = [...dialogs.querySelectorAll('dialog[open]')].at(-1);
+  const node = box ? box.querySelector('.dialog-notice') || el(box, 'p', '', 'hint dialog-notice') : document.getElementById('notice');
+  node.setAttribute('role', 'status'); node.textContent = text; node.style.display = 'block';
+  clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { if (box) node.remove(); else node.style.display = 'none'; }, 5500);
 }
 function errorText(error) { return error.name === 'NotAllowedError' ? tr('Passkey operation cancelled or timed out.', '通行密钥操作已取消或超时。') : error.message; }
+function showError(source, error) {
+  const box = source.closest('dialog');
+  if (!box?.open || !box.isConnected) { notify(errorText(error)); return; }
+  let message = box.querySelector('.operation-error');
+  if (!message) {
+    message = el(box, 'p', '', 'error operation-error'); message.setAttribute('role', 'alert'); message.tabIndex = -1;
+    box.insertBefore(message, box.children[2] || null);
+  }
+  message.textContent = errorText(error); message.scrollIntoView({block: 'nearest'}); message.focus();
+}
 async function api(path, body) {
-  const response = await fetch('/admin/api/' + path, body === undefined ? {} : {
-    method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: JSON.stringify(body)});
-  const data = await response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
+  let response, data;
+  try {
+    response = await fetch('/admin/api/' + path, {signal: controller.signal, ...(body === undefined ? {} : {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: JSON.stringify(body)})});
+    data = await response.json();
+  } catch (error) {
+    throw new Error(error.name === 'AbortError' ? tr('The request timed out. Refresh to check its status before retrying.', '请求超时，请刷新确认状态后再重试。')
+      : tr('Could not reach the gateway. Check your connection and try again.', '无法连接网关，请检查连接后重试。'));
+  } finally { clearTimeout(timer); }
   if (!response.ok) {
     if (response.status === 401) { csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); }
     const known = messages[data.error];
@@ -51,12 +82,15 @@ async function api(path, body) {
   }
   return data;
 }
-function button(parent, label, action, cls = '') {
+function button(parent, label, action, cls = '', busyLabel = '') {
   const node = el(parent, 'button', label, cls); node.type = 'button';
   node.addEventListener('click', async () => {
     node.disabled = true;
-    try { await action(); } catch (error) { notify(errorText(error)); }
-    finally { node.disabled = false; }
+    node.setAttribute('aria-busy', 'true');
+    node.closest('dialog')?.querySelector('.operation-error')?.remove();
+    if (busyLabel) node.textContent = busyLabel;
+    try { await action(); } catch (error) { showError(node, error); }
+    finally { node.disabled = false; node.removeAttribute('aria-busy'); node.textContent = label; }
   }); return node;
 }
 function field(parent, label, name, value = '', type = 'text', help = '') {
@@ -140,15 +174,28 @@ async function welcome(initialized) {
 }
 async function mutate(path, data) { const result = await api(path, {revision: state.revision, ...data}); await refresh(); return result; }
 async function refresh() { state = await api('state'); render(); }
+function nameOf(id) { return state.members.find(member => member.id === id)?.display_name || id; }
+function identityLabel(id) { const name = nameOf(id); return name === id ? id : `${name} (${id})`; }
+function renameMember(member) {
+  const box = modal(tr('Edit display name', '修改显示名称'));
+  const name = field(box, tr('Display name', '显示名称'), 'display_name', member.display_name || member.id,
+    'text', tr('Your permissions and existing passkeys stay the same.', '修改名称不会改变权限和现有通行密钥。'));
+  name.maxLength = 80; name.required = true;
+  button(box, tr('Save name', '保存名称'), async () => {
+    if (!name.reportValidity()) return;
+    await mutate('members/rename', {id: member.id, display_name: name.value}); box.close();
+    notify(tr('Display name updated.', '显示名称已更新。'));
+  }, 'primary');
+}
 function render() {
   app.replaceChildren(); const identity = document.getElementById('identity'); identity.replaceChildren();
-  el(identity, 'span', state.owner, 'muted');
+  button(identity, nameOf(state.owner), () => renameMember(state.members.find(m => m.id === state.owner)), 'profile-name');
   button(identity, tr('Sign out', '退出'), async () => { await api('auth/logout', {}); csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); });
   const nav = el(app, 'nav'); nav.setAttribute('aria-label', tr('Administration', '管理导航'));
   const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '家庭成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')]];
   for (const [key, label] of tabs) button(nav, label, () => { tab = key; render(); }, tab === key ? 'active' : '');
   ({overview, members, agents, connections, permissions})[tab]();
-  const foot = el(app, 'footer'); el(foot, 'span', tr('Changes apply after active calls finish. Configuration changes invalidate outstanding approvals.', '配置在正在执行的调用结束后生效。修改配置会使未使用的审批失效。'));
+  const foot = el(app, 'footer'); el(foot, 'span', tr('Access and connector changes apply after active calls finish and invalidate outstanding approvals.', '接入和权限配置在正在执行的调用结束后生效，并使未使用的审批失效。'));
 }
 function overview() {
   const hero = el(app, 'section', undefined, 'hero'); el(hero, 'p', tr('Ready when you are', '准备就绪'), 'eyebrow');
@@ -179,18 +226,20 @@ function members() {
   }, 'primary');
   const grid = el(app, 'div', undefined, 'grid');
   for (const member of state.members) {
-    const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', member.id);
+    const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', nameOf(member.id));
+    if (nameOf(member.id) !== member.id) el(card, 'small', member.id, 'muted');
     el(card, 'span', member.id === state.owner ? tr('Administrator', '管理员') : member.shared ? tr('Shared', '共享') : tr('Personal', '个人'), 'badge');
     el(card, 'p', member.shared ? tr('Give shared agents this identity.', '共享 Agent 使用此身份。') : tr(`${member.passkeys} passkey(s) registered`, `已注册 ${member.passkeys} 个通行密钥`), 'muted');
     const actions = el(card, 'div', undefined, 'actions');
+    button(actions, tr('Edit name', '修改名称'), () => renameMember(member));
     if (!member.shared) button(actions, tr('Register a passkey', '注册通行密钥'), async () => {
       const result = await api('members/enroll', {id: member.id}); secretResult(tr('Private registration link', '私密注册链接'), result.url, true);
     });
-    if (member.id !== state.owner) button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove member?', '移除此成员？'), member.id, async () => mutate('members/remove', {id: member.id})), 'danger');
+    if (member.id !== state.owner) button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove member?', '移除此成员？'), identityLabel(member.id), async () => mutate('members/remove', {id: member.id})), 'danger');
   }
   const card = el(app, 'section', undefined, 'card'); el(card, 'h2', tr('Registered passkeys', '已注册的通行密钥'));
   for (const key of state.passkeys) {
-    const row = el(card, 'div', undefined, 'row between'); el(row, 'span', key.principal + ' · ' + key.id.slice(0, 12) + ' · ' + new Date(key.created * 1000).toLocaleDateString());
+    const row = el(card, 'div', undefined, 'row between'); el(row, 'span', identityLabel(key.principal) + ' · ' + key.id.slice(0, 12) + ' · ' + new Date(key.created * 1000).toLocaleDateString());
     button(row, tr('Revoke passkey', '撤销通行密钥'), () => confirmAction(tr('Revoke this passkey?', '撤销此通行密钥？'), tr('Sessions using it will also stop working.', '使用此通行密钥建立的管理会话也会失效。'), async () => { await api('passkeys/remove', {id: key.id}); await refresh(); }), 'danger');
   }
 }
@@ -198,7 +247,7 @@ function agents() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Agent access', 'Agent 接入'));
   button(head, tr('Create agent token', '创建 Agent Token'), () => {
     const box = modal(tr('Create agent token', '创建 Agent Token')); const name = field(box, tr('Agent name', 'Agent 名称'), 'client_id');
-    const principal = select(box, tr('Identity', '身份'), 'principal', state.members.map(m => [m.id, m.id]), state.owner);
+    const principal = select(box, tr('Identity', '身份'), 'principal', state.members.map(m => [m.id, identityLabel(m.id)]), state.owner);
     el(box, 'p', tr('For an agent shared by several people, choose the shared household identity.', '多人共享的 Agent 应选择共享家庭身份。'), 'hint');
     button(box, tr('Create token', '创建 Token'), async () => { const result = await mutate('clients/create', {id: name.value, principal: principal.value}); box.close(); secretResult(tr('Save your agent token', '保存 Agent Token'), result.token); }, 'primary');
   }, 'primary');
@@ -207,7 +256,7 @@ function agents() {
   for (const name of [tr('Agent', 'Agent'), tr('Identity', '身份'), tr('Credentials', '凭据')]) el(heading, 'th', name);
   const body = el(table, 'tbody');
   for (const client of state.clients) {
-    const row = el(body, 'tr'); el(row, 'td', client.id); el(row, 'td', client.principal); const actions = el(el(row, 'td'), 'div', undefined, 'actions');
+    const row = el(body, 'tr'); el(row, 'td', client.id); el(row, 'td', identityLabel(client.principal)); const actions = el(el(row, 'td'), 'div', undefined, 'actions');
     button(actions, tr('Rotate token', '轮换 Token'), () => confirmAction(tr('Replace this token?', '替换此 Token？'), tr('The old token will stop working immediately.', '旧 Token 将立即失效。'), async () => { const result = await mutate('clients/rotate', {id: client.id}); secretResult(tr('Save your new token', '保存新 Token'), result.token); }));
     button(actions, tr('Revoke', '撤销'), () => confirmAction(tr('Revoke agent access?', '撤销 Agent 接入？'), client.id, async () => mutate('clients/revoke', {id: client.id})), 'danger');
   }
@@ -218,7 +267,7 @@ function connections() {
   el(app, 'p', tr('Credentials stay encrypted on the gateway. Read checks contact the actual upstream; demo checks use synthetic notes.', '凭据在网关加密保存。只读验证会连接对应服务；模拟笔记验证使用测试数据。'), 'muted');
   const grid = el(app, 'div', undefined, 'grid');
   for (const conn of state.connections) {
-    const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', conn.id, 'connector-title'); el(card, 'p', conn.owner + ' · ' + (state.catalog[conn.kind]?.label || tr('Custom YAML connector', 'YAML 自定义连接器')), 'muted');
+    const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', conn.id, 'connector-title'); el(card, 'p', identityLabel(conn.owner) + ' · ' + (state.catalog[conn.kind]?.label || tr('Custom YAML connector', 'YAML 自定义连接器')), 'muted');
     el(card, 'span', conn.test?.ok ? tr('Read check passed', '读取验证通过') : conn.connected ? tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证') : tr('Connecting tools', '正在连接工具'), 'badge');
     if (conn.kind === 'demo') el(card, 'p', tr('Synthetic data. Notes reset when the connector restarts.', '模拟数据。连接器重启后笔记会重置。'), 'hint');
     if (conn.kind === 'reminders') el(card, 'p', tr('Experimental. Requires a helper in the account owner’s Mac login session.', '实验性功能。需要在账号所有者的 Mac 登录会话中运行辅助服务。'), 'hint');
@@ -236,7 +285,9 @@ function connectorForm(existing) {
   const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'demo'); kind.disabled = !!existing;
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = field(fixed, tr('Connector name', '连接器名称'), 'connection_id', existing?.id || '', 'text', tr('Up to 32 lowercase letters, numbers, underscores, or hyphens.', '最多 32 个小写字母、数字、下划线或连字符。')); name.disabled = !!existing;
-  const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', state.members.map(m => [m.id, m.id]), existing?.owner || state.owner); owner.disabled = !!existing;
+  name.required = true; name.maxLength = 32; name.pattern = '[a-z][a-z0-9_\\-]{0,31}';
+  name.title = tr('Start with a lowercase letter; use lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，只用小写字母、数字、下划线或连字符。');
+  const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', state.members.map(m => [m.id, identityLabel(m.id)]), existing?.owner || state.owner); owner.disabled = !!existing;
   const dynamic = el(form, 'div'); let settings = {}, credentials = {};
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     url: tr('HTTPS service URL', '服务 HTTPS 地址'), timezone: tr('Time zone', '时区'), password: tr('App-specific password', 'App 专用密码'),
@@ -267,14 +318,17 @@ function connectorForm(existing) {
       credentials: Object.fromEntries(Object.entries(credentials).map(([k, input]) => [k, input.value]))};
   }
   button(form, tr('Preview tools', '预览工具'), async () => {
+    name.value = name.value.trim();
+    if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
+    if (!form.reportValidity()) return;
     const result = await api('connections/preview', values());
     for (const input of Object.values(credentials)) input.value = '';
     showReview(result, box);
-  }, 'primary');
+  }, 'primary', tr('Reading tool definitions…', '正在读取工具定义…'));
 }
 function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
-  el(review, 'p', result.connection + ' · ' + result.owner, 'muted');
+  el(review, 'p', result.connection + ' · ' + identityLabel(result.owner), 'muted');
   if (result.google_account) el(review, 'p', tr('Authorized Google account: ', '已授权的 Google 账号：') + result.google_account, 'hint');
   el(review, 'p', tr('These descriptions and schemas are what agents will see. New connectors initially grant access only to their account owner.', 'Agent 将看到这些描述和参数定义。新连接器默认只授权给账号所有者。'), 'hint');
   for (const definition of result.definitions) { el(review, 'h3', definition.name); el(review, 'pre', JSON.stringify(definition, null, 2)); }
@@ -293,13 +347,13 @@ function permissions() {
   el(app, 'h1', tr('Inspect permissions', '检查权限'));
   el(app, 'p', tr('Unlisted access is denied. Approval-required tools still need a separate passkey decision for each exact call.', '未授权的访问默认拒绝。需要审批的工具，每次调用仍须对具体内容进行通行密钥审批。'), 'muted');
   if (!state.members.some(m => m.id === subject)) subject = state.owner;
-  const person = select(app, tr('Inspect as', '以此身份检查'), 'inspect_principal', state.members.map(m => [m.id, m.id]), subject);
+  const person = select(app, tr('Inspect as', '以此身份检查'), 'inspect_principal', state.members.map(m => [m.id, identityLabel(m.id)]), subject);
   person.addEventListener('change', () => { subject = person.value; render(); });
   const table = el(el(app, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
   for (const label of [tr('Tool / owner', '工具 / 所有者'), tr('Access', '访问权限'), tr('Changes', '修改')]) el(heading, 'th', label);
   const body = el(table, 'tbody');
   for (const conn of state.connections) for (const tool of conn.tools) {
-    const row = el(body, 'tr'); const info = el(row, 'td'); el(info, 'strong', tool.name); el(info, 'div', conn.owner + ' · ' + conn.id, 'muted');
+    const row = el(body, 'tr'); const info = el(row, 'td'); el(info, 'strong', tool.name); el(info, 'div', identityLabel(conn.owner) + ' · ' + conn.id, 'muted');
     if (tool.problem) el(info, 'span', tr('Disabled: ', '已停用：') + tool.problem, 'badge bad');
     if (Object.keys(tool.pin).length) el(info, 'pre', JSON.stringify(tool.pin));
     const settings = el(row, 'td'); const effect = select(settings, tr('Effect', '权限效果'), 'effect', [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow', '允许')], ['approval_required', tr('Require approval', '需要审批')]], tool.permissions[subject]);

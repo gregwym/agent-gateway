@@ -161,6 +161,13 @@ class PasskeyApprover:
     def _url(self, request_id: str) -> str:
         return f"{self.cfg.origin}/approvals/r/{request_id}"
 
+    def display_name(self, principal: str) -> str:
+        return principal
+
+    def identity_label(self, principal: str) -> str:
+        name = self.display_name(principal)
+        return f"{name} ({principal})" if name != principal else principal
+
     # -- the Approver interface ---------------------------------------------------
 
     async def authorize(self, request: ApprovalRequest) -> ApprovalDecision:
@@ -209,7 +216,7 @@ class PasskeyApprover:
         return ApprovalDecision(False, "requested", self._waiting(request_id, approvers, expires, now), request_id)
 
     def _waiting(self, request_id: str, approvers: str, expires: int, now: int) -> str:
-        people = " or ".join(json.loads(approvers))
+        people = " or ".join(self.identity_label(p) for p in json.loads(approvers))
         minutes = max(1, (expires - now + 59) // 60)
         return (
             f"{NOT_EXECUTED} It is waiting at {self._url(request_id)} . Ask {people} to open that page and approve it "
@@ -274,6 +281,10 @@ class PasskeyApprover:
         shown = {key: row[key] for key in row.keys() if key not in ("binding", "credential", "arguments", "approvers")}
         shown["approvers"] = json.loads(row["approvers"])
         shown["arguments"] = json.loads(row["arguments"]) if row["arguments"] is not None else None
+        people = {row["principal"], row["owner"], *shown["approvers"]}
+        if row["decided_by"]:
+            people.add(row["decided_by"])
+        shown["display_names"] = {p: self.display_name(p) for p in people}
         return shown
 
     def _credentials(self, db: sqlite3.Connection, principals: list[str]) -> list[sqlite3.Row]:
@@ -313,7 +324,7 @@ class PasskeyApprover:
                 if len(existing) >= _MAX_PASSKEYS_PER_PERSON:
                     raise Refused("too_many_passkeys")
                 options, state = self._server.register_begin(
-                    {"id": principal.encode("utf-8"), "name": principal, "displayName": principal},
+                    {"id": principal.encode("utf-8"), "name": principal, "displayName": self.display_name(principal)},
                     [AttestedCredentialData(bytes(r["data"])) for r in existing],
                     resident_key_requirement=ResidentKeyRequirement.REQUIRED,
                     user_verification=UserVerificationRequirement.REQUIRED,

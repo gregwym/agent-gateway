@@ -160,13 +160,19 @@ members, connect an account (or demo notes), review its definitions, run its rea
 check, and create a separate token for each agent. Tokens are shown once. Members
 receive a private 15-minute passkey registration link; membership alone does not
 make someone an administrator. The console is available in English and Chinese.
+Click your name in the header, or **Members → Edit name**, to change a display
+name. Identity IDs, permissions, passkeys, sessions, and pending approvals stay
+the same. The name is saved in the encrypted administration state.
 
-Changes wait up to 30 seconds for active calls to finish, then atomically save and
-apply; busy calls leave the configuration unchanged. Every change invalidates
+Access and connector changes wait up to 30 seconds for active calls to finish, then atomically save and
+apply; busy calls leave the configuration unchanged. These changes invalidate
 outstanding approvals. Sessions last 30 minutes, are revocable, and cannot be
 used as MCP tokens. Host paths, administrator identity, origin, and subprocess
 commands cannot be changed through the browser. Connectors use a fixed catalog;
 custom connectors remain a host configuration task.
+Connector preview shows progress and reports validation or network errors inside
+the open dialog, retaining entered values for correction. Preview reads tool
+definitions; the separate read check verifies account access.
 
 Web changes override the five account sections (`principals`, `shared`, `clients`,
 `connections`, `policy`) from YAML after the first save. `agw check` includes those

@@ -185,6 +185,8 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
             assert registered.status_code == 200, registered.text
             csrf = registered.json()['csrf']
             http.headers['X-CSRF-Token'] = csrf
+            renamed = await http.post('/admin/api/members/rename', json={'revision':0,'id':'person_a','display_name':'Container owner'})
+            assert renamed.status_code == 200, renamed.text
             created = await http.post('/admin/api/clients/create', json={'revision':0,'id':'web-agent','principal':'person_a'})
             assert created.status_code == 200, created.text
             token = created.json()['token']
@@ -201,6 +203,7 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
             saved = await http.get('/admin/api/state')
             assert saved.status_code == 200, saved.text
             assert saved.json()['revision'] == 2
+            assert next(m for m in saved.json()['members'] if m['id']=='person_a')['display_name'] == 'Container owner'
             assert any(c['id']=='web-notes' for c in saved.json()['connections'])
             assert token not in saved.text
         async with agent(base + '/mcp', token, Host='localhost') as client:
