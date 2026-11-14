@@ -51,6 +51,7 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         await page.reload()
         await playwright.expect(page.locator('.profile-name')).to_have_text(label)
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert await page.get_by_role('button', name=t('Sign out', '退出'), exact=True).evaluate('(node) => node.getBoundingClientRect().height < 50')
         if directory := os.environ.get('AGW_TEST_ARTIFACTS'):
             Path(directory).mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(Path(directory) / f'member-name-{locale}.png'))
