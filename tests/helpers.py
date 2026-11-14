@@ -152,14 +152,16 @@ async def write_lock(config_path: Path) -> None:
 _LOCKS: dict[str, str] = {}
 
 
-async def prepare(directory: Path, raw: dict[str, Any] | None = None, *, lock: bool = True) -> Path:
+async def prepare(
+    directory: Path, raw: dict[str, Any] | None = None, *, lock: bool = True, secrets: dict[str, str] | None = None
+) -> Path:
     """Write config + secrets (+ lock file) for a test.
 
     A lock file depends only on the connections, so it is computed once per
     distinct set of connections and reused for the rest of the run.
     """
     raw = raw if raw is not None else base_config()
-    path = write_config(directory, raw)
+    path = write_config(directory, raw, secrets)
     if not lock:
         return path
     key = json.dumps(raw["connections"], sort_keys=True)
@@ -194,12 +196,12 @@ class Running:
 
 
 @asynccontextmanager
-async def running_gateway(config_path: Path, approver: Any = None) -> AsyncIterator[Running]:
+async def running_gateway(config_path: Path, approver: Any = None, *, port: int = 0) -> AsyncIterator[Running]:
     cfg = load_config(config_path)
     audit = Audit(cfg.audit.path, cfg.audit.retention_days)
     gateway = Gateway(cfg, Lock.load(cfg.lock_file), resolve_secrets(cfg), audit, approver=approver)
     server = uvicorn.Server(
-        uvicorn.Config(build_app(gateway), host="127.0.0.1", port=0, log_level="error", **SERVE_OPTIONS)
+        uvicorn.Config(build_app(gateway), host="127.0.0.1", port=port, log_level="error", **SERVE_OPTIONS)
     )
     async with anyio.create_task_group() as tg:
         tg.start_soon(server.serve)

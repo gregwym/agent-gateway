@@ -1,5 +1,8 @@
 # 部署
 
+先读第 1 节。接入真实账号之前，按「需要你亲自验证的事」一节走一遍：这个项目里凡是涉及真实
+iCloud、Google 和真实认证器的部分，都只对本地替身测试过。
+
 ## 1. 代码保证不了、必须由部署保证的事
 
 Gateway 的全部安全性建立在一条前提上：**Agent 不能读、不能改、不能重启 Gateway 所在的环境。**
@@ -7,12 +10,16 @@ Gateway 的全部安全性建立在一条前提上：**Agent 不能读、不能�
 
 - Agent（尤其是有运维权限的 OpenClaw）在 Gateway 主机上没有 shell、SSH、root，也不在 `docker` 组；
 - Agent 不能通过任何部署通道修改 Gateway 的配置、镜像、Compose 文件或环境变量；
-- Agent 读不到 Gateway 的数据目录（`config/`、`secrets/`、`key/`），也读不到它们的备份；
-- Agent 只能通过网络访问 Gateway 的 `/mcp` 端口，访问不到上游 Connector 和上游凭据；
-- 个人 Token 不存放在其他 Agent 能读到的地方（见 [design.md](design.md) 第 5 节）。
+- Agent 读不到 Gateway 的数据目录（`config/`、`secrets/`、`key/`、`state/`），也读不到它们的备份；
+- Agent 只能通过网络访问 Gateway 的端口，访问不到上游 Connector 和上游凭据；
+- 个人 Token 不存放在其他 Agent 能读到的地方（见 [design.md](design.md) 第 5 节）；
+- 审批用的 Passkey 所在的设备（手机、你自己的电脑）不受 Agent 控制，登记 Passkey 的链接不经过 Agent 能读到的渠道。
 
 Docker 容器不是这里的安全边界。Compose 文件里的非 root、只读根文件系统、去掉 capabilities，
 限制的是「Gateway 自己出 bug 时能做什么」，不限制主机管理员。
+
+能改 `gateway.yaml` 或 `state/approvals.sqlite` 的人可以绕过审批，能读 `key/` 和 `secrets/` 的人拿得到全部上游凭据。
+这不是代码缺陷能修的，只能靠上面这几条。
 
 ## 2. 放在哪台机器
 
@@ -25,7 +32,9 @@ Docker 容器不是这里的安全边界。Compose 文件里的非 root、只读
 ## 3. 安装（Docker Compose）
 
 > 已验证的环境：linux/arm64，Docker 29，Compose v5。验证内容：镜像构建、容器内的全部管理命令、启动与健康检查、
-> 以 uid 10001 运行且无任何 capability、配置 / 密钥 / 密文只读挂载、缺少密钥文件时拒绝启动、Connector 进程被杀后自动重连。
+> 以 uid 10001 运行且无任何 capability、配置 / 密钥 / 密文只读挂载、缺少密钥文件时拒绝启动、Connector 进程被杀后自动重连；
+> 用 [gateway.household.example.yaml](../deploy/gateway.household.example.yaml)（填入假的凭据）在容器内完成
+> `lock --write`、`check` 和启动，六个 Connector 进程都能起来并列出工具。
 > linux/amd64 没有实测，只确认了所有依赖都有带哈希的 wheel。
 
 在 Gateway 主机上，由人执行：
@@ -34,7 +43,7 @@ Docker 容器不是这里的安全边界。Compose 文件里的非 root、只读
 git clone https://github.com/gregwym/agent-gateway && cd agent-gateway/deploy
 
 mkdir -p data/config data/secrets data/key data/state
-cp gateway.example.yaml data/config/gateway.yaml
+cp gateway.example.yaml data/config/gateway.yaml              # demo；真实账号用 gateway.household.example.yaml，见第 5 节
 sudo chown -R 10001:10001 data && sudo chmod -R go-rwx data   # Linux 主机；macOS 上的 Colima / Docker Desktop 不需要 chown
 
 docker compose build
@@ -52,7 +61,8 @@ docker compose build
 6. **检查**：`docker compose run --rm admin check`，输出每个 principal 能调用什么。逐行核对。
 7. **启动**：`AGW_BIND=<本机 Tailscale IP> docker compose up -d`（可以把 `AGW_BIND` 写进 `deploy/.env`）。
 
-不用 Docker 时，`pip install .` 后直接用 `agw` 命令，步骤相同；用一个专用的系统用户运行，数据目录权限 `0700`。
+不用 Docker 时，在仓库目录里 `pip install '.[connectors]'` 后直接用 `agw` 命令，步骤相同；用一个专用的系统用户运行，
+数据目录权限 `0700`。这个项目没有发布到 PyPI，不要按名字从 PyPI 安装。
 
 ## 4. 网络
 
@@ -64,10 +74,256 @@ docker compose build
   ```
 
 - Gateway 以主机名被访问时，设置 `server.allowed_hosts`（如 `["agent-gateway.your-tailnet.ts.net:8080"]`），
-  开启 Host 头校验并拒绝带 `Origin` 的浏览器请求（防 DNS rebinding）。
-- Gateway 不需要入站公网访问。出站只需要到各上游服务。
+  开启 `/mcp` 的 Host 头校验并拒绝带 `Origin` 的浏览器请求（防 DNS rebinding）。填的值必须和客户端实际发来的 Host 头一致，
+  包括端口；填错的表现是所有 `/mcp` 请求都被拒绝。
+- Gateway 不需要入站公网访问。出站只需要到各上游服务（`imap.mail.me.com:993`、`caldav.icloud.com` 及其跳转到的
+  `*.icloud.com` 主机、`gmail.googleapis.com`、`oauth2.googleapis.com`）。
 
-## 5. 日常操作
+**启用审批时需要 HTTPS。** 浏览器只在 HTTPS 页面（或 `http://localhost`）上允许使用 Passkey。Gateway 自己不做 TLS，
+由 Tailscale 提供证书是最省事的办法：
+
+```sh
+AGW_BIND=127.0.0.1 docker compose up -d
+tailscale serve --bg --https=443 http://127.0.0.1:8080     # 以你的 Tailscale 版本的 `tailscale serve --help` 为准
+```
+
+这样 Agent 和人都通过 `https://<主机名>.<tailnet>.ts.net` 访问（MCP 地址是 `https://…/mcp`），
+`approvals.origin` 和 `server.allowed_hosts` 都填这个主机名（443 端口不带端口号）。需要在 Tailscale 管理后台开启
+MagicDNS 和 HTTPS 证书；ACL 里放行的端口相应改成 `tcp:443`。经过 `tailscale serve` 之后，审计日志里的 `remote`
+是本机地址，不再是调用方的地址。**这一段我没有在真实 tailnet 上跑过**，只验证了 Gateway 一侧的行为。
+
+## 5. 接入真实账号
+
+[gateway.household.example.yaml](../deploy/gateway.household.example.yaml) 是两个人各有 iCloud 邮件、iCloud 日历、
+Gmail 的完整配置。复制成 `data/config/gateway.yaml`，把所有大写的占位值换掉。它引用 7 个 secret，下面逐个说明怎么得到。
+全部录入后才能 `lock`：`lock` 会启动每个 Connector 列出工具，缺 secret 时启动不了。Connector 在第一次被调用时才登录上游，
+所以凭据是否正确要到第一次调用才知道。
+
+**只读的真实范围**（详见 [design.md](design.md) 7.3）：Gmail 的 Token 由 Google 强制只读。iCloud 的 App 专用密码
+**没有只读版本**，它能收发邮件、改日历；只读靠的是 Connector 只发读请求，以及这些密码只存在 Gateway 主机上。
+
+### 5.1 iCloud 邮件
+
+1. 每个人登录 [account.apple.com](https://account.apple.com) →「登录与安全」→「App 专用密码」，生成一个，命名如
+   `agent-gateway mail`。需要账号已开启双重认证。邮件和日历各生成一个，这样可以单独吊销。
+2. 录入：`docker compose run --rm admin secret set icloud_mail_password_a`（B 同理）。
+3. 配置里的 `IMAP_USERNAME` 填 iCloud 邮箱地址。Apple 的说明是用户名通常为地址中 `@` 之前的部分，
+   不行再试完整地址；两种我都没法替你试。登录被拒绝后 Connector 会暂停 60 秒再试，避免连续失败锁账号。
+
+「隐藏邮件地址」和「通过 Apple 登录」转发来的邮件就在这个邮箱里，按收件地址搜索用 `to` 参数；
+`get_message` 返回 `Delivered-To`、`To`、`Reply-To` 等头，可以看出是哪个中转地址收的。
+
+### 5.2 iCloud 日历
+
+1. 同样生成一个 App 专用密码，`secret set icloud_calendar_password_a`。
+2. `CALDAV_USERNAME` 填 Apple ID（登录 Apple 账号用的邮箱，可能不是 `@icloud.com` 地址），
+   `CALDAV_TIMEZONE` 填你们的 IANA 时区（如 `America/Los_Angeles`），不带时区的时间参数按它解释。
+3. **家庭日历**：示例把 A 账号里的家庭日历单独暴露给共享 Agent 和 B，日历 id 是固定参数（`pin`），Agent 改不了。
+   id 要启动后才能查到：先带着占位值启动，用 A 的 Token 调一次 `a_calendar_list`（命令见「需要你亲自验证的事」），
+   把家庭日历的 `id` 填进两处 `FAMILY_CALENDAR_ID`，`check` 后重启。在那之前这两个工具只会回答 `No such calendar.`。
+
+不需要改变现有的 iCloud 账号结构：每个人用自己的 Apple ID 和自己的密码，Gateway 里是两条互不相通的连接。
+
+### 5.3 Gmail
+
+Google 的控制台界面经常改版，下面按要做的事写，不按菜单名写。
+
+1. 在 [Google Cloud Console](https://console.cloud.google.com) 建一个项目，启用 **Gmail API**。
+2. 配置 OAuth 同意屏幕：用户类型「外部」。**发布状态要改成「In production」**：停在「Testing」时 Google 会在 7 天后让
+   refresh token 失效。`gmail.readonly` 是受限 scope，不提交验证的话授权页会显示「未经验证的应用」警告，对自用的两个账号可以接受。
+   （这两点来自 Google 的文档，我没有实测。如果选择停在「Testing」，要把两个人的地址加进测试用户，并接受每周重新授权。）
+3. 创建 OAuth 客户端，类型 **「桌面应用」**，下载 JSON（下面叫 `client_secret.json`）。
+4. 把 client id 填进配置的 `GMAIL_CLIENT_ID`，把 client secret 存进 secret store：
+
+   ```sh
+   python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["installed"]["client_secret"])' client_secret.json \
+     | docker compose run --rm -T admin secret set gmail_client_secret
+   ```
+
+5. 每个人在一台有浏览器的电脑上各做一次授权。在仓库目录里：
+
+   ```sh
+   python3 -m venv .venv && . .venv/bin/activate && pip install '.[gmail-auth]'
+   python -m agent_gateway.connectors.gmail_auth client_secret.json \
+     | docker compose -f deploy/docker-compose.yml run --rm -T admin secret set gmail_token_a
+   ```
+
+   浏览器会打开 Google 的授权页，用**那个人自己的** Google 账号登录并同意。Token 只走管道，不显示在屏幕上；
+   Google 给的权限不是恰好 `gmail.readonly` 时不输出任何东西。Gateway 在另一台机器上时，把管道的后半段换成
+   `ssh <Gateway 主机> 'cd agent-gateway/deploy && docker compose run --rm -T admin secret set gmail_token_a'`。
+6. 用完后删掉 `client_secret.json`。
+
+两个人共用一个 OAuth 客户端，各自一份 Token（`gmail_token_a`、`gmail_token_b`）。
+
+### 5.4 收尾
+
+```sh
+docker compose run --rm admin lock          # 读一遍 24 个工具的定义
+docker compose run --rm admin lock --write
+docker compose run --rm admin check         # 核对：household 只有 family_calendar_* 两个工具
+docker compose up -d
+```
+
+然后做「需要你亲自验证的事」。
+
+## 6. 审批
+
+自带的 Connector 都只读，所以示例配置里没有任何需要审批的工具。这一节在你以后加入会改动数据的工具时才用得上；
+现在可以用 demo 配置（[gateway.example.yaml](../deploy/gateway.example.yaml) 里的 `a_notes_add`）把流程走一遍。
+
+**启用**：配置里加
+
+```yaml
+approvals:
+  origin: https://gateway.your-tailnet.ts.net   # 人在浏览器地址栏里看到的那个地址，必须是 https（本机试用可以是 http://localhost:8080）
+  store: ../state/approvals.sqlite
+```
+
+`origin` 写错的表现是审批页能打开，但点批准时报 `wrong_origin`。Passkey 由浏览器绑定在这个主机名上，
+**以后改主机名，所有人都要重新登记。**
+
+**登记 Passkey**（每个人一次，可以登记多个设备，每人最多 8 个）：
+
+```sh
+docker compose run --rm admin approval enroll person_a
+```
+
+它打印一个 15 分钟内有效、只能用一次的链接。**谁先打开，谁就成为这个人账号的批准者**，所以把链接通过私下渠道
+（AirDrop、当面、端到端加密的私聊）交给本人，不要贴进任何 Agent 读得到的对话。打开后按浏览器提示创建 Passkey
+（需要生物识别或设备密码）。
+
+**一次审批**：Agent 调用一个 `approval_required` 的工具时，调用不会执行，Agent 收到一段固定文字，里面有一个
+`…/approvals/r/<id>` 链接。账号所有者打开链接，页面显示是哪个 client、哪个账号、哪个工具、完整参数；用 Passkey 批准后，
+Agent 在有效期内（默认 10 分钟）**用完全相同的参数**再调一次，才会执行，而且只执行一次。参数变了就是一个新的请求。
+共享账号（`household`）的请求，任何一个人都可以批。
+
+**管理**：
+
+| 命令（前面加 `docker compose run --rm admin`） | 作用 |
+|---|---|
+| `approval requests` | 列出近期请求及其状态、谁批的、执行结果 |
+| `approval cancel <请求 id>` | 撤销一个已批准但还没用掉的请求 |
+| `approval passkeys` | 列出已登记的 Passkey |
+| `approval forget <Passkey id>` | 删除一个 Passkey（设备丢了就做这个） |
+
+没有 `approvals:` 一节，或者账号所有者还没登记 Passkey 时，`approval_required` 的工具会列出来但永远不执行。
+待处理请求的参数明文存在 `approvals.sqlite` 里，请求结束（执行、拒绝、撤销、过期）时清除。
+
+## 7. 提醒事项
+
+**实验性，未在真实数据上验证。** 背景和限制见 [design.md](design.md) 7.6，要点三条：
+
+- 提醒事项只能在登录了那个 Apple ID 的 Mac 上、在那个人自己的 macOS 登录会话里读到。所以要在**那个人的 Mac** 上
+  跑第二个很小的 `agw`（下面叫 helper），主 Gateway 把它当作一个 HTTP 上游。那台 Mac 关机或睡眠时提醒事项不可用。
+- macOS 的授权是「完全访问」，没有只读档，而且记在启动它的应用名下（从「终端」启动，就是「终端」获得授权，
+  以后从「终端」里跑的任何程序都能读写提醒事项）。
+- helper 不要放在 Agent 运行的那台机器上：以同一个 macOS 用户运行的 Agent 可以绕过 Gateway 直接读写提醒事项。
+
+在那个人的 Mac 上，由本人操作：
+
+```sh
+git clone https://github.com/gregwym/agent-gateway && cd agent-gateway
+python3 -m venv .venv && . .venv/bin/activate && pip install '.[macos]'
+
+mkdir -p run/reminders && cp deploy/reminders-helper.example.yaml run/reminders/gateway.yaml
+export AGW_CONFIG=run/reminders/gateway.yaml
+
+python -m agent_gateway.connectors.reminders_eventkit --request-access   # macOS 弹窗，选允许
+agw token                 # 哈希填进 run/reminders/gateway.yaml；Token 本身存进主 Gateway（见下）
+agw lock --write && agw check
+agw serve --host <这台 Mac 的 Tailscale IP>
+```
+
+在主 Gateway 上：`secret set reminders_helper_token_a`（值是上面那个 Token），取消
+`gateway.household.example.yaml` 里 `reminders-a` 的 connection 和 policy 两段注释，`lock --write`、`check`、重启。
+Tailscale ACL 只放行主 Gateway 主机到这台 Mac 的 `tcp:8090`。
+
+我验证过的：示例配置在一台 Mac 上能通过 `lock --write` 和 `check`（Connector 能启动并列出三个工具）；
+Gateway 串联 Gateway 有自动化测试；数据转换逻辑用替身对象测过。**我没有验证的**：授权弹窗、读真实提醒事项、
+用 launchd 开机自启时还能不能拿到授权。模拟测试已覆盖两个 helper 串联主网关、列表／详情／完成状态和账号隔离。
+所以上面是从「终端」前台运行；要长期运行，先确认前台可用，再自己试 LaunchAgent。
+
+## 8. 验收
+
+### 8.1 模拟验收（不需要真实账号）
+
+在仓库的虚拟环境中运行：
+
+```sh
+pip install -e '.[dev,browser-tests]'
+python -m playwright install chromium
+python scripts/acceptance.py --docker
+```
+
+所有数据都是一次性的测试数据。邮件对接本地 pymap（TLS），日历对接 Radicale，Gmail 对接仿 Google 的
+OAuth/API 服务；Reminders 用 EventKit 替身经过两层真实网关。审批页面在真实 Chromium 中通过虚拟认证器
+完成注册、批准、拒绝、撤回及一次性执行。容器测试使用独立临时卷，验证权限隔离、重启后的审批状态和故障恢复，
+结束时删除测试容器与卷，不操作现有部署。
+
+`run/acceptance/report.json` 记录源码指纹、各项退出码和测试统计；同目录保存 JUnit、日志及浏览器截图。
+没有 Docker 时去掉 `--docker`，报告会明确该次不包含容器验收。Linux 缺少原生 EventKit 时，原生权限守卫测试会跳过，
+跨平台的 EventKit 替身端到端测试仍会执行。
+
+### 8.2 真实服务的可选验收
+
+下面是以后使用真实账号时的检查清单，不属于模拟验收的通过条件。
+
+下面每一项我都只对本地替身（pymap、Radicale、仿 Google 的本地服务、软件 Passkey）测过，没有碰过真实服务。
+验证可以在最终主机上做；想先快速试一遍，也可以在你自己的电脑（不是 Agent 所在的机器）上不用 Docker 跑：
+`pip install -e '.[connectors,gmail-auth]'`，配置放在 `run/config/`，命令去掉 `docker compose run --rm admin` 前缀换成 `agw`。
+试完把 `run/` 整个删掉。
+
+准备一个调用工具的函数（需要 `curl` 和 `jq`）：
+
+```sh
+export AGW_URL=http://127.0.0.1:8080/mcp      # 或 https://<主机名>/mcp
+call() {  # call <token> <tool> '<JSON 参数>'
+  curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" \
+    | jq '.result // .error'
+}
+tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name'; }
+```
+
+`$A`、`$B`、`$H` 是 person_a、person_b、household 三个 client 的 Token。
+
+**Phase 2**
+
+| # | 验收项 | 怎么验 | 预期 |
+|---|---|---|---|
+| 1 | 搜索和读取真实邮件 | `call $A a_mail_search '{"from":"<某个发件人>","since":"2026-10-01"}'`，再 `call $A a_mail_get '{"uid":<上一步的 uid>}'`；Gmail：`call $A a_gmail_search '{"query":"from:<某人> newer_than:30d"}'`，`call $A a_gmail_get '{"id":"<id>"}'` | 结果和你在邮件客户端里看到的一致；中文主题和正文不乱码 |
+| 2 | 完整正文及附件 | 找一封很长的邮件，`a_mail_get` 返回的 `body_chars` 是正文总长度，`truncated` 为 `true` 时用 `{"uid":…,"offset":20000}` 取后续部分；找一封带 PDF 和图片附件的，`call $A a_mail_attachment '{"uid":…,"index":0}'` | 分段拼起来是完整正文；附件大小和原件一致（默认上限 5 MB） |
+| 2b | 中转地址 | `call $A a_mail_search '{"to":"<你的某个隐藏邮件地址>"}'` | 搜得到，`Delivered-To` / `To` 显示中转地址 |
+| 3 | 指定账号的日历 | `call $A a_calendar_list '{}'`；`call $A a_calendar_events '{"start":"2026-11-16","end":"2026-11-23"}'`；对一个重复日程用 `a_calendar_event`（`calendar`、`uid`、`start` 都取自上一步）；`call $A a_calendar_conflicts '{"start":"2026-11-18T09:00","end":"2026-11-18T10:00"}'` | 和「日历」App 一致：全天日程、重复日程的每一次、别人邀请的日程、时区。iCloud 的每次日历调用可能要几秒 |
+| 3b | 提醒事项 | 按第 7 节搭好后 `call $A a_reminders_lists '{}'`、`call $A a_reminders_list '{}'` | 实验性；任何不一致都请记下来 |
+| 4 | 账号隔离 | `tools $B` 和 `tools $H`；`call $B a_mail_search '{}'`；`call $H a_calendar_events '{"start":"2026-11-16","end":"2026-11-23"}'`；`call $H family_calendar_events '{"start":"2026-11-16","end":"2026-11-23","calendar":"<A 的另一个日历 id>"}'` | B 的列表里没有任何 `a_*`；household 只有 `family_calendar_*`；越权调用得到和「工具不存在」一样的回答；最后一条因为试图设置固定参数被拒绝 |
+| 5 | 没有全量索引 | 用一段时间后看 `data/state/` | 只有 `audit/`（和启用审批后的 `approvals.sqlite`）；审计行里没有邮件内容和参数值 |
+| 6a | 授权失效 | 在 Apple 账号页吊销邮件的 App 专用密码，再 `call $A a_mail_search '{}'` | 回答 `The mail server rejected this account's credentials…`，不是崩溃，也不泄露密码；`secret set` 新密码并重启后恢复 |
+| 6b | Gmail 授权失效 | 在 [myaccount.google.com/connections](https://myaccount.google.com/connections) 移除这个应用的访问权，再调用 | 回答 `Google no longer accepts this account's authorisation…`；重新跑 `gmail_auth` 并重启后恢复 |
+| 6c | Token 更新 | Gmail 调用一次，隔一个多小时再调用一次 | 两次都成功（access token 一小时过期，Connector 自己换新的） |
+| 6d | 连接中断 | 邮件调用一次，放置半小时以上（或断一下网）再调用 | 成功；Connector 发现连接断了会重连一次 |
+
+**Phase 3**
+
+用 demo 配置或在你的配置里临时加一个 `approval_required` 的工具，并按第 4、6 节启用 HTTPS 和 `approvals:`。
+
+| # | 怎么验 | 预期 |
+|---|---|---|
+| 1 | `approval enroll person_a`，在手机或电脑上打开链接 | 浏览器要求创建 Passkey；同一个链接第二次打开无效 |
+| 2 | `call $A a_notes_add '{"folder":"inbox","text":"hello"}'` | 没有执行；回答里有审批链接 |
+| 3 | 打开链接，核对页面上的 client、账号、工具、参数，批准 | 要求生物识别或设备密码 |
+| 4 | 原样重复第 2 步的调用，然后再重复一次 | 第一次执行成功；第二次又变成等待审批（一次批准只管一次） |
+| 5 | 发起请求，批准后把参数改一个字再调用 | 不执行，生成新的请求 |
+| 6 | 发起请求，在页面上拒绝；再原样调用 | 回答已被拒绝，不生成新请求（默认 10 分钟内） |
+| 7 | 用 B 的设备打开 A 的请求链接 | 看得到内容，但 B 的 Passkey 批不了 A 账号的请求 |
+| 8 | 批准后不调用，`approval cancel <id>`，再调用 | 不执行 |
+| 9 | `jq -c 'select(.event \| startswith("approval"))' data/state/audit/audit.jsonl` | 每次请求、批准、拒绝、撤销各有一行，没有参数值 |
+
+哪一项和预期不符，把现象和对应时间的审计日志行（里面没有内容）发给我就够定位了。
+
+## 9. 日常操作
 
 **改权限**：改 `gateway.yaml` → `check` → `docker compose restart gateway`。没有热加载，这是有意的。
 
@@ -77,40 +333,57 @@ docker compose build
 **轮换客户端 Token**：`token` 生成新的 → 替换配置里的哈希 → 重启 → 更新 Agent 侧配置。旧 Token 立即失效。
 怀疑泄露时也是这个流程。
 
-**轮换上游凭据**：先在服务方吊销旧的（Apple ID 的 App 专用密码、Google 的应用授权）→ `secret set` 录入新的 → 重启。
+**轮换上游凭据**：先在服务方吊销旧的（Apple 账号页的 App 专用密码、Google 账号的第三方应用访问权）→ `secret set` 录入新的 → 重启。
 
 **撤销一个 Agent**：删除它的 `clients` 条目 → 重启。
 
-## 6. 备份与恢复
+**Agent 说某个工具用不了**：Agent 收到的都是固定文字，对应关系如下。
+
+| Agent 收到 | 原因 | 处理 |
+|---|---|---|
+| `…rejected this account's credentials…` | App 专用密码被吊销或录错；之后 60 秒内的调用直接得到同一句话 | 生成新密码 → `secret set` → 重启 |
+| `Google no longer accepts this account's authorisation…` | refresh token 过期或被撤销（「Testing」状态下每 7 天一次） | 重新跑 `gmail_auth` → 重启 |
+| `The stored Google token allows more than reading mail…` | 存进去的 Token 不是只读 scope | 用 `gmail_auth` 重新授权，不要用别处得到的 Token |
+| `…could not be reached…` | 网络或上游服务故障 | 通常自己恢复 |
+| `The upstream service is currently unavailable.` | Connector 进程没起来或刚被重启 | 看容器日志；Gateway 会自动重连 |
+| `This tool is disabled until an administrator reviews its definition.` | 上游工具定义和锁文件不一致 | `lock` |
+| `This action needs human approval and was not executed.`（没有链接） | 没有配置 `approvals:`，或账号所有者没登记 Passkey | 第 6 节 |
+
+## 10. 备份与恢复
 
 | 文件 | 内容 | 备份方式 |
 |---|---|---|
 | `key/master.key` | 解密 `secrets.enc` 的密钥 | **只**放密码管理器，不进入任何自动备份 |
 | `secrets/secrets.enc` | 加密后的上游凭据 | 可以随常规备份；没有密钥时无法解开 |
 | `config/gateway.yaml`、`config/tools.lock.json` | 配置和已审阅的工具定义；只含 Token 的哈希 | 常规备份，或放私有仓库 |
+| `state/approvals.sqlite` | 已登记 Passkey 的公钥、近期审批请求 | 可以备份，也可以不备份：丢了的后果是每个人重新登记一次。它不含私钥，但含待处理请求的参数 |
 | `state/audit/` | 审计日志 | 按需 |
 
 密钥和密文分开放，是这份加密唯一的意义：密文单独泄露不等于凭据泄露。把两者放进同一个备份就失去了这个意义。
 
-**恢复**：把四类文件放回原位（密钥从密码管理器取回，权限 `0600`、属主 10001）→ `check` → 启动。
+**恢复**：把文件放回原位（密钥从密码管理器取回，权限 `0600`、属主 10001）→ `check` → 启动。
+从备份恢复 `approvals.sqlite` 会把当时已登记的 Passkey 一起恢复，包括之后被你 `forget` 掉的；恢复后用 `approval passkeys` 核对一遍。
 
 **密钥丢了**：`secrets.enc` 无法恢复。删掉它和旧密钥，重新 `secret init`，到各服务方重新生成凭据后逐个 `secret set`。
 这些凭据都是可以重新签发的，所以丢密钥是麻烦，不是灾难。
 
 **主机被入侵或怀疑被入侵**：按「全部凭据已泄露」处理：在各服务方吊销所有上游凭据，换新主机，
-重新生成主密钥、所有上游凭据和所有客户端 Token。
+重新生成主密钥、所有上游凭据和所有客户端 Token，删掉 `approvals.sqlite` 让所有人重新登记 Passkey。
 
-## 7. 审计日志
+## 11. 审计日志
 
 `state/audit/audit.jsonl`，每行一个 JSON，每个 UTC 日切一个文件，保留 `audit.retention_days` 个。
 
-记录的字段：时间、事件（`tool_call` / `auth_failed` / `tool_blocked` / `startup`）、client、principal、tool、
-connection、service、account、上游工具名、decision、reason、耗时、结果字节数、参数**名**、来源地址。
+事件：`tool_call`、`auth_failed`、`tool_blocked`、`startup`，以及审批相关的 `approval_requested`、`approval_decided`、
+`passkey_enrolled`、`passkey_removed`。
 
-不记录：参数值、结果内容、Token、凭据、上游错误原文。
+记录的字段：时间、事件、client、principal、tool、connection、service、account、上游工具名、decision、reason、
+耗时、结果字节数、参数**名**、来源地址、审批请求 id、批准者。
+
+不记录：参数值、结果内容（邮件、日程、提醒事项的任何文字）、Token、凭据、上游错误原文。
 
 `remote` 是 Gateway 进程看到的对端地址。容器部署下它取决于 Docker 网络：从外部网卡进来的连接通常保留源地址，
-经 Docker 本机转发的连接会显示成网桥地址（如 `172.18.0.1`）。部署后先看一眼实际记录到的值，再决定能不能靠它判断调用来自哪台机器。
+经 Docker 本机转发或 `tailscale serve` 的连接会显示成网桥或本机地址。部署后先看一眼实际记录到的值，再决定能不能靠它判断调用来自哪台机器。
 
 ```sh
 jq -c 'select(.decision != "allow")' data/state/audit/audit.jsonl      # 所有被拒绝和出错的调用
@@ -120,7 +393,7 @@ jq -r 'select(.event == "tool_call") | [.principal, .tool] | @tsv' data/state/au
 
 审计日志由 Gateway 自己写，能控制 Gateway 主机的人也能改它。它用于发现 Agent 的异常行为，不是防篡改的证据。
 
-## 8. 升级
+## 12. 升级
 
 ```sh
 git pull

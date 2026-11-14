@@ -1,0 +1,52 @@
+# EXPERIMENTAL. A second, small gateway that runs natively on one person's Mac, inside
+# that person's own macOS login session, and serves only their Reminders. The main
+# gateway is its one client and reaches it as an HTTP upstream (the commented
+# `reminders-a` connection in gateway.household.example.yaml).
+#
+# Why a second gateway: Reminders can only be read through EventKit, by a process
+# running as the macOS user who is signed in to that Apple Account. The main gateway
+# runs somewhere else, so something has to run here. Using `agw` for it means no new
+# code: the same token check, allowlist, lock file and audit log.
+#
+# Not verified on real data, and the macOS permission is not read-only. Read the
+# section 提醒事项 in docs/deployment.md before using this.
+
+server:
+  host: 127.0.0.1            # start with `agw serve --host <this Mac's Tailscale IP>`
+  port: 8090
+  allowed_hosts: []          # e.g. ["PERSON_A_MAC.your-tailnet.ts.net:8090"]
+
+audit:
+  path: state/audit/audit.jsonl
+  retention_days: 30
+
+# No upstream credential is stored here: EventKit uses the macOS permission.
+# No secrets store or master key is needed for this helper.
+
+lock_file: tools.lock.json
+
+principals: [person_a]
+
+clients:
+  - id: main-gateway
+    principal: person_a
+    token_sha256: PASTE_HASH_FROM_agw_token   # the token itself goes into the main gateway: agw secret set reminders_helper_token_a
+
+connections:
+  - id: reminders
+    service: reminders
+    account: person_a
+    owner: person_a
+    transport: stdio
+    command: ["python", "-m", "agent_gateway.connectors.reminders_eventkit"]
+    timeout_seconds: 30
+    tools:
+      - { upstream: list_lists, name: reminders_lists }
+      - { upstream: list_reminders, name: reminders_list }
+      - { upstream: get_reminder, name: reminders_get }
+
+policy:
+  - principals: [person_a]
+    connection: reminders
+    tools: [reminders_lists, reminders_list, reminders_get]
+    effect: allow
