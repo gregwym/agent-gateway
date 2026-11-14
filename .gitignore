@@ -1,0 +1,14 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Local runtime state: never commit keys, secret stores, tokens or audit logs.
+/run/
+/deploy/data/
+/deploy/.env
+*.key
+secrets.enc
+audit.jsonl*

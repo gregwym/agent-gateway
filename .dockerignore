@@ -1,0 +1,5 @@
+*
+!requirements.txt
+!agent_gateway/
+!examples/
+**/__pycache__/

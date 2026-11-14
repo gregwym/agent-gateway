@@ -1,0 +1,55 @@
+# Run from this directory:  docker compose up -d --build
+#
+# Host layout (AGW_HOME, default ./data), all owned by uid 10001:
+#   config/gateway.yaml, config/tools.lock.json   read-only for the running gateway
+#   secrets/secrets.enc                            encrypted upstream credentials
+#   state/audit/                                   audit log (the only thing the gateway writes)
+# and, kept apart so one backup job does not pick up both halves:
+#   AGW_KEY_DIR (default ./data/key)/master.key    the key for secrets.enc
+#
+# This file hardens the container. It does not make the host safe: anyone with
+# root or Docker access on this host can read the key. See docs/deployment.md.
+
+name: agent-gateway
+
+x-gateway: &gateway
+  build: ..
+  image: agent-gateway:local
+  user: "10001:10001"
+  init: true            # reaps whatever connector processes leave behind
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp"]
+
+services:
+  gateway:
+    <<: *gateway
+    restart: unless-stopped
+    ports:
+      # One address only. Set AGW_BIND to this host's Tailscale IP; never 0.0.0.0.
+      - "${AGW_BIND:-127.0.0.1}:${AGW_PORT:-8080}:8080"
+    volumes:
+      - ${AGW_HOME:-./data}/config:/config:ro
+      - ${AGW_HOME:-./data}/secrets:/secrets:ro
+      - ${AGW_KEY_DIR:-./data/key}:/key:ro
+      - ${AGW_HOME:-./data}/state:/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # One-off admin commands, run by a human on this host. Same image, writable mounts:
+  #   docker compose run --rm admin secret init
+  #   docker compose run --rm admin secret set notes_key_a
+  #   docker compose run --rm admin lock --write
+  #   docker compose run --rm admin check
+  admin:
+    <<: *gateway
+    profiles: ["admin"]
+    volumes:
+      - ${AGW_HOME:-./data}/config:/config
+      - ${AGW_HOME:-./data}/secrets:/secrets
+      - ${AGW_KEY_DIR:-./data/key}:/key
+      - ${AGW_HOME:-./data}/state:/state

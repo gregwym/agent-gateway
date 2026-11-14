@@ -1,0 +1,137 @@
+# Example configuration. It runs as-is against the demo connector once the three
+# token hashes are filled in (`agw token`) and the three demo secrets are stored
+# (`agw secret set`). Until then it is rejected, on purpose.
+#
+# Read once at startup. No hot reload, no admin API: changing access means editing
+# this file on the gateway host and restarting. Unknown keys are errors.
+#
+# Relative paths are relative to this file. The layout assumed here:
+#   <home>/config/gateway.yaml   <home>/secrets/   <home>/key/   <home>/state/
+
+server:
+  host: 127.0.0.1          # the container image overrides this with --host 0.0.0.0
+  port: 8080
+  # Host header values to accept, e.g. ["gateway.your-tailnet.ts.net:8080"].
+  # Empty = no check. Set it when the gateway is reachable by name.
+  allowed_hosts: []
+  max_result_bytes: 1000000
+
+audit:
+  path: ../state/audit/audit.jsonl   # metadata only: who, which tool, outcome, sizes
+  retention_days: 90
+
+secrets:
+  path: ../secrets/secrets.enc
+  key_file: ../key/master.key
+
+lock_file: tools.lock.json
+
+# Who exists. A principal is a person or the household; nothing more.
+principals: [person_a, person_b, household]
+
+# Accounts owned by these principals are meant to be shared, so rules that grant
+# them to other principals need no `cross_account: true`.
+shared: [household]
+
+# One entry per credential handed to an agent. A client is exactly one principal.
+# An agent that cannot prove which person is talking to it gets a `household` client.
+clients:
+  - id: openclaw-shared
+    principal: household
+    token_sha256: PASTE_HASH_FROM_agw_token
+  - id: mausbot-person-a
+    principal: person_a
+    token_sha256: PASTE_HASH_FROM_agw_token
+  - id: mausbot-person-b
+    principal: person_b
+    token_sha256: PASTE_HASH_FROM_agw_token
+
+# One connection = one upstream MCP server = one account of one service.
+# Only the tools listed here exist for agents; everything else upstream is ignored.
+connections:
+  - id: notes-a
+    service: notes
+    account: person_a
+    owner: person_a
+    transport: stdio
+    command: ["python", "examples/demo_connector.py"]   # relative to the gateway's working directory
+    env: { DEMO_ACCOUNT: person_a }
+    secret_env: { DEMO_API_KEY: notes_key_a }            # ENV_VAR: name in the secret store
+    timeout_seconds: 30
+    tools:
+      - { upstream: list_notes, name: a_notes_list }
+      - { upstream: get_note, name: a_notes_get }
+      - { upstream: add_note, name: a_notes_add }
+      # The same upstream tool again, fixed to one folder: `folder` disappears from
+      # the schema agents see and is always sent as "family".
+      - { upstream: list_notes, name: a_family_notes, pin: { folder: family } }
+
+  - id: notes-b
+    service: notes
+    account: person_b
+    owner: person_b
+    transport: stdio
+    command: ["python", "examples/demo_connector.py"]
+    env: { DEMO_ACCOUNT: person_b }
+    secret_env: { DEMO_API_KEY: notes_key_b }
+    tools:
+      - { upstream: list_notes, name: b_notes_list }
+      - { upstream: get_note, name: b_notes_get }
+
+  - id: notes-house
+    service: notes
+    account: household
+    owner: household
+    transport: stdio
+    command: ["python", "examples/demo_connector.py"]
+    env: { DEMO_ACCOUNT: household }
+    secret_env: { DEMO_API_KEY: notes_key_house }
+    tools:
+      # `folder` stays an argument, but only these values are accepted.
+      - { upstream: list_notes, name: house_notes_list, allow_values: { folder: [family] } }
+
+  # An HTTP upstream looks like this (https, or http to loopback; anything else
+  # needs allow_plain_http: true). The URL is fixed here; agents never supply one.
+  # - id: offbook-a
+  #   service: offbook
+  #   account: person_a
+  #   owner: person_a
+  #   transport: http
+  #   url: https://offbook.example.ts.net/mcp
+  #   bearer_secret: offbook_token_a
+  #   tools:
+  #     - { upstream: list_trips, name: a_trips_list }
+
+# Default: deny. A (principal, tool) pair with no rule does not exist for that
+# principal: not listed, not callable. No wildcards. If several rules match,
+# the strictest wins: deny > approval_required > allow.
+policy:
+  - principals: [person_a]
+    connection: notes-a
+    tools: [a_notes_list, a_notes_get]
+    effect: allow
+
+  # Writes go through approval. There is no approval channel yet, so this tool is
+  # visible to person_a and never runs. That is the intended Phase 1 behaviour.
+  - principals: [person_a]
+    connection: notes-a
+    tools: [a_notes_add]
+    effect: approval_required
+
+  - principals: [person_b]
+    connection: notes-b
+    tools: [b_notes_list, b_notes_get]
+    effect: allow
+
+  # person_a's family folder, readable from the shared agent. Reaching into another
+  # principal's account must be spelled out.
+  - principals: [household, person_b]
+    connection: notes-a
+    tools: [a_family_notes]
+    effect: allow
+    cross_account: true
+
+  - principals: [person_a, person_b, household]
+    connection: notes-house
+    tools: [house_notes_list]
+    effect: allow
