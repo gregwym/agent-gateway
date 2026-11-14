@@ -85,7 +85,7 @@ def main() -> int:
             check("image", ["docker", "build", "-t", image, "."])
             env["AGW_TEST_IMAGE"] = image
         junit = output / "junit.xml"
-        check("pytest", [sys.executable, "-m", "pytest", "-v", "--tb=short", "-o", "faulthandler_timeout=120", f"--junitxml={junit}"], env=env)
+        check("pytest", [sys.executable, "-m", "pytest", "-v", "-x", "--tb=short", "-o", "faulthandler_timeout=120", f"--junitxml={junit}"], env=env)
         if source_fingerprint() != report["source_sha256"]:
             raise RuntimeError("Source changed during acceptance; rerun against a stable snapshot")
         report["status"] = "passed"
