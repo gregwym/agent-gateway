@@ -8,7 +8,6 @@ import json
 import re
 import secrets
 import sys
-from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -82,7 +81,7 @@ def kind_of(conn):
     if conn.transport == "http" and conn.service == "reminders":
         return "reminders"
     command = " ".join(conn.command)
-    for needle, kind in (("demo_connector.py", "demo"), ("connectors.imap_mail", "imap"),
+    for needle, kind in (("demo_connector.py", "demo"), ("agent_gateway.demo_connector", "demo"), ("connectors.imap_mail", "imap"),
                          ("connectors.caldav_calendar", "caldav"), ("connectors.gmail", "gmail")):
         if needle in command:
             return kind
@@ -141,7 +140,7 @@ def make_connection(body, cfg, values):
            "command": [sys.executable, "-m", "agent_gateway.connectors." + {"imap": "imap_mail", "caldav": "caldav_calendar"}.get(kind, kind)],
            "env": {}, "secret_env": {}}
     if kind == "demo":
-        raw["command"] = [sys.executable, str(Path(__file__).resolve().parent.parent / "examples/demo_connector.py")]
+        raw["command"] = [sys.executable, "-m", "agent_gateway.demo_connector"]
         raw["env"] = {"DEMO_ACCOUNT": owner}
         key = "web_" + name + "_demo"
         fresh[key] = values.get(key, "demo-only-" + secrets.token_urlsafe(24))
