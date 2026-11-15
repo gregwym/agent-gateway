@@ -6,7 +6,7 @@ import re
 
 import mcp_types as types
 
-from .admin_config import kind_of
+from .admin_config import kind_of, mailbox_metadata
 
 SEARCH_TOOLS = "gateway_search_tools"
 SEARCH_CONNECTIONS = "gateway_search_connections"
@@ -27,7 +27,7 @@ PAGING = {"query": text("Optional search words; empty finds all permitted matche
 TOOLS = [
     types.Tool(name=SEARCH_TOOLS, description="Search the tools this Agent may use. Tools are shared across connections. Returns names, parameter schemas and connection counts. Use gateway_search_connections to inspect connection-specific restrictions, then gateway_call_tool to execute. Results reflect current permissions, without reloading the MCP tool list.",
                input_schema=schema({**PAGING, "connection": text("Optional connection ID to search within.", 48)}), annotations=types.ToolAnnotations(read_only_hint=True)),
-    types.Tool(name=SEARCH_CONNECTIONS, description="Search connections this Agent may access. Optionally specify a tool from gateway_search_tools to see its permitted parameter variants and approval requirements on each connection. Hidden or denied connections are never returned.",
+    types.Tool(name=SEARCH_CONNECTIONS, description="Search connections this Agent may access by name, service, owner, or known mailbox address and aliases. Mail aliases share the same connection ID. Optionally specify a tool from gateway_search_tools to see its permitted parameter variants and approval requirements on each connection. Hidden or denied connections are never returned.",
                input_schema=schema({**PAGING, "tool": text("Optional shared tool name from gateway_search_tools.", 128)}), annotations=types.ToolAnnotations(read_only_hint=True)),
     types.Tool(name=CALL_TOOL, description="Execute a discovered tool on a permitted connection. Pass tool, connection and arguments. Permissions, fixed arguments and one-use approvals are enforced again at execution. If several parameter variants match, select a variant from gateway_search_connections. Approval-required responses contain a link; after approval retry the same call once.",
                input_schema=schema({"tool": text("Shared tool name from gateway_search_tools.", 128),
@@ -89,12 +89,17 @@ def search_connections(gateway, who, args):
     for route in permitted(gateway, who):
         if args.get("tool") and args["tool"] != shared_name(route):
             continue
-        if matches(args.get("query", ""), route.conn.id, route.conn.service, gateway.cfg.name_of(route.conn.owner)):
-            grouped.setdefault(route.conn.id, []).append(route)
+        grouped.setdefault(route.conn.id, []).append(route)
     items = []
     for name, routes in sorted(grouped.items()):
-        item = {"connection": name, "service": routes[0].conn.service,
-                "owner": gateway.cfg.name_of(routes[0].conn.owner), "tool_count": len({shared_name(r) for r in routes})}
+        conn = routes[0].conn
+        owner = gateway.cfg.name_of(conn.owner)
+        mailbox = mailbox_metadata(conn)
+        if not matches(args.get("query", ""), name, conn.service, owner, mailbox.get("email", ""),
+                       mailbox.get("sender_email", ""), *mailbox.get("aliases", ())):
+            continue
+        item = {"connection": name, "service": conn.service, "owner": owner,
+                "tool_count": len({shared_name(r) for r in routes}), **mailbox}
         if args.get("tool"):
             item["variants"] = [{"id": r.tool.name, "description": r.exposed.description or "", "inputSchema": r.exposed.input_schema,
                                  "approval_required": gateway.policy.effect(who.principal, r.tool.name, who.client_id) == "approval_required"}

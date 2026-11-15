@@ -75,6 +75,15 @@ filter by `connection`; connection search can filter by `tool` and returns the
 exact schema for each permitted binding. Supply `variant` when a connection has
 multiple restricted bindings for the same tool.
 
+For IMAP and Gmail, connection search also matches known mailbox addresses. In
+the IMAP connector's **Mailbox addresses** settings, add one alias per line.
+The primary address and aliases point to the same connection. Gmail addresses
+are recorded when the account is authorized through the web UI.
+
+Use **Rename** on a connector to change its connection ID. Credentials and
+permissions carry over. Update workflows that pass the old connection ID and
+request unfinished approvals again.
+
 Every call rechecks permissions, parameters and approval requirements. A call
 requiring approval returns a link without executing. After approval, the agent
 repeats the same call; the grant is consumed once. A failed upstream write is not

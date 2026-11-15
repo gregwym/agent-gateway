@@ -9,6 +9,7 @@ import httpx2
 from fido2.utils import websafe_encode
 
 from .admin_config import make_connection
+from .mail_address import email_address
 from .passkey import Refused
 
 SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -87,8 +88,8 @@ class GoogleConsent(ConsentSessions):
                     raise Refused("oauth_refresh_token_missing", 400)
                 profile = await http.get(PROFILE, headers={"Authorization": "Bearer " + token["access_token"]})
                 profile.raise_for_status()
-                email = profile.json().get("emailAddress")
-                if not isinstance(email, str) or len(email) > 320:
+                email = email_address(profile.json().get("emailAddress"))
+                if not email:
                     raise Refused("oauth_failed", 400)
             flow["body"]["credentials"]["refresh_token"] = token["refresh_token"]
             flow["account"] = email

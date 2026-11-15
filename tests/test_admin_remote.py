@@ -217,6 +217,10 @@ async def test_oauth_roundtrip_refresh_restart_scrubbing_and_revoke(tmp_path, mo
             await upstream.list_all_tools(client)
         assert remote.tokens == 2  # absolute expiry survives restart
         assert (await change(http, 'permissions/connection', client='shared-agent', connection=conn.id, access='read')).status_code == 200
+        renamed = await change(http, 'connections/rename', id=conn.id, name='personal-notes')
+        assert renamed.status_code == 200, renamed.text
+        conn = admin.runtime.gateway.cfg.connection('personal-notes')
+        assert conn.oauth_ref == ref and remote.tokens == 2
         reply = (await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name':'remote_notes_read_note','arguments':{}})).json()
         assert '[REDACTED]' in reply['result']['content'][0]['text']
         revoked = await change(http, 'oauth/revoke', id=conn.id)

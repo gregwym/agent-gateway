@@ -16,6 +16,7 @@ const TEXT = {
   hint_gone: ['Nothing will be executed for this request.', '这个请求不会被执行。'],
   requested_by: ['Requested by', '请求方'],
   account: ['Account', '账号'],
+  connection: ['Connector', '连接器'],
   tool: ['Action', '操作'],
   decides: ['Who can decide', '谁可以决定'],
   until: ['Valid until', '有效期至'],
@@ -157,6 +158,7 @@ function showRequest(request) {
   const facts = el(el(app, 'div', undefined, 'card'), 'dl');
   row(facts, t('requested_by'), request.client);
   row(facts, t('account'), request.service + ' / ' + request.account);
+  if (request.connection !== request.account) row(facts, t('connection'), request.connection);
   row(facts, t('tool'), request.tool + ' (' + request.upstream_tool + ')');
   if (request.status === 'pending') row(facts, t('decides'), request.approvers.map(identity).join(', '));
   if (open) row(facts, t('until'), new Date(request.expires * 1000).toLocaleString());

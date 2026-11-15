@@ -11,9 +11,10 @@ import sys
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .config import Config, ConnectionCfg, validate_name
+from .config import Config, ConnectionCfg, allocate_tool_name, validate_name
 from .credentials import EncryptedFileStore
 from .lock import Lock, digest_of
+from .mail_address import email_address
 from .passkey import Refused
 
 SECTIONS = ("principals", "shared", "households", "members", "clients", "connections", "policy")
@@ -26,6 +27,7 @@ CONNECTION_ACCESS = {
     "read_write_approval": {"read": "approval_required", "write": "approval_required"},
     "read_approval_write_direct": {"read": "approval_required", "write": "allow"},
 }
+CONNECTOR_NAME = r"[a-z][a-z0-9_-]{0,31}"
 from .admin_remote import SPEC, make_remote
 
 CATALOG = {
@@ -34,7 +36,8 @@ CATALOG = {
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
              "probe": ("list_notes", {"folder": "inbox"})},
     "imap": {"label": "Mail / 邮箱 (iCloud, IMAP + SMTP)",
-             "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender"], "secrets": ["password"],
+             "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender",
+                        "mailbox_email", "mailbox_aliases"], "secrets": ["password"],
              "tools": [("list_mailboxes", "mailboxes"), ("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment"),
                        ("list_messages", "list"), ("get_messages", "get_batch"), ("set_message_state", "set_state"),
                        ("move_messages", "move"), ("archive_messages", "archive"), ("trash_messages", "trash"), ("send_message", "send")],
@@ -194,11 +197,40 @@ def settings_of(conn):
              "CALDAV_USERNAME": "username", "CALDAV_URL": "url", "CALDAV_TIMEZONE": "timezone",
              "GMAIL_CLIENT_ID": "client_id"}
     result = {names[key]: value for key, value in conn.env.items() if key in names}
+    if kind_of(conn) == "imap":
+        result.update(mailbox_email=conn.mailbox_email or "", mailbox_aliases="\n".join(conn.mailbox_aliases))
     if conn.transport == "http":
         result["url"] = conn.url
         if kind_of(conn) == "remote":
             result.update(service=conn.service, auth="oauth" if conn.oauth_ref else "bearer" if conn.bearer_secret else "header" if conn.secret_headers else "none",
                           header=next(iter(conn.secret_headers), ""))
+    return result
+
+
+def mailbox_metadata(conn):
+    kind = kind_of(conn)
+    if kind not in ("imap", "gmail"):
+        return {}
+    primary = conn.mailbox_email
+    result = {}
+    if kind == "imap":
+        username = conn.env.get("IMAP_USERNAME", "")
+        icloud = conn.env.get("IMAP_HOST", "imap.mail.me.com").lower() == "imap.mail.me.com"
+        default_address = username + "@icloud.com" if icloud and username and "@" not in username else username
+        primary = primary or email_address(default_address)
+        sender = email_address(conn.env.get("SMTP_SENDER"))
+        if sender and sender != primary:
+            result["sender_email"] = sender
+    seen = {primary.casefold()} if primary else set()
+    aliases = []
+    for alias in conn.mailbox_aliases:
+        if alias.casefold() not in seen:
+            aliases.append(alias)
+            seen.add(alias.casefold())
+    if primary:
+        result["email"] = primary
+    if aliases:
+        result["aliases"] = aliases
     return result
 
 
@@ -216,15 +248,16 @@ def tool_access(conn, tool):
     return "write"
 
 
-def catalog_additions(conn):
+def catalog_additions(conn, cfg):
     registered = {tool.upstream for tool in conn.tools}
-    return [{"upstream": upstream, "name": conn.id.replace("-", "_") + "_" + suffix}
+    occupied = {tool.name for c in cfg.connections for tool in c.tools}
+    return [{"upstream": upstream, "name": allocate_tool_name(conn.id, upstream, suffix, occupied)}
             for upstream, suffix in CATALOG.get(kind_of(conn), {}).get("tools", ()) if upstream not in registered]
 
 
-def extend_catalog_tools(conn):
+def extend_catalog_tools(conn, cfg):
     raw = conn.model_dump(mode="json")
-    raw["tools"] += catalog_additions(conn)
+    raw["tools"] += catalog_additions(conn, cfg)
     return ConnectionCfg.model_validate(raw)
 
 
@@ -236,13 +269,13 @@ def connection_access(policy, client, conn):
     return "custom"
 
 
-def make_connection(body, cfg, values):
+def make_connection(body, cfg, values, *, gmail_email=None):
     if set(body) - {"kind", "id", "owner", "settings", "credentials", "revision"}:
         raise Refused("invalid_connector", 400)
     kind, name, owner = body.get("kind"), body.get("id"), body.get("owner")
     if kind not in CATALOG:
         raise Refused("invalid_connector", 400)
-    if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+    if not isinstance(name, str) or not re.fullmatch(CONNECTOR_NAME, name):
         raise Refused("invalid_connector_name", 400)
     if owner not in cfg.principals:
         raise Refused("unknown_member", 400)
@@ -254,8 +287,27 @@ def make_connection(body, cfg, values):
     previous = next((c for c in cfg.connections if c.id == name), None)
     if previous and (kind_of(previous) != kind or previous.owner != owner):
         raise Refused("connector_identity_is_fixed", 409)
+    # The public ID can change. Keep the account and credentials bound to the
+    # original connector, even if the old ID is used to create another one.
+    accounts = {c.account for c in cfg.connections}
+    account = previous.account if previous else name
+    if not previous:
+        while account in accounts:
+            account = f"{name[:31]}-{secrets.token_hex(8)}"
+    other_refs = {ref for c in cfg.connections if c.id != name for ref in c.secret_names()}
+
+    def credential_ref(key, old_ref=None):
+        preferred = f"web_{account}_{key}"
+        if old_ref and old_ref.startswith(preferred + "_") and old_ref not in other_refs:
+            return old_ref
+        if preferred not in values or (preferred == old_ref and preferred not in other_refs):
+            return preferred
+        while (ref := f"{preferred}_{secrets.token_hex(8)}") in values:
+            pass
+        return ref
+
     if kind == "remote":
-        return make_remote(name, owner, settings, provided, previous, values)
+        return make_remote(name, owner, account, settings, provided, previous, values, credential_ref)
     fresh = {}
 
     def field(key, default=""):
@@ -269,15 +321,13 @@ def make_connection(body, cfg, values):
         value = provided.get(key) or values.get(old_name)
         if not value:
             raise Refused("missing_" + key, 400)
-        secret_name = "web_" + name + "_" + key
+        secret_name = credential_ref(key, old_name)
         fresh[secret_name] = value
         return secret_name
 
     service = {"demo": "notes", "imap": "imap-mail", "caldav": "caldav-calendar"}.get(kind, kind)
-    # Multiple accounts of one service can belong to a person; account identity is
-    # the connector id. Ownership and approval authority are separate.
     raw = {"id": name, "service": previous.service if previous else service,
-           "account": previous.account if previous else name, "owner": owner,
+           "account": account, "owner": owner,
            "approver": previous.approver if previous else None,
            "transport": "stdio", "timeout_seconds": 60,
            "command": [sys.executable, "-m", "agent_gateway.connectors." + {"imap": "imap_mail", "caldav": "caldav_calendar"}.get(kind, kind)],
@@ -285,8 +335,9 @@ def make_connection(body, cfg, values):
     if kind == "demo":
         raw["command"] = [sys.executable, "-m", "agent_gateway.demo_connector"]
         raw["env"] = {"DEMO_ACCOUNT": owner}
-        key = "web_" + name + "_demo"
-        fresh[key] = values.get(key, "demo-only-" + secrets.token_urlsafe(24))
+        old_ref = previous.secret_env.get("DEMO_API_KEY") if previous else None
+        key = credential_ref("demo", old_ref)
+        fresh[key] = values.get(old_ref) or "demo-only-" + secrets.token_urlsafe(24)
         raw["secret_env"] = {"DEMO_API_KEY": key}
     elif kind == "imap":
         port = field("port", "993")
@@ -304,6 +355,15 @@ def make_connection(body, cfg, values):
             raise Refused("smtp_invalid_security", 400)
         raw["env"].update(SMTP_HOST=smtp_host, SMTP_PORT=smtp_port, SMTP_SECURITY=security,
                           SMTP_USERNAME=settings.get("smtp_username", "").strip(), SMTP_SENDER=settings.get("smtp_sender", "").strip())
+        raw["mailbox_email"] = settings.get("mailbox_email", previous.mailbox_email if previous else "") or None
+        if raw["mailbox_email"]:
+            raw["mailbox_email"] = raw["mailbox_email"].strip() or None
+        raw["mailbox_aliases"] = ([line.strip() for line in settings["mailbox_aliases"].splitlines() if line.strip()]
+                                  if "mailbox_aliases" in settings else previous.mailbox_aliases if previous else [])
+        if raw["mailbox_email"] and not email_address(raw["mailbox_email"]):
+            raise Refused("invalid_mailbox_email", 400)
+        if len(raw["mailbox_aliases"]) > 50 or any(not email_address(alias) for alias in raw["mailbox_aliases"]):
+            raise Refused("invalid_mailbox_aliases", 400)
         if raw["env"]["SMTP_SENDER"]:
             from .connectors._smtp import address
             from .connectors._base import ConnectorError
@@ -327,6 +387,12 @@ def make_connection(body, cfg, values):
         raw["env"] = {"GMAIL_CLIENT_ID": field("client_id")}
         raw["secret_env"] = {"GMAIL_CLIENT_SECRET": secret("client_secret", "GMAIL_CLIENT_SECRET"),
                              "GMAIL_REFRESH_TOKEN": secret("refresh_token", "GMAIL_REFRESH_TOKEN")}
+        if gmail_email:
+            raw["mailbox_email"] = gmail_email
+        elif previous and previous.env.get("GMAIL_CLIENT_ID") == raw["env"]["GMAIL_CLIENT_ID"] and all(
+                fresh[ref] == values.get(previous.secret_env.get(key)) for key, ref in raw["secret_env"].items()):
+            raw["mailbox_email"] = previous.mailbox_email
+            raw["mailbox_aliases"] = previous.mailbox_aliases
     else:
         raw.update(transport="http", url=field("url"), command=[], bearer_secret=secret("token", ""))
         parts = urlsplit(raw["url"])
@@ -337,7 +403,4 @@ def make_connection(body, cfg, values):
     # Keep reviewed restrictions and names, and present newly bundled tools for
     # explicit review. No policy rule is added, so additions start denied.
     raw["tools"] = [t.model_dump(mode="json") for t in previous.tools] if previous else []
-    existing = {t["upstream"] for t in raw["tools"]}
-    raw["tools"] += [{"upstream": upstream, "name": name.replace("-", "_") + "_" + suffix}
-                     for upstream, suffix in CATALOG[kind]["tools"] if upstream not in existing]
-    return ConnectionCfg.model_validate(raw), fresh
+    return extend_catalog_tools(ConnectionCfg.model_validate(raw), cfg), fresh

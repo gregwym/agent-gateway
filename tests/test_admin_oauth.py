@@ -94,6 +94,8 @@ async def test_google_consent_is_session_bound_reviewed_and_never_echoes_credent
         assert 'google-private-refresh' not in review.text
         assert not any(c['id'] == 'google-mail' for c in (await state(http))['connections'])
         assert (await change(http, 'connections/apply', draft=review.json()['draft'], reviewed=True)).status_code == 200
+        conn = next(c for c in (await state(http))['connections'] if c['id'] == 'google-mail')
+        assert conn['mailbox'] == {'email':'owner@example.test'}
         assert 'google-private-refresh' not in json.dumps(await state(http)) + gw.audit_text()
         assert b'google-private-refresh' not in (tmp_path / 'admin.enc').read_bytes()
 

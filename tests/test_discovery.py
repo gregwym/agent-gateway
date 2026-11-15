@@ -7,7 +7,7 @@ from mcp import MCPError
 from helpers import TOKEN_A, TOKEN_B, TOKEN_HOUSE, agent, base_config, prepare, running_gateway, text_of, tool_names
 from passkey_helpers import Page, approval_config, request_id_in
 from service_helpers import free_port
-from test_admin import change, rpc, setup, web_gateway
+from test_admin import change, login, rpc, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
 CORE = {'gateway_search_tools', 'gateway_search_connections', 'gateway_call_tool'}
@@ -21,6 +21,63 @@ async def search(client, name, **args):
 
 async def execute(client, tool, connection, arguments, **extra):
     return await client.call_tool('gateway_call_tool', dict(tool=tool, connection=connection, arguments=arguments, **extra))
+
+
+async def test_mailbox_addresses_and_connector_rename_follow_agent_grants(tmp_path):
+    port = free_port()
+    origin = f'http://localhost:{port}'
+    raw = approval_config(origin=origin)
+    raw['server']['tool_discovery'] = 'search'
+    raw['admin'] = {'owner': 'person_a', 'state': 'admin.enc'}
+    path = await prepare(tmp_path, raw)
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
+        key, _ = await setup(http, origin, path)
+
+        async def add_mail(name, username, password, **settings):
+            preview = await change(http, 'connections/preview', id=name, kind='imap', owner='person_a',
+                                   settings={'username': username, **settings}, credentials={'password': password})
+            assert preview.status_code == 200, preview.text
+            applied = await change(http, 'connections/apply', draft=preview.json()['draft'], reviewed=True)
+            assert applied.status_code == 200, applied.text
+
+        await add_mail('inbox', 'account', 'fake-original-password', mailbox_email='primary@example.test',
+                       mailbox_aliases='alias@example.test\nother@example.test\nALIAS@example.test',
+                       smtp_sender='outbound@example.test')
+        await add_mail('work', 'work@example.test', 'fake-work-password')
+        granted = await change(http, 'permissions/connection', client='agent-a', connection='inbox', access='read')
+        assert granted.status_code == 200, granted.text
+        before = next(c for c in (await state(http))['connections'] if c['id'] == 'inbox')
+        async with agent(origin + '/mcp', TOKEN_A) as allowed, agent(origin + '/mcp', TOKEN_B) as denied:
+            assert (await search(denied, 'connections', query='alias@example.test'))['total'] == 0
+            assert (await search(allowed, 'connections', query='work@example.test'))['total'] == 0
+            item, = (await search(allowed, 'connections', query='ALIAS@example.test'))['connections']
+            assert item['connection'] == 'inbox'
+            assert item['email'] == 'primary@example.test'
+            assert item['aliases'] == ['alias@example.test', 'other@example.test']
+            assert item['sender_email'] == 'outbound@example.test'
+            assert (await change(http, 'connections/rename', id='inbox', name='work')).json()['error'] == 'duplicate_connector'
+            assert (await change(http, 'connections/rename', id='inbox', name='Bad name')).json()['error'] == 'invalid_connector_name'
+            renamed = await change(http, 'connections/rename', id='inbox', name='personal')
+            assert renamed.status_code == 200, renamed.text
+            found, = (await search(allowed, 'connections', query='other@example.test'))['connections']
+            assert found == {**item, 'connection': 'personal'}
+            assert (await search(allowed, 'connections', query='inbox'))['total'] == 0
+            after = next(c for c in (await state(http))['connections'] if c['id'] == 'personal')
+            assert after['access'] == before['access']
+            assert after['tools'] == before['tools']
+
+        await add_mail('inbox', 'new-account', 'fake-replacement-password')
+        effective = gw.app.state.admin.runtime.gateway
+        for name, password in [('personal', 'fake-original-password'), ('inbox', 'fake-replacement-password')]:
+            conn = effective.cfg.connection(name)
+            assert effective.secrets[conn.secret_env['IMAP_PASSWORD']] == password
+        granted = await change(http, 'permissions/connection', client='agent-a', connection='inbox', access='read')
+        assert granted.status_code == 200, granted.text
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, _):
+        await login(http, key, origin)
+        async with agent(origin + '/mcp', TOKEN_A) as allowed:
+            assert (await search(allowed, 'connections', query='primary@example.test'))['connections'][0]['connection'] == 'personal'
+            assert (await search(allowed, 'connections', query='new-account@icloud.com'))['connections'][0]['connection'] == 'inbox'
 
 
 async def test_fixed_list_search_paging_and_connection_selected_execution(tmp_path):

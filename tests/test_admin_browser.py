@@ -96,6 +96,12 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                         await page.screenshot(path=str(Path(directory) / 'admin-permissions-mobile-detail.png'))
                 bounds = await row.get_by_role('button', name=t('Save access','保存权限'), exact=True).bounding_box()
                 assert bounds['x'] >= 0 and bounds['x'] + bounds['width'] <= page.viewport_size['width']
+                await page.get_by_role('button', name=t('Connectors','连接器'), exact=True).click()
+                await connector.get_by_role('button', name=t('Rename','改名'), exact=True).click()
+                await page.get_by_label(t('Connector name','连接器名称'), exact=True).fill('renamed-notes')
+                await page.get_by_role('button', name=t('Save name','保存名称'), exact=True).click()
+                await playwright.expect(page.get_by_role('heading', name='renamed-notes', exact=True)).to_be_visible()
+                await playwright.expect(connector).to_have_count(0)
                 await page.get_by_role('button', name=t('Sign out','退出'), exact=True).click()
                 await page.get_by_role('button', name=t('Sign in with passkey','用通行密钥登录'), exact=True).click()
                 await playwright.expect(page.get_by_role('button', name=t('Sign out','退出'), exact=True)).to_be_visible()

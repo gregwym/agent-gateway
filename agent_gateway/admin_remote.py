@@ -1,8 +1,7 @@
 """Web-managed remote MCP connections: bounded settings and explicit tool review."""
-import hashlib
 import re
 
-from .config import ConnectionCfg, NAME, ToolCfg
+from .config import ConnectionCfg, NAME, ToolCfg, allocate_tool_name
 from .oauth import https_url
 from .passkey import Refused
 
@@ -10,7 +9,7 @@ FIELDS = ["url", "service", "auth", "header", "issuer", "client_id", "auth_metho
 SPEC = {"label": "Remote MCP / 远程 MCP", "fields": FIELDS, "secrets": ["token", "client_secret"], "tools": [], "probe": (None, {})}
 
 
-def make_remote(name, owner, settings, provided, previous, values):
+def make_remote(name, owner, account, settings, provided, previous, values, credential_ref):
     url = https_url(settings.get("url", ""))
     service = settings.get("service") or "remote-mcp"
     auth = settings.get("auth", "none")
@@ -18,7 +17,7 @@ def make_remote(name, owner, settings, provided, previous, values):
         raise Refused("invalid_remote_settings", 400)
     if previous and previous.service != service:
         raise Refused("connector_identity_is_fixed", 409)
-    raw = {"id": name, "owner": owner, "service": service, "account": previous.account if previous else name,
+    raw = {"id": name, "owner": owner, "service": service, "account": account,
            "transport": "http", "url": url, "tools": [t.model_dump(mode="json") for t in previous.tools] if previous else [],
            "approver": previous.approver if previous else None}
     fresh = {}
@@ -31,7 +30,7 @@ def make_remote(name, owner, settings, provided, previous, values):
             raise Refused("missing_token", 400)
         if any(ord(c) < 32 or ord(c) == 127 for c in token):
             raise Refused("invalid_remote_token", 400)
-        key = "web_" + name + "_token"
+        key = credential_ref("token", old)
         fresh[key] = token
         if auth == "bearer":
             raw["bearer_secret"] = key
@@ -76,18 +75,15 @@ def suggested_access(name, definition):
 
 def remote_tools(conn, definitions, cfg):
     previous = {t.upstream: t for t in conn.tools}
-    occupied = {t.name for c in cfg.connections if c.id != conn.id for t in c.tools}
+    occupied = {t.name for c in cfg.connections for t in c.tools} | {t.name for t in conn.tools}
     result = []
     for upstream in definitions:
         if upstream in previous:
             tool = previous[upstream]
         else:
             suffix = re.sub(r"[^A-Za-z0-9_-]", "_", upstream)
-            name = conn.id.replace("-", "_") + "_" + suffix
-            if len(name) > 64 or name in occupied:
-                name = name[:51] + "_" + hashlib.sha256(upstream.encode()).hexdigest()[:12]
+            name = allocate_tool_name(conn.id, upstream, suffix, occupied)
             tool = ToolCfg(upstream=upstream, name=name, access=suggested_access(upstream, definitions[upstream]))
-        occupied.add(tool.name)
         result.append(tool)
     return conn.model_copy(update={"tools": result})
 

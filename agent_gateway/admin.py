@@ -15,7 +15,10 @@ from starlette.routing import Route
 
 from . import registry
 from .admin_auth import AdminAuth, COOKIE
-from .admin_config import CATALOG, CONNECTION_ACCESS, ManagedStore, catalog_additions, connection_access, extend_catalog_tools, kind_of, make_connection, member_name, settings_of, tool_access
+from .admin_config import (
+    CATALOG, CONNECTION_ACCESS, CONNECTOR_NAME, ManagedStore, catalog_additions, connection_access,
+    extend_catalog_tools, kind_of, mailbox_metadata, make_connection, member_name, settings_of, tool_access,
+)
 from .auth import hash_token, new_token
 from .config import NAME, ToolCfg
 from .lock import Lock, definition_of, digest_of
@@ -84,8 +87,8 @@ class AdminController:
             raise Refused("configuration_changed", 409)
 
     async def _commit(self, state, action):
-        # Renames do not restart connectors or invalidate approvals. A draft must
-        # keep the latest canonical names without overwriting newly added members.
+        # Member and household renames leave the revision unchanged. Keep
+        # their latest names when publishing a draft.
         for kind in ("members", "households"):
             names = {m["id"]: m["name"] for m in self.store.state["config"][kind]}
             for member in state["config"][kind]:
@@ -148,9 +151,10 @@ class AdminController:
                                 "approver": conn.approver or conn.owner,
                                 "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
                                 "settings": self.connection_settings(conn), "tools": tools,
+                                "mailbox": mailbox_metadata(conn),
                                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None,
                                 "catalog_sync": self.store.catalog_updates.get(conn.id),
-                                "available_tools": [{**t, "access": tool_access(conn, ToolCfg.model_validate(t))} for t in catalog_additions(conn)],
+                                "available_tools": [{**t, "access": tool_access(conn, ToolCfg.model_validate(t))} for t in catalog_additions(conn, gw.cfg)],
                                 "connected": gw.upstreams[conn.id]._client is not None,
                                 "test": self.tests.get(conn.id)})
         return {"revision": self.store.state["revision"], "owner": self.auth.owner,
@@ -181,6 +185,11 @@ class AdminController:
         raw["policy"] = [{**r, "tools": [t for t in r["tools"] if t in names]} if r["connection"] == conn.id else r
                          for r in raw["policy"] if r["connection"] != conn.id or any(t in names for t in r["tools"])]
         state["secrets"].update(added)
+        previous = next((c for c in cfg.connections if c.id == conn.id), None)
+        if previous:
+            referenced = conn.secret_names() | {key for c in cfg.connections if c.id != conn.id for key in c.secret_names()}
+            for key in previous.secret_names() - referenced:
+                state["secrets"].pop(key, None)
         lock = Lock()
         for tool in conn.tools:
             lock.put(conn.id, definitions[tool.upstream])
@@ -218,7 +227,7 @@ class AdminController:
                             client_metadata_url=record.get("client_metadata_url") or "")
         return settings
 
-    async def operate(self, operation, body, session):
+    async def operate(self, operation, body, session, *, gmail_email=None):
         if operation == "oauth/mcp/start":
             return await self.mcp_oauth.start(body, session)
         if operation == "oauth/mcp/complete":
@@ -228,7 +237,7 @@ class AdminController:
             return self.google.start(body, session)
         if operation == "oauth/complete":
             connector, account = self.google.complete(body.get("id"), session)
-            result = await self.operate("connections/preview", connector, session)
+            result = await self.operate("connections/preview", connector, session, gmail_email=account)
             return {**result, "google_account": account}
         if operation == "members/enroll":
             principal = body.get("id")
@@ -379,6 +388,29 @@ class AdminController:
             if token:
                 result.update(token=token, fingerprint=hash_token(token)[:12], mcp_url=self.runtime.gateway.cfg.approvals.origin + "/mcp")
             return result
+        if operation == "connections/rename":
+            name, renamed = body.get("id"), body.get("name")
+            conn = next((c for c in raw["connections"] if c["id"] == name), None)
+            if conn is None:
+                raise Refused("not_found", 404)
+            if renamed == name:
+                return {"revision": self.store.state["revision"], "id": name}
+            if not isinstance(renamed, str) or not re.fullmatch(CONNECTOR_NAME, renamed):
+                raise Refused("invalid_connector_name", 400)
+            if any(c["id"] == renamed for c in raw["connections"]):
+                raise Refused("duplicate_connector", 409)
+            _, lock, _ = self.store.effective(state)
+            conn["id"] = renamed
+            for rule in raw["policy"]:
+                if rule["connection"] == name:
+                    rule["connection"] = renamed
+            state["locks"][renamed] = copy.deepcopy(lock.entries.get(name, {}))
+            state["locks"].pop(name, None)
+            metadata = state.get("bundled_catalog", {})
+            if name in metadata:
+                metadata[renamed] = metadata.pop(name)
+            result = await self._commit(state, operation)
+            return {**result, "id": renamed}
         if operation in ("connections/preview", "connections/review-tools"):
             cfg, _, values = self.store.effective(state)
             if operation == "connections/review-tools":
@@ -389,9 +421,9 @@ class AdminController:
                     raise Refused("not_found", 404)
                 if kind_of(previous) not in CATALOG:
                     raise Refused("unsupported_connector", 400)
-                conn, added = extend_catalog_tools(previous), {}
+                conn, added = extend_catalog_tools(previous, cfg), {}
             else:
-                conn, added = make_connection(body, cfg, values)
+                conn, added = make_connection(body, cfg, values, gmail_email=gmail_email)
             if len(raw["connections"]) >= 50 and not any(c["id"] == conn.id for c in raw["connections"]):
                 raise Refused("connector_limit", 400)
             if kind_of(conn) == "remote" and body.get("settings", {}).get("auth") == "oauth" and not conn.oauth_ref:
@@ -446,7 +478,7 @@ class AdminController:
             if client.household != cfg.household_of(conn.owner):
                 raise Refused("outside_household", 400)
             if mode != "custom" and CONNECTION_ACCESS[mode]["write"] != "deny" and not any(tool_access(conn, t) == "write" for t in conn.tools):
-                raise Refused("connection_tools_update_required" if any(tool_access(conn, ToolCfg.model_validate(t)) == "write" for t in catalog_additions(conn)) else "connection_readonly", 400)
+                raise Refused("connection_tools_update_required" if any(tool_access(conn, ToolCfg.model_validate(t)) == "write" for t in catalog_additions(conn, cfg)) else "connection_readonly", 400)
             if "approver" in body:
                 approver = body["approver"]
                 if not isinstance(approver, str) or approver not in cfg.principals or cfg.household_of(approver) != client.household:

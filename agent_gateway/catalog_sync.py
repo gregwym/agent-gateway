@@ -6,12 +6,11 @@ servers and arbitrary launch commands retain the existing review/lock workflow.
 from __future__ import annotations
 
 import copy
-import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from .config import Config, ToolCfg
+from .config import Config, ToolCfg, allocate_tool_name
 from .lock import Lock, definition_of, digest_of
 
 MODULES = {
@@ -61,17 +60,6 @@ def bundled_manifest(conn):
             for name, suffix in CATALOG[kind]["tools"]}
 
 
-def _new_name(conn, upstream, suffix, occupied):
-    preferred = conn.id.replace("-", "_") + "_" + suffix
-    name, counter = preferred, 0
-    while name in occupied or len(name) > 64:
-        counter += 1
-        tag = hashlib.sha256(f"{conn.id}:{upstream}:{counter}".encode()).hexdigest()[:8]
-        name = preferred[:55] + "_" + tag
-    occupied.add(name)
-    return name
-
-
 def sync_catalog(cfg, lock, previous=None):
     """Return an idempotent configuration overlay; never write host/state files.
 
@@ -101,7 +89,7 @@ Incompatible restrictions remain intact and produce a visible, disabled tool.
         registered = {tool.upstream for tool in conn.tools}
         for upstream, spec in manifest.items():
             if upstream not in registered:
-                name = _new_name(conn, upstream, spec["suffix"], occupied)
+                name = allocate_tool_name(conn.id, upstream, spec["suffix"], occupied)
                 updated["tools"].append(ToolCfg(upstream=upstream, name=name).model_dump(mode="json"))
                 report["added"].append(name)
         incompatible = set()

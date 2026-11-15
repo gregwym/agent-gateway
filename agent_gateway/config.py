@@ -7,6 +7,7 @@ Unknown keys are rejected so a typo cannot silently widen or drop a rule.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import re
@@ -18,12 +19,25 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .mail_address import email_address
+
 NAME = r"^[a-z][a-z0-9_-]{0,47}$"
 # Deliberately narrower than what MCP allows: no dots, so names survive every client.
 TOOL_NAME = r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"
 ENV_NAME = r"^[A-Za-z_][A-Za-z0-9_]*$"
 
 Effect = Literal["allow", "deny", "approval_required"]
+
+
+def allocate_tool_name(connection, upstream, suffix, occupied):
+    preferred = connection.replace("-", "_") + "_" + suffix
+    name, counter = preferred, 0
+    while name in occupied or len(name) > 64:
+        counter += 1
+        tag = hashlib.sha256(f"{connection}:{upstream}:{counter}".encode()).hexdigest()[:8]
+        name = preferred[:55] + "_" + tag
+    occupied.add(name)
+    return name
 
 
 class ConfigError(Exception):
@@ -164,6 +178,8 @@ class ConnectionCfg(_Model):
     owner: str
     # Approval authority is separate from ownership: a member or their household.
     approver: str | None = None
+    mailbox_email: str | None = None
+    mailbox_aliases: list[str] = Field(default_factory=list, max_length=50)
     transport: Literal["stdio", "http"]
 
     # stdio
@@ -182,6 +198,14 @@ class ConnectionCfg(_Model):
     max_concurrency: int = Field(4, ge=1, le=64)
     verify_interval_seconds: float = Field(300, gt=0)
     tools: list[ToolCfg]
+
+    @field_validator("mailbox_email", "mailbox_aliases")
+    @classmethod
+    def _mail_addresses(cls, value):
+        addresses = value if isinstance(value, list) else [value] if value is not None else []
+        if any(not email_address(address) for address in addresses):
+            raise ValueError("mailbox addresses must be bare email addresses")
+        return value
 
     @model_validator(mode="after")
     def _check(self) -> ConnectionCfg:

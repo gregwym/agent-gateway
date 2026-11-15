@@ -139,6 +139,9 @@ const messages = {
   operation_failed: ['The server encountered an unexpected error. Use the error ID to locate it before retrying.', '服务器发生未预期错误，请用错误编号定位后重试。'],
   invalid_configuration: ['Check the values and account-sharing permission.', '请检查输入值和跨账号授权选项。'],
   invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
+  duplicate_connector: ['This connector name already exists. Choose another name.', '此连接器名称已存在，请使用其他名称。'],
+  invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
+  invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   invalid_connector: ['Some connector fields are invalid. Check the form.', '连接器字段无效，请检查表单。'],
   invalid_imap_server: ['Check the IMAP server name and TLS port (1–65535).', '请检查 IMAP 服务器地址及 TLS 端口（1–65535）。'],
   invalid_smtp_server: ['Check the SMTP server name and port (1–65535).', '请检查 SMTP 服务器地址及端口（1–65535）。'],
@@ -498,6 +501,28 @@ function checkToken(client) {
     input.value = '';
   }, 'primary');
 }
+function connectorNameField(parent, value = '') {
+  const name = field(parent, tr('Connector name', '连接器名称'), 'connection_id', value, 'text',
+    tr('Start with a lowercase letter. Use up to 32 lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'));
+  name.required = true; name.maxLength = 32; name.pattern = '[a-z][a-z0-9_\\-]{0,31}';
+  name.title = tr(...messages.invalid_connector_name);
+  return name;
+}
+function renameConnector(conn) {
+  const revision = state.revision;
+  const box = modal(tr('Rename connector', '修改连接器名称'));
+  const name = connectorNameField(box, conn.id);
+  el(box, 'p', tr('Agents will find this connector under the new name. Update workflows that use the old name and request any unfinished approvals again.',
+    'Agent 会用新名称找到此连接器。请更新引用旧名称的工作流，并重新发起尚未完成的审批。'), 'hint');
+  button(box, tr('Save name', '保存名称'), async () => {
+    name.value = name.value.trim();
+    if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
+    await mutate('connections/rename', {revision, id: conn.id, name: name.value});
+    box.close();
+    notify(tr('Connector renamed.', '连接器已改名。'));
+  }, 'primary');
+  name.focus(); name.select();
+}
 function connections() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Account connectors', '账号连接器'));
   button(head, tr('Add connector', '添加连接器'), () => connectorForm(), 'primary');
@@ -505,6 +530,8 @@ function connections() {
   const grid = el(app, 'div', undefined, 'grid');
   for (const conn of state.connections) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', conn.id, 'connector-title'); el(card, 'p', identityLabel(conn.owner) + ' · ' + (state.catalog[conn.kind]?.label || tr('Custom YAML connector', 'YAML 自定义连接器')), 'muted');
+    if (conn.mailbox?.email) el(card, 'p', conn.mailbox.email, 'muted');
+    if (conn.mailbox?.aliases?.length) el(card, 'p', tr('Aliases', '邮箱别名') + ' · ' + conn.mailbox.aliases.join(', '), 'muted');
     const failed = conn.test?.ok === false, remote = conn.kind === 'remote';
     el(card, 'span', failed ? (remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败')) : conn.test?.ok ? (remote ? tr('MCP initialization and tools verified', 'MCP 初始化和工具验证通过') : tr('Read check passed', '读取验证通过')) : conn.connected ? (remote ? tr('MCP connected', 'MCP 已连接') : tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证')) : tr('Connecting tools', '正在连接工具'), failed ? 'badge bad' : 'badge');
     if (failed) el(card, 'p', serverError({error: conn.test.reason, incident: conn.test.incident}, 422).message, 'error').setAttribute('role', 'alert');
@@ -526,6 +553,7 @@ function connections() {
       }, 'primary', tr('Testing connection…', '正在验证连接…'));
       button(actions, tr('Edit & review', '编辑并审阅'), () => connectorForm(conn));
     }
+    button(actions, tr('Rename', '改名'), () => renameConnector(conn));
     if (conn.kind === 'remote') button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id: conn.id, revision: state.revision}));
     });
@@ -609,9 +637,7 @@ function connectorForm(existing) {
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
   const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'demo'); kind.disabled = !!existing;
   const fixed = el(form, 'div', undefined, 'form-grid');
-  const name = field(fixed, tr('Connector name', '连接器名称'), 'connection_id', existing?.id || '', 'text', tr('Up to 32 lowercase letters, numbers, underscores, or hyphens.', '最多 32 个小写字母、数字、下划线或连字符。')); name.disabled = !!existing;
-  name.required = true; name.maxLength = 32; name.pattern = '[a-z][a-z0-9_\\-]{0,31}';
-  name.title = tr('Start with a lowercase letter; use lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，只用小写字母、数字、下划线或连字符。');
+  const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
   if (!existing) {
     button(form, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
@@ -660,7 +686,10 @@ function connectorForm(existing) {
       el(dynamic, 'p', tr('Preview initializes MCP and lists tools; it does not execute a tool. You choose which tools to expose and classify each as read or write.', '预览只初始化 MCP 并列出工具，不执行工具。你可以选择开放的工具，并标明读取或写入。'), 'hint');
       return;
     }
-    for (const key of spec.fields) settings[key] = key === 'smtp_security' ? select(dynamic, labels[key], key, [['starttls', 'STARTTLS (587)'], ['tls', 'TLS (465)']], existing?.settings[key] ?? defaults[key]) : field(dynamic, labels[key], key, existing?.settings[key] ?? defaults[key] ?? '');
+    for (const key of spec.fields) {
+      if (key === 'mailbox_email' || key === 'mailbox_aliases') continue;
+      settings[key] = key === 'smtp_security' ? select(dynamic, labels[key], key, [['starttls', 'STARTTLS (587)'], ['tls', 'TLS (465)']], existing?.settings[key] ?? defaults[key]) : field(dynamic, labels[key], key, existing?.settings[key] ?? defaults[key] ?? '');
+    }
     for (const key of spec.secrets) credentials[key] = field(dynamic, labels[key], key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
     if (kind.value === 'demo') el(dynamic, 'p', tr('No real account needed. Includes read tools and a demo write that requires passkey approval.', '无需真实账号。包含只读工具，以及一个需要通行密钥审批的模拟写入工具。'), 'hint');
     if (kind.value === 'gmail') {
@@ -674,6 +703,12 @@ function connectorForm(existing) {
     }
     if (kind.value === 'caldav') el(dynamic, 'p', tr('iCloud uses an app-specific password. The calendar connector exposes read operations only.', 'iCloud 使用 App 专用密码。日历连接器只提供读取操作。'), 'hint');
     if (kind.value === 'imap') {
+      const addresses = el(dynamic, 'details');
+      el(addresses, 'summary', tr('Mailbox addresses', '邮箱地址与别名'));
+      settings.mailbox_email = field(addresses, tr('Primary email address', '主邮箱地址'), 'mailbox_email', existing?.settings.mailbox_email || '', 'email',
+        tr('Optional. Overrides the address inferred from the login name.', '可选。填写后会覆盖根据登录名推断的地址。'));
+      settings.mailbox_aliases = field(addresses, tr('Email aliases', '邮箱别名'), 'mailbox_aliases', existing?.settings.mailbox_aliases || '', 'textarea',
+        tr('One address per line. Authorized Agents can use these addresses to find this mailbox.', '每行一个地址。获授权的 Agent 可以用这些地址找到此邮箱。'));
       el(dynamic, 'p', tr('One mail account: IMAP reads and organizes mail; SMTP sends it. Both use the same saved password. Enable write access and choose approval settings in Permissions. Test connection checks IMAP and configured SMTP authentication without sending mail.', '一个邮箱账号：IMAP 读取和整理邮件，SMTP 发信，两者共用已保存的密码。请在「权限」中启用写入并选择审批方式。「测试连接」会检查 IMAP 及已配置的 SMTP 登录，不会发出邮件。'), 'hint');
       el(dynamic, 'p', tr('iCloud requires an app-specific password. SMTP uses the full email address; when the IMAP username has no domain, @icloud.com is added for SMTP. Other providers: enter their SMTP server or leave it blank.', 'iCloud 需要 App 专用密码。SMTP 使用完整邮箱地址；IMAP 用户名不带域名时，SMTP 自动补上 @icloud.com。其他服务商请填写对应的 SMTP 服务器，或留空关闭发信。'), 'muted');
     }
