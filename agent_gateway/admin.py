@@ -13,9 +13,9 @@ from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from .admin_auth import AdminAuth, COOKIE
-from .admin_config import CATALOG, CONNECTION_ACCESS, ManagedStore, connection_access, kind_of, make_connection, member_name, settings_of, tool_access
+from .admin_config import CATALOG, CONNECTION_ACCESS, ManagedStore, catalog_additions, connection_access, extend_catalog_tools, kind_of, make_connection, member_name, settings_of, tool_access
 from .auth import hash_token, new_token
-from .config import NAME
+from .config import NAME, ToolCfg
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .upstream import list_all_tools, open_client
@@ -103,6 +103,7 @@ class AdminController:
                                 "approver": conn.approver or conn.owner,
                                 "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
                                 "settings": settings_of(conn), "tools": tools,
+                                "available_tools": [{**t, "access": tool_access(conn, ToolCfg.model_validate(t))} for t in catalog_additions(conn)],
                                 "connected": gw.upstreams[conn.id]._client is not None,
                                 "test": self.tests.get(conn.id)})
         return {"revision": self.store.state["revision"], "owner": self.auth.owner,
@@ -258,9 +259,19 @@ class AdminController:
             if token:
                 result.update(token=token, fingerprint=hash_token(token)[:12], mcp_url=self.runtime.gateway.cfg.approvals.origin + "/mcp")
             return result
-        if operation == "connections/preview":
+        if operation in ("connections/preview", "connections/review-tools"):
             cfg, _, values = self.store.effective(state)
-            conn, added = make_connection(body, cfg, values)
+            if operation == "connections/review-tools":
+                if set(body) - {"id", "revision"}:
+                    raise Refused("invalid_connector", 400)
+                previous = next((c for c in cfg.connections if c.id == body.get("id")), None)
+                if previous is None:
+                    raise Refused("not_found", 404)
+                if kind_of(previous) not in CATALOG:
+                    raise Refused("unsupported_connector", 400)
+                conn, added = extend_catalog_tools(previous), {}
+            else:
+                conn, added = make_connection(body, cfg, values)
             if len(raw["connections"]) >= 50 and not any(c["id"] == conn.id for c in raw["connections"]):
                 raise Refused("connector_limit", 400)
             values.update(added)
@@ -326,7 +337,7 @@ class AdminController:
             if client.household != cfg.household_of(conn.owner):
                 raise Refused("outside_household", 400)
             if mode != "custom" and CONNECTION_ACCESS[mode]["write"] != "deny" and not any(tool_access(conn, t) == "write" for t in conn.tools):
-                raise Refused("connection_readonly", 400)
+                raise Refused("connection_tools_update_required" if any(tool_access(conn, ToolCfg.model_validate(t)) == "write" for t in catalog_additions(conn)) else "connection_readonly", 400)
             if "approver" in body:
                 approver = body["approver"]
                 if not isinstance(approver, str) or approver not in cfg.principals or cfg.household_of(approver) != client.household:

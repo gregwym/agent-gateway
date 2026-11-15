@@ -14,8 +14,8 @@ pytestmark = [pytest.mark.anyio, pytest.mark.browser]
 
 
 @asynccontextmanager
-async def admin_page(tmp_path, locale):
-    async with web_gateway(tmp_path) as (gateway, http, origin, config):
+async def admin_page(tmp_path, locale, **gateway_options):
+    async with web_gateway(tmp_path, **gateway_options) as (gateway, http, origin, config):
         async with playwright.async_playwright() as driver:
             browser = await driver.chromium.launch()
             try:

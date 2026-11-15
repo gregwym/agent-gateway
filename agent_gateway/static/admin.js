@@ -76,6 +76,7 @@ const messages = {
   invalid_permission_effect: ['Choose Deny, Allow, or Require approval.', '请选择拒绝、允许或需要审批。'],
   invalid_connection_access: ['Choose a valid access scope and read/write approval settings.', '请选择有效的访问范围及读取、写入审批设置。'],
   connection_readonly: ['This connector has no write tools. Choose Read only.', '此连接器没有写入工具，请选择只读。'],
+  connection_tools_update_required: ['New write tools are available for this connection. Review and enable them before choosing Read and write.', '此连接有新增写入工具，请先审阅并启用，再选择读写。'],
   invalid_connection_approver: ['Choose a member of this household, or any member of the household.', '请选择此家庭的一位成员，或家庭内任意成员。'],
   cross_account_required: ['This grants access to another person’s account. Select the explicit cross-account consent checkbox.', '此操作会开放其他个人账号，请勾选明确的跨账号授权选项。'],
   restrictions_object_required: ['Fixed arguments and allowed values must each be a JSON object.', '固定参数和允许值必须分别为 JSON 对象。'],
@@ -451,6 +452,7 @@ function connections() {
     if (failed) el(card, 'p', serverError({error: conn.test.reason, incident: conn.test.incident}, 422).message, 'error').setAttribute('role', 'alert');
     if (conn.kind === 'demo') el(card, 'p', tr('Synthetic data. Notes reset when the connector restarts.', '模拟数据。连接器重启后笔记会重置。'), 'hint');
     if (conn.kind === 'reminders') el(card, 'p', tr('Experimental. Requires a helper in the account owner’s Mac login session.', '实验性功能。需要在账号所有者的 Mac 登录会话中运行辅助服务。'), 'hint');
+    toolUpdateNotice(card, conn);
     const actions = el(card, 'div', undefined, 'actions');
     if (conn.kind) {
       button(actions, tr('Test connection', '验证连接'), async () => {
@@ -528,6 +530,16 @@ function showReview(result, form) {
     await mutate('connections/apply', {draft: result.draft, reviewed: checked.checked}); review.close(); if (form) form.close(); notify(tr('Connector applied. Run its read check next.', '连接器已应用，请继续运行读取验证。'));
   }, 'primary'); apply.disabled = true; checked.addEventListener('change', () => { apply.disabled = !checked.checked; });
 }
+function toolUpdateNotice(parent, conn) {
+  const additions = conn.available_tools || [];
+  if (!additions.length) return;
+  const writes = additions.filter(t => t.access === 'write').length;
+  el(parent, 'p', tr(`This connection still uses an older tool list. ${additions.length} new tools are available, including ${writes} write tools. Review them here to enable the new permission options. Existing access stays unchanged.`, `此连接仍使用旧工具列表，有 ${additions.length} 个新工具（含 ${writes} 个写入工具）待启用。可在这里审阅，启用后即可配置新权限。原有授权会保留。`), 'hint');
+  button(parent, tr('Review new tools', '审阅新工具'), async () => {
+    const result = await api('connections/review-tools', {id: conn.id, revision: state.revision});
+    showReview(result);
+  }, 'primary', tr('Reading tool definitions…', '正在读取工具定义…'));
+}
 async function resumeGoogle() {
   if (!gmailResult) return;
   const id = gmailResult; gmailResult = null; history.replaceState(null, '', '/admin/');
@@ -551,6 +563,7 @@ function permissions() {
   for (const conn of state.connections.filter(c => c.household === agent.household)) {
     const card = el(app, 'section', undefined, 'card permission-card'); card.dataset.connection = conn.id;
     el(card, 'h2', conn.id);
+    toolUpdateNotice(card, conn);
     el(card, 'p', tr('Account owner: ', '账号归属：') + nameOf(conn.owner), 'muted');
     const reads = conn.tools.filter(t => t.access === 'read').length, writes = conn.tools.length - reads;
     const current = conn.access[subject];
@@ -559,7 +572,7 @@ function permissions() {
     if (writes) options.push(['read_write', tr('Read and write', '读写')]);
     if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
     const mode = select(card, tr('Connection access', '连接权限'), 'connection_access', options, scope);
-    if (!writes) el(card, 'p', tr('This connector only provides read operations.', '此连接器只提供读取操作，不支持写入。'), 'muted');
+    if (!writes && !(conn.available_tools || []).some(t => t.access === 'write')) el(card, 'p', tr('This connector only provides read operations.', '此连接器只提供读取操作，不支持写入。'), 'muted');
     el(card, 'p', tr(`${reads} read tool(s) · ${writes} write or unclassified tool(s)`, `${reads} 个读取工具 · ${writes} 个写入或未分类工具`), 'muted');
     const approvalFields = el(card, 'div', undefined, 'form-grid');
     const readSettings = el(approvalFields, 'div'), writeSettings = el(approvalFields, 'div');

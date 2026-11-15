@@ -196,6 +196,18 @@ def tool_access(conn, tool):
     return "write"
 
 
+def catalog_additions(conn):
+    registered = {tool.upstream for tool in conn.tools}
+    return [{"upstream": upstream, "name": conn.id.replace("-", "_") + "_" + suffix}
+            for upstream, suffix in CATALOG.get(kind_of(conn), {}).get("tools", ()) if upstream not in registered]
+
+
+def extend_catalog_tools(conn):
+    raw = conn.model_dump(mode="json")
+    raw["tools"] += catalog_additions(conn)
+    return ConnectionCfg.model_validate(raw)
+
+
 def connection_access(policy, client, conn):
     effects = [(tool_access(conn, t), policy.effect(client.subject, t.name, client.id)) for t in conn.tools]
     for name, settings in CONNECTION_ACCESS.items():

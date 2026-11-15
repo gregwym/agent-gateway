@@ -386,7 +386,9 @@ during submission return unknown and are never automatically retried. It does no
 an extra copy to Sent; that depends on the provider. The administrator's connection
 test checks IMAP plus configured SMTP authentication without sending email.
 
-For an existing mail connection, **Edit & review → Preview tools → Apply connector**
+For an existing mail connection, its Permissions or Connectors card shows **Review new tools**
+when installed capabilities have not been registered. **Review new tools → Apply connector**
+preserves the exact existing server settings and credential references. Alternatively, **Edit & review → Preview tools → Apply connector**
 adds the new tools while preserving existing names, restrictions, credentials and grants.
 New tools start denied. Then save that Agent's desired connection access and separate
 read/write approval settings in **Permissions**. New mail connections also start denied.
