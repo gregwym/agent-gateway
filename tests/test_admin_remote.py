@@ -163,7 +163,9 @@ async def test_remote_review_classification_and_default_denial(tmp_path, monkeyp
         preview = await remote_preview(http, mode)
         assert preview.status_code == 200, preview.text
         assert [t['name'] for t in preview.json()['definitions']] == ['read.note', 'write.note']
-        assert all(t['access'] == 'write' for t in preview.json()['tools'])  # never trust readOnlyHint
+        assert {t['upstream']: t['access'] for t in preview.json()['tools']} == {
+            'read.note': 'read', 'write.note': 'write',  # both carry readOnlyHint
+        }
         assert not remote.calls
         assert (await apply(http, preview)).status_code == 200
         conn = next(c for c in (await state(http))['connections'] if c['id'] == 'remote-notes')
@@ -176,6 +178,7 @@ async def test_remote_review_classification_and_default_denial(tmp_path, monkeyp
         remote.extra = True
         preview = await change(http, 'connections/review-tools', id=conn['id'])
         assert preview.status_code == 200
+        assert {t['upstream']: t['access'] for t in preview.json()['tools']}['new.note'] == 'write'
         assert (await apply(http, preview, [{'upstream':'read.note','access':'write'}, {'upstream':'new.note','access':'read'}])).status_code == 200
         conn = next(c for c in (await state(http))['connections'] if c['id'] == 'remote-notes')
         assert conn['access']['shared-agent'] == 'none'  # reclassification revokes prior grant
@@ -515,3 +518,21 @@ async def test_remote_http_failures_keep_the_original_cause(tmp_path,monkeypatch
         response = await remote_preview(http,'bearer')
         assert response.status_code == 422 and response.json()['error'] == expected, response.text
         assert 'private-' not in response.text + gw.audit_text()
+
+
+@pytest.mark.parametrize('name, definition, expected', [
+    ('get_issue', {}, 'read'),
+    ('list-issues', {}, 'read'),
+    ('searchIssues', {}, 'read'),
+    ('QueryProjects', {}, 'read'),
+    ('get_or_create_issue', {}, 'write'),
+    ('search_and_replace', {}, 'write'),
+    ('query_sql', {}, 'write'),
+    ('query', {'inputSchema': {'properties': {'statement': {}}}}, 'write'),
+    ('get_issue', {'annotations': {'readOnlyHint': False}}, 'write'),
+    ('list_projects', {'annotations': {'destructiveHint': True}}, 'write'),
+    ('custom_action', {'annotations': {'readOnlyHint': True}}, 'write'),
+])
+def test_suggested_remote_access(name, definition, expected):
+    from agent_gateway.admin_remote import suggested_access
+    assert suggested_access(name, definition) == expected

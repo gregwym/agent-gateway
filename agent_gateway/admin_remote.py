@@ -49,6 +49,31 @@ def make_remote(name, owner, settings, provided, previous, values):
     return ConnectionCfg.model_validate(raw), fresh
 
 
+_READ_ACTIONS = frozenset({"get", "list", "search", "query", "read", "fetch", "find", "count", "describe", "lookup"})
+_WRITE_ACTIONS = frozenset({
+    "add", "archive", "cancel", "close", "complete", "create", "delete", "exec", "execute",
+    "insert", "move", "publish", "remove", "replace", "run", "save", "send", "set",
+    "submit", "update", "upload", "upsert", "write",
+})
+
+
+def suggested_access(name, definition):
+    """Suggest a category for admin review using the name and conflicting hints."""
+    annotations = definition.get("annotations") or {}
+    if annotations.get("readOnlyHint") is False or annotations.get("destructiveHint") is True:
+        return "write"
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
+    words = re.findall(r"[a-z0-9]+", separated.casefold())
+    if not words or words[0] not in _READ_ACTIONS or _WRITE_ACTIONS.intersection(words[1:]):
+        return "write"
+    if words[0] == "query":
+        properties = definition.get("inputSchema", {}).get("properties") or {}
+        if {"sql", "cypher", "sparql", "statement"}.intersection([*words[1:], *properties]):
+            return "write"
+    return "read"
+
+
 def remote_tools(conn, definitions, cfg):
     previous = {t.upstream: t for t in conn.tools}
     occupied = {t.name for c in cfg.connections if c.id != conn.id for t in c.tools}
@@ -61,7 +86,7 @@ def remote_tools(conn, definitions, cfg):
             name = conn.id.replace("-", "_") + "_" + suffix
             if len(name) > 64 or name in occupied:
                 name = name[:51] + "_" + hashlib.sha256(upstream.encode()).hexdigest()[:12]
-            tool = ToolCfg(upstream=upstream, name=name, access="write")
+            tool = ToolCfg(upstream=upstream, name=name, access=suggested_access(upstream, definitions[upstream]))
         occupied.add(tool.name)
         result.append(tool)
     return conn.model_copy(update={"tools": result})

@@ -703,7 +703,7 @@ function showReview(result, form) {
   el(review, 'p', tr('These descriptions and schemas are what authorized agents will see. New connectors and newly added tools grant no access. After applying, choose the connection access and approval settings for each Agent in Permissions. Existing tool permissions are preserved.', '已获授权的 Agent 将看到这些描述和参数定义。新连接器和新增工具默认不开放访问。应用后，请在「权限」中为每个 Agent 选择连接权限及审批设置。原有工具权限会保留。'), 'hint');
   if (result.oauth?.issuer) el(review, 'p', tr('Authorization server: ', '授权服务器：') + result.oauth.issuer, 'hint');
   if (result.oauth?.scope) el(review, 'p', tr('Granted scopes: ', '已授权范围：') + result.oauth.scope, 'hint');
-  if (result.remote) el(review, 'p', tr('Unknown tools default to write. Mark a tool as read only after reviewing what it does. Unselected tools and read-to-write changes lose their existing grants.', '未知工具默认为写入，请确认工具行为后再标为读取。取消选择的工具，以及从读取改为写入的工具，将撤销原有授权。'), 'hint');
+  if (result.remote) el(review, 'p', tr('Gateway suggests Read for names like get, list, and search. Ambiguous tools default to Write. Confirm each category before applying. Unselected tools and read-to-write changes lose their existing grants.', '网关会将 get、list、search 等工具预选为读取，含义不明确的工具预选为写入。请核对后应用。取消选择的工具，以及从读取改为写入的工具，将撤销原有授权。'), 'hint');
   const selections = [];
   for (const definition of result.definitions) {
     if (result.remote) {

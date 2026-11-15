@@ -50,7 +50,9 @@ async def test_browser_remote_oauth_review_errors_and_revoke(tmp_path, monkeypat
                 await page.get_by_role('button', name=t('Preview tools','预览工具'), exact=True).click()
                 await playwright.expect(page.get_by_role('heading', name=t('Review tool definitions','审阅工具定义'), exact=True)).to_be_visible()
                 assert 'mcp_oauth=' not in page.url
-                await page.get_by_label(t('Operation type: ','操作类型：')+'read.note', exact=True).select_option('read')
+                access = t('Operation type: ', '操作类型：')
+                await playwright.expect(page.get_by_label(access+'read.note', exact=True)).to_have_value('read')
+                await playwright.expect(page.get_by_label(access+'write.note', exact=True)).to_have_value('write')
                 await page.get_by_label('write.note', exact=True).uncheck()
                 if directory := os.environ.get('AGW_TEST_ARTIFACTS'):
                     output = Path(directory); output.mkdir(parents=True, exist_ok=True)
