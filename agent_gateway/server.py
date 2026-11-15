@@ -299,7 +299,7 @@ class Gateway:
             done("error", "internal_error", detail=type(exc).__name__)
             return _error("The gateway failed to process this call.")
 
-    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any) -> types.CallToolResult:
+    def _prepare_call(self, client_id, route, arguments, done):
         problem = self.problem(route)
         if problem is not None or route.exposed is None:
             done("deny", problem or "not_locked")
@@ -320,7 +320,7 @@ class Gateway:
             return _error(f"Invalid arguments: {failure.message[:300]}")
 
         final_arguments = {**arguments, **route.tool.pin}
-        scope = route.conn.mailbox_access.get(who.client_id)
+        scope = route.conn.mailbox_access.get(client_id)
         upstream_arguments = final_arguments
         if scope is not None and not is_mail_send(route.conn, route.tool):
             from .catalog_sync import bundled_kind
@@ -334,28 +334,47 @@ class Gateway:
                 return _error("This action is outside the Agent's allowed mailbox folders or labels.")
             upstream_arguments = {**final_arguments, ARGUMENT: scope}
 
+        return final_arguments, upstream_arguments
+
+    def _approval_request(self, client, route, final_arguments):
+        return ApprovalRequest(
+            principal=client.subject, client_id=client.id, tool=route.tool.name, connection=route.conn.id,
+            service=route.conn.service, account=route.conn.account, upstream_tool=route.tool.upstream,
+            arguments_sha256=arguments_digest(final_arguments), arguments=final_arguments, owner=route.conn.owner,
+            approvers=self.cfg.approvers_of(route.conn), configuration_revision=self.configuration_revision,
+            client_token_sha256=client.token_sha256,
+            target_sha256=arguments_digest({
+                "connection": route.conn.model_dump(mode="json", exclude={"tools", "mailbox_email", "mailbox_aliases"}),
+                "tool": route.tool.model_dump(mode="json"),
+                "definition": self.lock.get(route.conn.id, route.tool.upstream),
+            }),
+        )
+
+    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any) -> types.CallToolResult:
+        prepared = self._prepare_call(who.client_id, route, arguments, done)
+        if isinstance(prepared, types.CallToolResult):
+            return prepared
+        final_arguments, upstream_arguments = prepared
         if effect != "approval_required":
             return await self._run(route, upstream_arguments, done, "ok")
 
-        request = ApprovalRequest(
-            principal=who.principal,
-            client_id=who.client_id,
-            tool=route.tool.name,
-            connection=route.conn.id,
-            service=route.conn.service,
-            account=route.conn.account,
-            upstream_tool=route.tool.upstream,
-            arguments_sha256=arguments_digest(final_arguments),
-            arguments=final_arguments,
-            owner=route.conn.owner,
-            approvers=self.cfg.approvers_of(route.conn),
-            configuration_revision=self.configuration_revision,
-        )
+        client = next(c for c in self.cfg.clients if c.id == who.client_id)
+        request = self._approval_request(client, route, final_arguments)
         decision = await self.approver.authorize(request)
         approval = decision.approval_id
         if not decision.approved:
             done("deny", f"approval:{decision.reason}", approval=approval)
             # The approver's own wording (where the request waits); it is gateway code, not upstream text.
+            if approval:
+                from .approval_dispatch import response
+                from .passkey import PasskeyApprover
+                if isinstance(self.approver, PasskeyApprover):
+                    status = "pending" if decision.reason in ("pending", "requested") else decision.reason
+                    data = {"status": status, "request_id": approval}
+                    if status == "pending":
+                        data["approval_url"] = self.approver._url(approval)
+                    message = decision.message or f"Action already submitted. Call gateway_wait_for_approval with request_id {approval}. Do not resubmit the action."
+                    return response(data, message, error=True)
             return _error(decision.message or NOT_EXECUTED)
         # From here the approval is spent, whatever happens. Tell the approver how it ended.
         outcome = "internal_error"
@@ -372,11 +391,47 @@ class Gateway:
                 with anyio.CancelScope(shield=True):
                     await self.approver.finished(approval, outcome)
 
+    async def run_approved(self, row):
+        """Recheck the approved call against the leased, current policy before sending it."""
+        client = next((c for c in self.cfg.clients if c.id == row["client"] and c.token_sha256 == row["client_token_sha256"]), None)
+        route = self.routes.get(row["tool"])
+        started = time.monotonic()
+        outcome = "configuration_changed"
+
+        def done(decision, reason, **extra):
+            nonlocal outcome
+            if decision == "allow":
+                outcome = "tool_error" if extra.get("is_error") else "ok"
+            elif decision == "error":
+                outcome = ("execution_unknown" if extra.get("execution_uncertain") or
+                           reason in ("upstream_timeout", "upstream_invalid_reply", "result_too_large") else reason)
+            self.audit.write("tool_call", client=row["client"], principal=row["principal"], tool=row["tool"],
+                             connection=row["connection"], service=row["service"], account=row["account"],
+                             upstream_tool=row["upstream_tool"], approval=row["id"], decision=decision,
+                             reason=reason, duration_ms=int((time.monotonic() - started) * 1000), **extra)
+
+        if (not client or client.subject != row["principal"] or not route
+                or row["revision"] != self.configuration_revision
+                or self.policy.effect(client.subject, route.tool.name, client.id) != "approval_required"
+                or set(self.cfg.approvers_of(route.conn)) != set(json.loads(row["approvers"]))):
+            done("deny", "configuration_changed")
+            return None, outcome
+        arguments = json.loads(row["arguments"])
+        prepared = self._prepare_call(client.id, route, {key: v for key, v in arguments.items() if key not in route.tool.pin}, done)
+        if isinstance(prepared, types.CallToolResult):
+            return None, outcome
+        final_arguments, upstream_arguments = prepared
+        if self._approval_request(client, route, final_arguments).binding != row["binding"]:
+            done("deny", "configuration_changed")
+            return None, outcome
+        result = await self._run(route, upstream_arguments, done, "approved")
+        return result, outcome
+
     async def _run(self, route: ToolRoute, final_arguments: dict[str, Any], done: Any, ok_reason: str) -> types.CallToolResult:
         try:
             result = await self.upstreams[route.conn.id].call(route.tool.upstream, final_arguments)
         except UpstreamError as exc:
-            done("error", exc.reason)
+            done("error", exc.reason, **({"execution_uncertain": True} if exc.execution_uncertain else {}))
             return _error(exc.public)
 
         payload = result.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -433,12 +488,24 @@ def build_app(gateway: Gateway) -> Starlette:
         runtime.gateway.configuration_revision = catalog_revision(synced, lock)
     gateway = runtime.gateway
     cfg = gateway.cfg
+    from .approval_dispatch import ApprovalDispatcher, REGISTER_TOOL, WAIT_TOOL
+    from .passkey import PasskeyApprover
+    dispatcher = ApprovalDispatcher(runtime) if isinstance(gateway.approver, PasskeyApprover) else None
 
     async def list_tools(ctx, params):
         async with runtime.lease() as current:
-            return await current.list_tools(ctx, params)
+            result = await current.list_tools(ctx, params)
+            if dispatcher:
+                who = caller_of(ctx.request, current.cfg.clients)
+                if who:
+                    special = dispatcher.tools(who)
+                    result = types.ListToolsResult(tools=[t for t in result.tools if t.name not in (WAIT_TOOL, REGISTER_TOOL)] + special)
+            return result
 
     async def call_tool(ctx, params):
+        if dispatcher and params.name in (WAIT_TOOL, REGISTER_TOOL):
+            # Waiting for a person must not hold a runtime lease or block permission changes.
+            return await dispatcher.call(ctx.request, params.name, params.arguments or {})
         async with runtime.lease() as current:
             return await current.call_tool(ctx, params)
     server: Server[Any] = Server(
@@ -484,6 +551,8 @@ def build_app(gateway: Gateway) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with manager.run(), runtime.run():
+            if dispatcher:
+                runtime.tasks.start_soon(dispatcher.run)
             if admin:
                 runtime.tasks.start_soon(admin.sweep)
             yield
@@ -493,7 +562,7 @@ def build_app(gateway: Gateway) -> Starlette:
 
     # The approval page, if there is one. It is reached by people, not by agents: it takes no
     # bearer token, and nothing on it changes anything without a passkey.
-    approval_routes = getattr(gateway.approver, "http_routes", list)()
+    approval_routes = gateway.approver.http_routes(dispatcher.notify) if dispatcher else []
 
     app = Starlette(
         routes=[

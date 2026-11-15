@@ -23,7 +23,7 @@ from .auth import hash_token, new_token
 from .catalog_sync import bundled_kind
 from .config import NAME, ToolCfg, is_mail_send, valid_mailbox_paths
 from .lock import Lock, definition_of, digest_of
-from .passkey import Refused, _json, _static, _PAGE_HEADERS
+from .passkey import ENROLL_TOOL, Refused, _json, _static, _PAGE_HEADERS
 from .plugins import MANIFEST_ENV, connector_plugins
 from .upstream import list_all_tools, open_client
 from .web_errors import connector_failure, failure_response, probe_error
@@ -151,7 +151,7 @@ class AdminController:
             # Revision-bound approvals are unusable immediately after publication,
             # including a crash between the atomic state write and this cleanup.
             with self.auth.approver._db() as db:
-                db.execute("UPDATE requests SET status='cancelled', arguments=NULL WHERE status IN ('pending','approved')")
+                db.execute("UPDATE requests SET status='cancelled', arguments=NULL WHERE status IN ('pending','approved') AND tool<>?", (ENROLL_TOOL,))
 
         try:
             await self.runtime.replace(gateway, persist)
@@ -202,7 +202,7 @@ class AdminController:
                 "clients": [{"id": c.id, "household": c.household, "fingerprint": c.token_sha256[:12],
                              "tool_count": sum(gw.policy.effect(c.subject, t.name, c.id) != "deny"
                                                for conn in gw.cfg.connections for t in conn.tools)} for c in gw.cfg.clients],
-                "connections": connections, "passkeys": keys,
+                "connections": connections, "passkeys": keys, "passkey_reviews": self.auth.approver.member_reviews(),
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
                 "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
@@ -533,6 +533,7 @@ class AdminController:
             with self.auth.approver._db() as db:
                 db.execute("DELETE FROM credentials WHERE principal=?", (name,))
                 db.execute("DELETE FROM enrollments WHERE principal=?", (name,))
+                db.execute("UPDATE requests SET status='cancelled', arguments=NULL WHERE tool=? AND principal=? AND status IN ('pending','approved')", (ENROLL_TOOL, name))
             # Delete credentials before publishing the removal, so even a failed
             # persistence attempt cannot leave credentials for a later re-added id.
             return await self._commit(state, operation)

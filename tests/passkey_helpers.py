@@ -121,3 +121,7 @@ class Page:
         assert status == 200, result
         return authenticator
 
+
+
+async def wait_for_approval(client, request_id, seconds=10):
+    return await client.call_tool("gateway_wait_for_approval", {"request_id": request_id, "wait_seconds": seconds})

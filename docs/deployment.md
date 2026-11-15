@@ -219,9 +219,17 @@ docker compose run --rm admin approval enroll person_a
 （AirDrop、当面、端到端加密的私聊）交给本人，不要贴进任何 Agent 读得到的对话。打开后按浏览器提示创建 Passkey
 （需要生物识别或设备密码）。
 
-**一次审批**：Agent 调用一个 `approval_required` 的工具时，调用不会执行，Agent 收到一段固定文字，里面有一个
-`…/approvals/r/<id>` 链接。连接指定的审批人打开链接，页面显示是哪个 client、哪个账号、哪个工具、完整参数；用 Passkey 批准后，
-Agent 在有效期内（默认 10 分钟）**用完全相同的参数**再调一次，才会执行，而且只执行一次。参数变了就是一个新的请求。
+**成员自行登记**：已有群组成员可让 Agent 调用 `gateway_request_passkey`，填写自己的名字。
+成员在自己的设备打开私密链接并创建 Passkey，把显示的审阅链接交给管理员。
+管理员在该链接或「群组成员 → 等待批准的通行密钥」用自己的 Passkey 批准。登记人无需登录管理页。
+管理员自己的 Passkey 不支持 Agent 发起登记。
+
+**一次审批**：需要审批的工具调用返回 `approval_url` 和 `request_id`。审批人核对原始参数并批准，
+Gateway 自动执行一次。Agent 调用 `gateway_wait_for_approval` 获取状态和结果；默认等 20 秒，
+`wait_seconds: 0` 可立即查询。等待中就用同一编号继续查，不要重发原操作。
+结果留在内存最多 10 分钟；重启后仍可查询执行状态。若结果显示未知，先确认上游是否已经执行。
+旧版挂起的请求升级后需要重新发起。
+
 连接的 `approver` 可选同群组的一位成员或群组内任意成员；未设置时默认 owner。选择群组时，其中任意成员可批准，
 无需全员批准；owner 本身不授予其他 Agent 工具权限。
 
@@ -316,7 +324,7 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 
 `$A`、`$B`、`$H` 是 person_a、person_b、household 三个 client 的 Token。
 
-0.6 默认只列出三个入口。先搜索工具，再选择有权限的连接，最后调用：
+默认使用三个连接器入口。先搜索工具，再选择有权限的连接，最后调用：
 
 ```sh
 call "$A" gateway_search_tools '{"query":"mail"}'
@@ -327,8 +335,8 @@ call "$A" gateway_call_tool '{"tool":"mail_list_messages","connection":"my_mail"
 
 工具搜索支持 connection 筛选，连接搜索支持 tool 筛选；两者都支持 query、offset、limit，跟随 next_offset 完整遍历。
 两个邮箱连接会共用 `mail_list_messages` 等工具名，授权和审批仍按实际连接分别检查。
-升级到 0.6 后，已有 Agent 会话需要刷新一次 MCP 清单（或新建会话）以获得这三个入口。
-之后能力或授权变化通过搜索即可看到。未授权 Agent 也有三个入口，但搜索结果为空。
+升级后刷新一次 MCP 清单（或新建会话），即可发现审批查询和 Passkey 登记工具。
+之后连接器或授权变化通过搜索即可看到。没有业务授权时，搜索结果为空。
 下面旧的前缀工具名调用仍兼容；如需复现旧的完整 tools/list 清单，在 YAML 中设置 `server.tool_discovery: all`。
 
 标准内置连接器的能力随网关版本自动同步，无需修数据库或逐个更新连接。新能力默认未授权；
@@ -360,11 +368,11 @@ call "$A" gateway_call_tool '{"tool":"mail_list_messages","connection":"my_mail"
 | 1 | `approval enroll person_a`，在手机或电脑上打开链接 | 浏览器要求创建 Passkey；同一个链接第二次打开无效 |
 | 2 | `call $A a_notes_add '{"folder":"inbox","text":"hello"}'` | 没有执行；回答里有审批链接 |
 | 3 | 打开链接，核对页面上的 client、账号、工具、参数，批准 | 要求生物识别或设备密码 |
-| 4 | 原样重复第 2 步的调用，然后再重复一次 | 第一次执行成功；第二次又变成等待审批（一次批准只管一次） |
+| 4 | 调用 `gateway_wait_for_approval`，传入第 2 步的 `request_id` | 网关自动执行一次；返回状态和工具结果 |
 | 5 | 发起请求，批准后把参数改一个字再调用 | 不执行，生成新的请求 |
 | 6 | 发起请求，在页面上拒绝；再原样调用 | 回答已被拒绝，不生成新请求（默认 10 分钟内） |
 | 7 | 用 B 的设备打开 A 的请求链接 | 看得到内容，但 B 的 Passkey 批不了 A 账号的请求 |
-| 8 | 批准后不调用，`approval cancel -- <id>`，再调用 | 不执行 |
+| 8 | 在请求开始执行前用 `approval cancel -- <id>` 撤回 | 等待工具返回已取消；上游不执行 |
 | 9 | `jq -c 'select(.event \| startswith("approval"))' data/state/audit/audit.jsonl` | 每次请求、批准、拒绝、撤销各有一行，没有参数值 |
 
 问题报告应包含失败步骤、时间和对应审计事件，避免附带凭据或业务内容。

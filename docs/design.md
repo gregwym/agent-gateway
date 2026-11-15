@@ -86,7 +86,7 @@ resource 用 `pin` / `allow_values` 表达（同一个上游工具可以用不�
 默认仍是 YAML + 重启。显式配置 `admin` 后，`/admin/` 提供 Passkey 管理员会话和受保护的管理 API。
 管理员由主机配置的 `admin.owner` 指定，普通群组成员、MCP Token、Tailscale 可达性都不授予管理角色。
 SQLite 保存审批、公钥和管理员会话；`admin.enc` 加密保存网页修改的配置、凭据和工具锁。
-Agent 通过 MCP 能改变的管理状态仍只有发起待审批请求（每个 client 同时最多 5 个）。
+Agent 可通过 MCP 发起操作审批或为组内已有成员发起 Passkey 登记。未批准的登记不会成为有效凭据。
 
 ### 模块
 
@@ -282,19 +282,20 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 ### 8.1 一次调用的经过
 
-1. Agent 调用一个 `approval_required` 的工具。Gateway 先完成策略和参数校验（pin 已填入），然后查这一次调用有没有批准。
-   没有：把请求存为「待审批」，告诉 Agent 请求在哪个地址等待，**不执行**。
-2. 连接指定的审批人在浏览器里打开那个地址，看到将要执行的内容：哪个 client、哪个账号、哪个工具、**完整的参数**。
-   用 Passkey 批准或拒绝。
-3. Agent 用完全相同的参数再调用一次。Gateway 找到批准，在同一个数据库事务里把它标记为「已使用」，然后执行。
-   再调用一次就找不到批准了，从第 1 步重新开始。
+1. Agent 调用需要审批的工具。Gateway 校验身份、权限和参数后保存原请求，返回审批链接和请求编号。
+2. 审批人在浏览器查看账号、工具和完整参数，用 Passkey 批准或拒绝。
+3. Gateway 领取已批准的请求，重新核对现有权限、凭据和工具定义，在联系上游前原子标记为「已使用」，然后执行一次。
+4. Agent 用 `gateway_wait_for_approval` 等待执行结果。同一 Agent Token 才能查询请求。原始结果短期保存在内存，
+   状态持久化。若进程在领取后、记录结果前中断，结果标记为未知，不重放。
 
+Agent 发起的成员登记也使用同一个审批流程。成员创建的公钥在管理员批准前保存在待审批记录中，
+不能用来批准操作或登录。登记仅限同组已有的非管理员成员。
 通知这一步没有单独的通道：等待地址由 Agent 转告给人。这是安全的，因为 Passkey 由浏览器绑定到配置的域名，
 别的页面拿不到有效的签名；但人必须读审批页面上显示的内容，而不是 Agent 的转述。
 
 ### 8.2 批准绑定什么
 
-- **请求的身份**（`ApprovalRequest.binding`）：发起的 client 和 principal、connection、service、account、上游工具名、
+- **请求的身份**（`ApprovalRequest.binding`）：发起的 client、Token 指纹和 principal、connection、service、account、上游工具名、
   以及**最终发往上游的参数**的 SHA-256。改任何一个参数、换一个 client、换一个账号，都是另一次调用，需要另一次批准。
 - **Passkey 签的是什么**：每个决定是一次独立的 WebAuthn 断言（要求用户验证，即指纹、面容或 PIN），挑战值是
   「一次性随机数 + 决定（批准/拒绝/撤回）+ 数据库里这条请求的全部字段」的哈希。答复回来时按数据库里的请求重新计算，
@@ -308,7 +309,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 | 项 | 值 |
 |---|---|
 | 待审批请求的有效期 | `request_ttl_seconds`，默认 10 分钟 |
-| 批准后可以使用的期限 | `grant_ttl_seconds`，默认 10 分钟；用一次即失效 |
+| 批准后开始执行的期限 | `grant_ttl_seconds`，默认 10 分钟；领取一次即失效 |
 | 被拒绝后 | 拒绝后的 `request_ttl_seconds` 内，同一次调用直接回答「已被拒绝」，不产生新的请求 |
 | 撤回 | 已批准未使用的请求可以在页面上用 Passkey 撤回，或由管理员 `agw approval cancel` |
 | 每个 client 同时等待的请求 | 5 个 |
@@ -380,7 +381,7 @@ Passkey 邀请或撤销，以及会引入或改变连接凭据和工具的操作
 | 工具名冲突 | `test_tools.py` | 暴露名全局唯一，配置期报错 |
 | 上游工具动态变更 | `test_tools.py` | 启动时和运行中的变更都会下线该工具；投毒描述不会到达 Agent |
 | SSRF / 任意 URL | `test_upstream.py`、`test_tools.py` | URL 只来自配置；跨源重定向不跟随；schema 远程 `$ref` 被拒 |
-| 审批绕过与重放 | `test_approval.py`、`test_passkey.py` | 参数改一个字符即需重新批准；批准只能用一次；并发的两次调用只有一次成功；签名不能挪到别的请求；显示之后请求变了则决定作废；过期；非指定审批人不能决定；没有用户验证的断言被拒；没有配置就没有页面 |
+| 审批绕过与重放 | `test_approval.py`、`test_passkey.py` | 参数改一个字符即需重新批准；批准只能用一次；并发查询不会重复执行；签名不能挪到别的请求；显示之后请求变了则决定作废；过期；非指定审批人不能决定；没有用户验证的断言被拒；没有配置就没有页面 |
 | Agent 绕过 Gateway | `test_surface.py` | 只验证了暴露面和 Connector 约定；其余是部署约束 |
 | 不可信内容中的 Prompt Injection | `test_surface.py` | 只验证了权限不变；Gateway 不过滤内容 |
 | 邮件的搜索、正文、附件、中继地址 | `test_connector_mail.py` | 对面是 [pymap](https://github.com/icgood/pymap)（一个真实的 IMAP 服务器实现）加 TLS；包括连接中断后重连、密码被拒、证书不可信 |

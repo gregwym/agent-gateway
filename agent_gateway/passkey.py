@@ -70,6 +70,13 @@ CREATE TABLE IF NOT EXISTS requests (
     created INTEGER NOT NULL, expires INTEGER NOT NULL,
     decided INTEGER, decided_by TEXT, credential TEXT, used INTEGER, outcome TEXT);
 CREATE INDEX IF NOT EXISTS requests_binding ON requests (binding, created);
+CREATE INDEX IF NOT EXISTS requests_ready ON requests (decided) WHERE status='approved';
+CREATE TABLE IF NOT EXISTS dispatch (
+    id TEXT PRIMARY KEY, revision TEXT NOT NULL, client_token_sha256 TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS enrollment_requests (
+    code_sha256 TEXT PRIMARY KEY, client TEXT NOT NULL, client_token_sha256 TEXT NOT NULL, administrator TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_credentials (
+    request_id TEXT PRIMARY KEY, id BLOB NOT NULL UNIQUE, data BLOB NOT NULL, counter INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS ceremonies (
     id TEXT PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, binding TEXT NOT NULL,
     state TEXT NOT NULL, expires INTEGER NOT NULL);
@@ -79,6 +86,8 @@ CREATE TABLE IF NOT EXISTS ceremonies (
 _DECISIONS = {"approve": "pending", "deny": "pending", "cancel": "approved"}
 _OPEN = ("pending", "approved")
 _ENROLL_TTL = 900
+_MEMBER_REVIEW_TTL = 86_400
+ENROLL_TOOL = "gateway_approve_passkey"
 _CEREMONY_TTL = 120
 _MAX_CEREMONIES = 100
 _MAX_CEREMONIES_PER_TARGET = 3
@@ -121,6 +130,7 @@ class PasskeyApprover:
     def __init__(self, cfg: ApprovalsCfg, audit: Audit, retention_days: int = 90) -> None:
         self.cfg = cfg
         self.audit = audit
+        self.member_allowed = lambda *_: False
         self._retention = retention_days * 86_400
         self._server = Fido2Server(
             {"id": cfg.rp_id, "name": "Agent Gateway"}, verify_origin=lambda origin: origin == cfg.origin
@@ -136,12 +146,12 @@ class PasskeyApprover:
     # -- storage ----------------------------------------------------------------
 
     @contextmanager
-    def _db(self) -> Iterator[sqlite3.Connection]:
+    def _db(self, *, write=True) -> Iterator[sqlite3.Connection]:
         """One short transaction. IMMEDIATE, so check-then-update sequences cannot interleave."""
         db = sqlite3.connect(self.cfg.store, timeout=10, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             db.execute("COMMIT")
         except BaseException:
@@ -158,6 +168,9 @@ class PasskeyApprover:
         db.execute("DELETE FROM requests WHERE status NOT IN ('pending','approved') AND created<?", (now - self._retention,))
         db.execute("DELETE FROM ceremonies WHERE expires<=?", (now,))
         db.execute("DELETE FROM enrollments WHERE expires<=?", (now,))
+        db.execute("DELETE FROM enrollment_requests WHERE code_sha256 NOT IN (SELECT code_sha256 FROM enrollments)")
+        db.execute("DELETE FROM dispatch WHERE id NOT IN (SELECT id FROM requests)")
+        db.execute("DELETE FROM pending_credentials WHERE request_id NOT IN (SELECT id FROM requests WHERE status IN ('pending','approved') OR (status='used' AND outcome IS NULL))")
 
     def _url(self, request_id: str) -> str:
         return f"{self.cfg.origin}/approvals/r/{request_id}"
@@ -182,14 +195,15 @@ class PasskeyApprover:
             if row is not None and set(json.loads(row["approvers"])) != set(request.approvers):
                 db.execute("UPDATE requests SET status='cancelled', arguments=NULL WHERE id=? AND status IN ('pending','approved')", (row["id"],))
                 row = None
-            if row is not None and row["status"] == "approved":
-                # Spent here, in the transaction that found it: a second call cannot find it again.
-                db.execute("UPDATE requests SET status='used', used=?, arguments=NULL WHERE id=?", (now, row["id"]))
-                return ApprovalDecision(True, "approved", approval_id=row["id"])
-            if row is not None and row["status"] == "pending":
-                return ApprovalDecision(False, "pending", self._waiting(row["id"], row["approvers"], row["expires"], now), row["id"])
-            if row is not None and row["status"] == "denied" and now - row["decided"] < self.cfg.request_ttl_seconds:
-                return ApprovalDecision(False, "denied", "This action was declined by the account owner and was not executed.", row["id"])
+            if row is not None:
+                status = row["status"]
+                if status in _OPEN:
+                    message = self._waiting(row["id"], row["approvers"], row["expires"], now) if status == "pending" else None
+                    return ApprovalDecision(False, status, message, row["id"])
+                if status == "denied" and now - row["decided"] < self.cfg.request_ttl_seconds:
+                    return ApprovalDecision(False, "denied", "This action was declined and was not executed.", row["id"])
+                if status == "used" and now - row["used"] < self.cfg.request_ttl_seconds:
+                    return ApprovalDecision(False, "submitted", approval_id=row["id"])
 
             enrolled = {r["principal"] for r in db.execute("SELECT DISTINCT principal FROM credentials")}
             if not enrolled & set(request.approvers):
@@ -204,15 +218,7 @@ class PasskeyApprover:
             request_id = secrets.token_urlsafe(24)
             approvers = json.dumps(sorted(request.approvers))
             expires = now + self.cfg.request_ttl_seconds
-            db.execute(
-                "INSERT INTO requests (id, binding, status, client, principal, tool, connection, service, account, owner,"
-                " upstream_tool, approvers, arguments, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    request_id, request.binding, "pending", request.client_id, request.principal, request.tool,
-                    request.connection, request.service, request.account, request.owner, request.upstream_tool,
-                    approvers, canonical(request.arguments).decode("utf-8"), now, expires,
-                ),
-            )  # fmt: skip
+            self._insert_request(db, request_id, request, now, expires)
         self.audit.write(
             "approval_requested", approval=request_id, client=request.client_id, principal=request.principal,
             tool=request.tool, connection=request.connection, service=request.service, account=request.account,
@@ -220,17 +226,67 @@ class PasskeyApprover:
         )  # fmt: skip
         return ApprovalDecision(False, "requested", self._waiting(request_id, approvers, expires, now), request_id)
 
+    @staticmethod
+    def _insert_request(db, request_id, request, now, expires):
+        db.execute(
+            "INSERT INTO requests (id, binding, status, client, principal, tool, connection, service, account, owner,"
+            " upstream_tool, approvers, arguments, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (request_id, request.binding, "pending", request.client_id, request.principal, request.tool,
+             request.connection, request.service, request.account, request.owner, request.upstream_tool,
+             json.dumps(sorted(request.approvers)), canonical(request.arguments).decode("utf-8"), now, expires),
+        )
+        db.execute("INSERT INTO dispatch VALUES (?,?,?)",
+                   (request_id, request.configuration_revision, request.client_token_sha256))
+
+    def dispatch_queue(self, limit):
+        with self._db(write=False) as db:
+            return [r["id"] for r in db.execute(
+                "SELECT r.id FROM requests r JOIN dispatch d ON r.id=d.id WHERE r.status='approved' AND r.expires>? ORDER BY r.decided, r.rowid LIMIT ?", (_now(), limit))]
+
+    def recover_dispatch(self):
+        # A process that disappeared after claiming an operation may already have
+        # changed the upstream. Never replay an execution whose outcome is unknown.
+        with self._db() as db:
+            db.execute("UPDATE requests SET outcome='execution_unknown' WHERE status='used' AND outcome IS NULL AND id IN (SELECT id FROM dispatch)")
+
+    def claim_dispatch(self, request_id):
+        now = _now()
+        with self._db() as db:
+            row = self._dispatch_row(db, request_id)
+            if not row or row["status"] != "approved" or row["expires"] <= now:
+                return None
+            if not any(bytes(key["id"]).hex() == row["credential"] for key in self._credentials(db, [row["decided_by"]])):
+                db.execute("UPDATE requests SET status='cancelled', outcome='approver_key_revoked', arguments=NULL WHERE id=?", (request_id,))
+                return None
+            db.execute("UPDATE requests SET status='used', used=?, arguments=NULL WHERE id=?", (now, request_id))
+            return dict(row)
+
+    @staticmethod
+    def _dispatch_row(db, request_id):
+        return db.execute("SELECT r.*, d.revision, d.client_token_sha256 FROM requests r JOIN dispatch d ON r.id=d.id WHERE r.id=?", (request_id,)).fetchone()
+
+    def dispatch_status(self, request_id):
+        with self._db(write=False) as db:
+            row = self._dispatch_row(db, request_id)
+            if not row:
+                return None
+            row = dict(row)
+            if row["status"] in _OPEN and row["expires"] <= _now():
+                row["status"] = "expired"
+            return row
+
     def _waiting(self, request_id: str, approvers: str, expires: int, now: int) -> str:
         people = " or ".join(self.identity_label(p) for p in json.loads(approvers))
         minutes = max(1, (expires - now + 59) // 60)
         return (
             f"{NOT_EXECUTED} It is waiting at {self._url(request_id)} . Ask {people} to open that page and approve it "
-            f"with their passkey within {minutes} minutes, then call this tool again with exactly the same arguments."
+            f"with their passkey within {minutes} minutes. The gateway executes the approved action automatically. "
+            f"Call gateway_wait_for_approval with request_id {request_id} for its status and result. Do not resubmit the action."
         )
 
     async def finished(self, approval_id: str, outcome: str) -> None:
         with self._db() as db:
-            db.execute("UPDATE requests SET outcome=? WHERE id=? AND status='used'", (outcome[:64], approval_id))
+            db.execute("UPDATE requests SET outcome=? WHERE id=? AND status='used' AND outcome IS NULL", (outcome[:64], approval_id))
 
     # -- administration (the `agw approval` commands) -------------------------------
 
@@ -242,6 +298,53 @@ class PasskeyApprover:
             self._sweep(db, now)
             db.execute("INSERT INTO enrollments VALUES (?,?,?)", (_sha256(code), principal, now + _ENROLL_TTL))
         return f"{self.cfg.origin}/approvals/enroll#{code}"
+
+    def request_member_enrollment(self, principal, client, admin):
+        if not self.member_allowed(principal, client.id, client.token_sha256, admin):
+            raise Refused("enrollment_member_unavailable", 404)
+        now, code = _now(), secrets.token_urlsafe(24)
+        code_hash = _sha256(code)
+        with self._db() as db:
+            self._sweep(db, now)
+            if not self._credentials(db, [admin]):
+                raise Refused("administrator_passkey_required")
+            outstanding = db.execute("SELECT count(*) FROM enrollment_requests WHERE client=?", (client.id,)).fetchone()[0]
+            reviews = db.execute("SELECT count(*) FROM requests WHERE tool=? AND client=? AND status IN ('pending','approved')",
+                                 (ENROLL_TOOL, client.id)).fetchone()[0]
+            if outstanding + reviews >= 5:
+                raise Refused("rate_limited", 429)
+            db.execute("INSERT INTO enrollments VALUES (?,?,?)", (code_hash, principal, now + _ENROLL_TTL))
+            db.execute("INSERT INTO enrollment_requests VALUES (?,?,?,?)", (code_hash, client.id, client.token_sha256, admin))
+        return {"enrollment_url": f"{self.cfg.origin}/approvals/enroll#{code}", "expires_in_seconds": _ENROLL_TTL}
+
+    def _member_metadata(self, db, enrollment):
+        row = db.execute("SELECT * FROM enrollment_requests WHERE code_sha256=?", (enrollment["code_sha256"],)).fetchone()
+        if row and not self.member_allowed(enrollment["principal"], row["client"], row["client_token_sha256"], row["administrator"]):
+            raise Refused("invalid_enrollment_code")
+        return row
+
+    def activate_member_passkey(self, row):
+        principal, admin = row["principal"], row["owner"]
+        with self._db() as db:
+            key = db.execute("SELECT * FROM pending_credentials WHERE request_id=?", (row["id"],)).fetchone()
+            if not key or not self.member_allowed(principal, row["client"], row["client_token_sha256"], admin):
+                outcome = "enrollment_member_unavailable"
+            elif len(self._credentials(db, [principal])) >= _MAX_PASSKEYS_PER_PERSON:
+                outcome = "too_many_passkeys"
+            elif db.execute("SELECT 1 FROM credentials WHERE id=?", (key["id"],)).fetchone():
+                outcome = "passkey_already_registered"
+            else:
+                db.execute("INSERT INTO credentials VALUES (?,?,?,?,?)", (key["id"], principal, key["data"], key["counter"], _now()))
+                outcome = "ok"
+            db.execute("DELETE FROM pending_credentials WHERE request_id=?", (row["id"],))
+            db.execute("UPDATE requests SET outcome=? WHERE id=? AND status='used'", (outcome, row["id"]))
+        self.audit.write("passkey_enrollment_reviewed", approver=admin, principal=principal, approval=row["id"], reason=outcome)
+
+    def member_reviews(self):
+        with self._db() as db:
+            return [{"member": row["principal"], "agent": row["client"], "url": self._url(row["id"])}
+                    for row in db.execute("SELECT id, principal, client FROM requests WHERE tool=? AND status='pending' AND expires>? ORDER BY created DESC",
+                                          (ENROLL_TOOL, _now()))]
 
     def passkeys(self) -> list[dict[str, Any]]:
         with self._db() as db:
@@ -284,8 +387,12 @@ class PasskeyApprover:
         if row is None:
             raise Refused("not_found", 404)
         shown = {key: row[key] for key in row.keys() if key not in ("binding", "credential", "arguments", "approvers")}
+        shown["automatic"] = self.dispatch_status(request_id) is not None
+        if not shown["automatic"] and row["status"] in _OPEN:
+            shown.update(status="cancelled", outcome="previous_version")
+        shown["enrollment"] = row["tool"] == ENROLL_TOOL
         shown["approvers"] = json.loads(row["approvers"])
-        shown["arguments"] = json.loads(row["arguments"]) if row["arguments"] is not None else None
+        shown["arguments"] = json.loads(row["arguments"]) if shown["status"] in _OPEN and row["arguments"] is not None else None
         people = {row["principal"], row["owner"], *shown["approvers"]}
         if row["decided_by"]:
             people.add(row["decided_by"])
@@ -299,7 +406,7 @@ class PasskeyApprover:
     @staticmethod
     def _open_request(db: sqlite3.Connection, action: str, request_id: str) -> sqlite3.Row:
         row = db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
-        if row is None or row["status"] != _DECISIONS[action]:
+        if row is None or row["status"] != _DECISIONS[action] or not db.execute("SELECT 1 FROM dispatch WHERE id=?", (request_id,)).fetchone():
             raise Refused("stale_request")
         return row
 
@@ -324,6 +431,7 @@ class PasskeyApprover:
                 enrollment = db.execute("SELECT * FROM enrollments WHERE code_sha256=?", (code,)).fetchone()
                 if enrollment is None:
                     raise Refused("invalid_enrollment_code")
+                self._member_metadata(db, enrollment)
                 principal = enrollment["principal"]
                 existing = self._credentials(db, [principal])
                 if len(existing) >= _MAX_PASSKEYS_PER_PERSON:
@@ -369,6 +477,7 @@ class PasskeyApprover:
             if ceremony is None:
                 raise Refused("expired_ceremony")
             db.execute("DELETE FROM ceremonies WHERE id=?", (ceremony_id,))  # single use, even if what follows fails
+        review_id = None
         action, target, state = ceremony["action"], ceremony["target"], json.loads(ceremony["state"])
         try:
             parsed = (RegistrationResponse if action == "enroll" else AuthenticationResponse).from_dict(response)
@@ -390,11 +499,30 @@ class PasskeyApprover:
                 credential = registered.credential_data
                 if credential is None:
                     raise Refused("verification_failed")
-                db.execute(
-                    "INSERT INTO credentials VALUES (?,?,?,?,?)",
-                    (credential.credential_id, enrollment["principal"], bytes(credential), registered.counter, now),
-                )
-                db.execute("DELETE FROM enrollments WHERE code_sha256=?", (target,))  # the link works once
+                principal = enrollment["principal"]
+                metadata = self._member_metadata(db, enrollment)
+                if len(self._credentials(db, [principal])) >= _MAX_PASSKEYS_PER_PERSON:
+                    raise Refused("too_many_passkeys")
+                if (db.execute("SELECT 1 FROM credentials WHERE id=?", (credential.credential_id,)).fetchone() or
+                        db.execute("SELECT 1 FROM pending_credentials WHERE id=?", (credential.credential_id,)).fetchone()):
+                    raise Refused("passkey_already_registered", 409)
+                if metadata:
+                    review_id = secrets.token_urlsafe(24)
+                    details = {"member": self.name_of(principal), "credential_fingerprint": bytes(credential.credential_id).hex()[:16]}
+                    request = ApprovalRequest(
+                        principal=principal, client_id=metadata["client"], tool=ENROLL_TOOL, connection="passkeys",
+                        service="passkey", account=principal, upstream_tool="register", arguments_sha256=_sha256(review_id),
+                        arguments=details, owner=metadata["administrator"], approvers=(metadata["administrator"],),
+                        client_token_sha256=metadata["client_token_sha256"],
+                    )
+                    self._insert_request(db, review_id, request, now, now + _MEMBER_REVIEW_TTL)
+                    db.execute("INSERT INTO pending_credentials VALUES (?,?,?,?)",
+                               (review_id, credential.credential_id, bytes(credential), registered.counter))
+                else:
+                    db.execute("INSERT INTO credentials VALUES (?,?,?,?,?)",
+                               (credential.credential_id, principal, bytes(credential), registered.counter, now))
+                db.execute("DELETE FROM enrollments WHERE code_sha256=?", (target,))
+                db.execute("DELETE FROM enrollment_requests WHERE code_sha256=?", (target,))
                 decided_by, request_row = enrollment["principal"], None
             else:
                 row = self._open_request(db, action, target)
@@ -419,7 +547,7 @@ class PasskeyApprover:
                 if (owner["counter"] or counter) and counter <= owner["counter"]:
                     raise Refused("verification_failed")
                 db.execute("UPDATE credentials SET counter=? WHERE id=?", (counter, owner["id"]))
-                credential_hex = bytes(owner["id"]).hex()[:16]
+                credential_hex = bytes(owner["id"]).hex()
                 if action == "approve":
                     db.execute(
                         "UPDATE requests SET status='approved', decided=?, decided_by=?, credential=?, expires=? WHERE id=?",
@@ -433,6 +561,9 @@ class PasskeyApprover:
                     )
                 request_row = row
 
+        if review_id:
+            self.audit.write("passkey_enrollment_requested", principal=decided_by, approval=review_id)
+            return {"action": action, "pending": True, "approval_url": self._url(review_id), "request_id": review_id}
         if request_row is None:
             self.audit.write("passkey_enrolled", approver=decided_by)
             return {"action": action}
@@ -445,7 +576,7 @@ class PasskeyApprover:
 
     # -- HTTP ---------------------------------------------------------------------
 
-    def http_routes(self) -> list[BaseRoute]:
+    def http_routes(self, notify=lambda: None) -> list[BaseRoute]:
         async def page(request: Request) -> Response:
             return _static("approve.html", "text/html; charset=utf-8")
 
@@ -468,7 +599,10 @@ class PasskeyApprover:
             body = await self._body(request)
             if isinstance(body, Response):
                 return body
-            return self._answer(lambda: self.finish(str(body.get("ceremony_id")), body.get("response")))
+            result = self._answer(lambda: self.finish(str(body.get("ceremony_id")), body.get("response")))
+            if result.status_code == 200:
+                notify()
+            return result
 
         return [
             Route("/approvals/r/{request_id}", page, methods=["GET"]),

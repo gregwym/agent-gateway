@@ -17,7 +17,7 @@ import pytest
 import yaml
 from helpers import TOKEN_A, TOKEN_B, TOKEN_HOUSE, agent, text_of, tool_names
 from mcp import MCPError
-from passkey_helpers import Authenticator, Page, request_id_in
+from passkey_helpers import wait_for_approval, Authenticator, Page, request_id_in
 from test_admin import admin_post
 
 from agent_gateway.auth import hash_token
@@ -120,7 +120,7 @@ p=Path('/state/write-probe'); p.write_text('test'); p.unlink()
             assert (await http.post(f"{base}/mcp", json={})).status_code == 401
         url = f"{base}/mcp"
         async with agent(url, TOKEN_A) as a, agent(url, TOKEN_B) as b, agent(url, TOKEN_HOUSE) as shared:
-            assert await tool_names(a) == await tool_names(b) == await tool_names(shared) == {'gateway_search_tools', 'gateway_search_connections', 'gateway_call_tool'}
+            assert await tool_names(a) == await tool_names(b) == await tool_names(shared) == {'gateway_search_tools', 'gateway_search_connections', 'gateway_call_tool', 'gateway_wait_for_approval'}
             assert 'notes_list_notes' in text_of(await a.call_tool('gateway_search_tools', {}))
             for other in (b, shared):
                 restricted = json.loads(text_of(await other.call_tool('gateway_search_connections', {'tool': 'notes_list_notes', 'query': 'notes-a'})))
@@ -143,19 +143,24 @@ p=Path('/state/write-probe'); p.write_text('test'); p.unlink()
             request_id = request_id_in(text_of(await a.call_tool("a_notes_add", note)))
         assert (await page.decide("approve", request_id, key))[0] == 200
 
-        # The approval store survives a real process/container restart.
+        async with agent(url, TOKEN_A) as a:
+            assert (await wait_for_approval(a, request_id)).structured_content["status"] == "succeeded"
+            assert text_of(await a.call_tool("a_notes_list", {"folder": "inbox"})).count(note["text"]) == 1
+
+        # The execution outcome survives a restart, without replaying the write.
         docker("restart", name)
         # Docker may allocate a new host port when an ephemeral published port restarts.
         port = docker("port", name, "8080/tcp").rsplit(":", 1)[1]
         base, url = f"http://127.0.0.1:{port}", f"http://127.0.0.1:{port}/mcp"
         page = Page(base)
         await healthy(base)
-        assert (await page.view(request_id))[1]["status"] == "approved"
+        assert (await page.view(request_id))[1]["status"] == "used"
         async with agent(url, TOKEN_A) as a:
-            assert not (await a.call_tool("a_notes_add", note)).is_error
-            assert (await a.call_tool("a_notes_add", note)).is_error
-            assert text_of(await a.call_tool("a_notes_list", {"folder": "inbox"})).count(note["text"]) == 1
-            assert (await page.view(request_id))[1]["status"] == "used"
+            recovered = await wait_for_approval(a, request_id)
+            assert recovered.structured_content["status"] == "succeeded"
+            assert "no longer available" in text_of(recovered)
+            assert (await a.call_tool("a_notes_add", note)).structured_content["request_id"] == request_id
+            assert note["text"] not in text_of(await a.call_tool("a_notes_list", {"folder": "inbox"}))
             kill = """
 import os, signal
 from pathlib import Path
@@ -202,7 +207,7 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
             applied = await admin_post(http, 'connections/apply', json={'revision':1,'draft':preview.json()['draft'],'reviewed':True})
             assert applied.status_code == 200, applied.text
             async with agent(base + '/mcp', token, Host='localhost') as client:
-                assert len(await tool_names(client)) == 3
+                assert await tool_names(client) == {"gateway_search_tools", "gateway_search_connections", "gateway_call_tool", "gateway_wait_for_approval", "gateway_request_passkey"}
                 assert json.loads(text_of(await client.call_tool('gateway_search_tools', {})))['total'] == 0
             granted = await admin_post(http, 'permissions/save', json={'revision':2,'client':'web-agent',
                 'connection':'web-notes','tool':'web_notes_list','effect':'allow'})

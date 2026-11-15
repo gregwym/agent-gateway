@@ -5,7 +5,7 @@ import pytest
 from mcp import MCPError
 
 from helpers import TOKEN_A, TOKEN_B, TOKEN_HOUSE, agent, base_config, prepare, running_gateway, text_of, tool_names
-from passkey_helpers import Page, approval_config, request_id_in
+from passkey_helpers import Page, approval_config, request_id_in, wait_for_approval
 from service_helpers import free_port
 from test_admin import change, login, rpc, setup, state, web_gateway
 
@@ -153,7 +153,7 @@ async def test_discovery_updates_without_reloading_and_approvals_bind_connection
         token = (await change(http, 'clients/create', id='discovery-agent', household='household')).json()['token']
         async with agent(origin + '/mcp', token) as client:
             cached_list = await tool_names(client)
-            assert cached_list == CORE
+            assert cached_list == CORE | {'gateway_wait_for_approval', 'gateway_request_passkey'}
             assert (await search(client, 'tools'))['total'] == (await search(client, 'connections'))['total'] == 0
             for conn in ['notes-a', 'notes-house']:
                 reply = await change(http, 'permissions/connection', client='discovery-agent', connection=conn, access='read_write', approver='person_a')
@@ -170,8 +170,8 @@ async def test_discovery_updates_without_reloading_and_approvals_bind_connection
             assert other.is_error and request_id_in(text_of(other)) != first
             changed = await execute(client, 'notes_add_note', 'notes-a', {**args, 'text': 'different content'})
             assert changed.is_error and request_id_in(text_of(changed)) != first
-            result = await execute(client, 'notes_add_note', 'notes-a', args)
-            assert not result.is_error and text_of(result) == 'added'
+            result = await wait_for_approval(client, first)
+            assert result.structured_content['status'] == 'succeeded' and result.content[1].text == 'added'
             assert (await execute(client, 'notes_add_note', 'notes-a', args)).is_error
             for conn in ['notes-a', 'notes-house']:
                 assert (await change(http, 'permissions/connection', client='discovery-agent', connection=conn, access='none')).status_code == 200

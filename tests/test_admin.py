@@ -157,7 +157,7 @@ async def test_live_tokens_permissions_and_restart_persistence(tmp_path):
         assert reply.status_code == 200, reply.text
         token = reply.json()['token']
         visible = (await rpc(origin, token)).json()['result']['tools']
-        assert visible == []
+        assert {t["name"] for t in visible} == {"gateway_wait_for_approval", "gateway_request_passkey"}
         assert token not in json.dumps(await state(http)) and token not in gw.audit_text()
         assert token.encode() not in (tmp_path / 'admin.enc').read_bytes()
         invalid = await change(http, 'permissions/save', principal='person_b', connection='notes-a', tool='a_list_notes', effect='allow')
@@ -230,6 +230,8 @@ async def test_setup_race_user_verification_and_session_revocation(tmp_path):
 
 async def test_failed_save_is_atomic_and_configuration_change_invalidates_approvals(tmp_path, monkeypatch):
     from passkey_helpers import Page, request_id_in
+    from test_passkey import defer_dispatch
+    start = defer_dispatch(monkeypatch)
     async with web_gateway(tmp_path) as (gw, http, origin, path):
         key, _ = await setup(http, origin, path)
         note = {'folder':'inbox','text':'must not survive a configuration change'}
@@ -247,6 +249,7 @@ async def test_failed_save_is_atomic_and_configuration_change_invalidates_approv
         assert (await rpc(origin, TOKEN_A)).status_code == 200
         monkeypatch.setattr(controller.store.file, 'set', original)
         assert (await change(http, 'clients/create', id='atomic', household='household')).status_code == 200
+        start.set()
         response = (await rpc(origin, TOKEN_A, 'tools/call', {'name':'a_add_note','arguments':note})).json()
         assert response['result']['isError']
         assert request_id_in(response['result']['content'][0]['text']) != request_id

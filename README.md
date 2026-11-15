@@ -55,7 +55,7 @@ aggregate service data, or call an LLM. It uses the official
 
 ## Discover and call tools
 
-The default MCP tool list contains three entry points:
+The default MCP tool list contains three connector entry points:
 
 | Tool | Purpose |
 |---|---|
@@ -86,12 +86,19 @@ Use **Rename** on a connector to change its connection ID. Credentials and
 permissions carry over. Update workflows that pass the old connection ID and
 request unfinished approvals again.
 
-Every call rechecks permissions, parameters and approval requirements. A call
-requiring approval returns a link without executing. After approval, the agent
-repeats the same call; the grant is consumed once. A failed upstream write is not
-automatically retried.
+A call requiring approval returns an `approval_url` and `request_id` without
+executing. After approval, Gateway rechecks the permissions and runs the saved
+operation once. Agents use `gateway_wait_for_approval` with the request ID to
+get its status and output. If still pending or running, wait again with that ID.
+Do not resubmit the original action. An interrupted execution with an unknown
+outcome is never replayed automatically.
 
-Clients upgrading from the full tool listing must refresh it once. Subsequent
+With web administration enabled, an Agent can use `gateway_request_passkey`
+to give an existing non-admin group member a private registration link. The
+member registers on their own device. The key activates only after the
+administrator uses their own passkey to approve it.
+
+Refresh the MCP tool list after upgrading to discover the approval and registration tools. Subsequent
 permission changes are visible through search. Legacy tool names remain callable
 under the same checks; `server.tool_discovery: all` restores the full listing.
 

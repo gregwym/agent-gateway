@@ -2,7 +2,7 @@
 // page with textContent only, and the CSP forbids inline script, so it stays text.
 'use strict';
 
-let language, redraw;
+let language, redraw, requestTimer;
 try { language = localStorage.getItem('gateway.ui-language'); } catch {}
 let ZH;
 function setLanguage(preference) {
@@ -16,9 +16,18 @@ const TEXT = {
   title_denied: ['Declined', '已拒绝'],
   title_cancelled: ['Withdrawn', '已撤回'],
   title_used: ['Approval used', '批准已使用'],
+  title_running: ['Running', '正在执行'],
+  title_succeeded: ['Completed', '已完成'],
+  title_failed: ['Execution failed', '执行失败'],
+  title_execution_unknown: ['Execution outcome unknown', '执行结果待核实'],
+  title_member_review: ['Approve a member’s passkey', '批准成员的通行密钥'],
+  hint_member_review: ['Confirm who registered this passkey before approving. Approving activates this key for the member below.', '请先核实登记人身份。批准后，这个通行密钥会为下方成员生效。'],
+  hint_running: ['The gateway is executing the approved request.', '网关正在执行已批准的请求。'],
+  hint_unknown: ['The operation may have run. Check the upstream before trying again.', '操作可能已执行，请先检查服务端结果。'],
+  hint_previous_version: ['This request belongs to a previous gateway version. Ask the Agent to submit it again.', '此请求来自旧版网关，请让 Agent 重新发起。'],
   title_expired: ['Expired', '已过期'],
-  hint_pending: ['Read it carefully. Approving lets the agent run exactly this, once.', '请仔细核对。批准后，Agent 只能按下面的内容执行一次。'],
-  hint_approved: ['The agent can now run exactly this, once, until the time below.', 'Agent 现在可以按下面的内容执行一次，截止时间如下。'],
+  hint_pending: ['Read it carefully. The gateway will run this exact request once after approval.', '请仔细核对。批准后，网关会自动按下面的内容执行一次。'],
+  hint_approved: ['The approved request is queued and will run automatically.', '已批准，网关将自动执行。'],
   hint_used: ['This approval has been used and cannot be used again.', '这次批准已经用掉，不能再次使用。'],
   hint_gone: ['Nothing will be executed for this request.', '这个请求不会被执行。'],
   requested_by: ['Requested by', '请求方'],
@@ -35,9 +44,11 @@ const TEXT = {
   deny: ['Decline', '拒绝'],
   cancel: ['Withdraw approval', '撤回批准'],
   enroll_title: ['Register a passkey', '注册通行密钥'],
-  enroll_hint: ['This passkey will be able to approve actions on your accounts. The link works once.', '这个通行密钥将用于批准对你账号的操作。此链接只能使用一次。'],
+  enroll_hint: ['Create a passkey on this device. Agent-issued links require administrator approval after registration.', '请在这台设备创建通行密钥。通过 Agent 发起的登记需要管理员批准后才会生效。'],
   enroll: ['Register passkey', '注册通行密钥'],
   enrolled: ['Passkey registered. You can close this page.', '通行密钥已注册，可以关闭此页面。'],
+  enrollment_pending: ['Passkey created. It will be active after administrator approval. Send this review link to the administrator.', '通行密钥已创建，管理员批准后才会生效。请将下面的审阅链接发给管理员。'],
+  enrollment_review_link: ['Administrator review link', '管理员审阅链接'],
   working: ['Waiting for your passkey…', '等待通行密钥验证…'],
   unsupported: ['This browser does not support passkeys.', '此浏览器不支持通行密钥。'],
   failed: ['Not done: ', '未完成：'],
@@ -49,6 +60,9 @@ const ERRORS = {
   verification_failed: ['The passkey could not be verified.', '通行密钥验证失败。'],
   not_enrolled: ['Nobody who can decide this has registered a passkey.', '可以决定此请求的人还没有注册通行密钥。'],
   invalid_enrollment_code: ['This link is invalid, expired or already used.', '此链接无效、已过期或已被使用。'],
+  administrator_passkey_required: ['The administrator must register their own passkey first.', '管理员需要先登记自己的通行密钥。'],
+  enrollment_member_unavailable: ['The member or requesting Agent is no longer eligible.', '成员或发起登记的 Agent 已不符合条件。'],
+  passkey_already_registered: ['This passkey was already submitted. Use the existing registration request.', '这个通行密钥已提交，请使用之前的登记请求。'],
   too_many_passkeys: ['Too many passkeys are registered already.', '已注册的通行密钥过多。'],
   rate_limited: ['Too many attempts. Try again in a few minutes.', '尝试次数过多，请几分钟后再试。'],
   wrong_origin: ['Open this page at the address your administrator configured.', '请通过管理员配置的地址打开此页面。'],
@@ -156,15 +170,30 @@ function row(list, label, value) {
 }
 
 function showRequest(request) {
+  clearTimeout(requestTimer);
   redraw = () => showRequest(request);
   const identity = (id) => {
     return request.names?.[id] || id;
   };
   app.replaceChildren();
   const open = request.status === 'pending' || request.status === 'approved';
-  el(app, 'h1', t('title_' + request.status));
-  el(app, 'p', t(request.status === 'pending' ? 'hint_pending' : request.status === 'approved' ? 'hint_approved'
-    : request.status === 'used' ? 'hint_used' : 'hint_gone'), 'muted');
+  const status = request.automatic && request.status === 'used'
+    ? (!request.outcome ? 'running' : request.outcome === 'ok' ? 'succeeded'
+      : request.outcome === 'execution_unknown' ? 'execution_unknown' : request.outcome === 'configuration_changed' ? 'cancelled' : 'failed')
+    : request.status;
+  el(app, 'h1', t(request.enrollment && status === 'pending' ? 'title_member_review' : 'title_' + status));
+  const hint = request.outcome === 'previous_version' ? 'hint_previous_version'
+    : status === 'pending' ? (request.enrollment ? 'hint_member_review' : 'hint_pending')
+    : status === 'approved' ? 'hint_approved'
+    : status === 'running' ? 'hint_running' : status === 'execution_unknown' ? 'hint_unknown'
+    : status === 'used' ? 'hint_used' : ['succeeded', 'failed'].includes(status) ? null : 'hint_gone';
+  if (hint) el(app, 'p', t(hint), 'muted');
+  if (request.automatic && ['approved', 'running'].includes(status)) {
+    requestTimer = setTimeout(async () => {
+      try { showRequest(await api('request/' + encodeURIComponent(request.id))); }
+      catch { /* A temporary network failure can be checked by reloading. */ }
+    }, 800);
+  }
 
   const facts = el(el(app, 'div', undefined, 'card'), 'dl');
   row(facts, t('requested_by'), request.client);
@@ -174,7 +203,20 @@ function showRequest(request) {
   if (request.status === 'pending') row(facts, t('decides'), request.approvers.map(identity).join(', '));
   if (open) row(facts, t('until'), new Date(request.expires * 1000).toLocaleString(ZH ? 'zh-CN' : 'en'));
   row(facts, t('decided_by'), request.decided_by ? identity(request.decided_by) : null);
-  row(facts, t('outcome'), request.outcome);
+  const outcomes = {
+    ok: ['Completed', '已完成'],
+    tool_error: ['The upstream tool reported an error.', '服务端工具返回错误。'],
+    upstream_unavailable: ['The upstream service was unavailable.', '服务端暂不可用。'],
+    upstream_rejected: ['The upstream service rejected the request.', '服务端拒绝了请求。'],
+    execution_unknown: ['The upstream did not confirm an outcome.', '服务端未确认执行结果。'],
+    previous_version: ['This request predates the current gateway version.', '此请求来自旧版本。'],
+    configuration_changed: ['The connection, authorization or tool changed.', '连接、权限或工具已变化。'],
+    approver_key_revoked: ['The approving passkey was revoked.', '批准此请求的通行密钥已被撤销。'],
+    enrollment_member_unavailable: ['The member or requesting Agent is no longer eligible.', '成员或发起登记的 Agent 已不符合条件。'],
+    too_many_passkeys: ['The member already has the maximum number of passkeys.', '成员的通行密钥数量已达上限。'],
+    passkey_already_registered: ['This passkey was already registered.', '这个通行密钥已注册。'],
+  };
+  row(facts, t('outcome'), outcomes[request.outcome]?.[ZH ? 1 : 0] || request.outcome);
 
   const content = el(app, 'div', undefined, 'card');
   el(content, 'p', t('arguments'), 'muted');
@@ -198,11 +240,16 @@ function showEnrollment(code) {
   el(app, 'p', t('enroll_hint'), 'muted');
   const actions = el(app, 'div', undefined, 'actions');
   act(actions, t('enroll'), 'go', async () => {
-    await passkey('enroll', code);
+    const result = await passkey('enroll', code);
     redraw = () => {
       app.replaceChildren();
       el(app, 'h1', t('enroll_title'));
-      el(app, 'p', t('enrolled'), 'notice ok');
+      el(app, 'p', t(result.pending ? 'enrollment_pending' : 'enrolled'), 'notice ok');
+      if (result.pending) {
+        const link = el(app, 'a', t('enrollment_review_link'));
+        link.href = result.approval_url;
+        el(app, 'p', result.approval_url);
+      }
     };
     redraw();
   });

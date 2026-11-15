@@ -521,6 +521,16 @@ function members() {
     });
     if (member.id !== state.owner) button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove member?', '移除此成员？'), identityLabel(member.id), async () => mutate('members/remove', {id: member.id})), 'danger');
   }
+  if (state.passkey_reviews?.length) {
+    const pending = el(app, 'section', undefined, 'card');
+    el(pending, 'h2', tr('Passkeys awaiting approval', '等待批准的通行密钥'));
+    for (const request of state.passkey_reviews) {
+      const row = el(pending, 'div', undefined, 'row between');
+      el(row, 'span', identityLabel(request.member) + ' · ' + request.agent);
+      const link = el(row, 'a', tr('Review registration', '审阅登记'));
+      link.href = request.url;
+    }
+  }
   const card = el(app, 'section', undefined, 'card'); el(card, 'h2', tr('Registered passkeys', '已注册的通行密钥'));
   for (const key of state.passkeys) {
     const row = el(card, 'div', undefined, 'row between'); el(row, 'span', identityLabel(key.principal) + ' · ' + key.id.slice(0, 12) + ' · ' + new Date(key.created * 1000).toLocaleDateString());
@@ -1179,6 +1189,12 @@ function accessSummary(parent, conn, client) {
     el(modes, 'span', read);
     if (scope === 'read_write' && otherWrites) el(modes, 'span', write);
   }
+  if (conn.mailbox_access && scope !== 'none') {
+    const count = conn.mailbox_access[client]?.length;
+    el(parent, 'small', conn.kind === 'gmail'
+      ? (count ? tr(`${count} selected labels`, `仅 ${count} 个所选标签`) : tr('All labels', '所有标签'))
+      : (count ? tr(`${count} selected folders`, `仅 ${count} 个所选文件夹`) : tr('All folders', '所有文件夹')));
+  }
   if (send) el(parent, 'small', tr('Send: ', '发信：') + (mailSendChoices().find(([value]) => value === send)?.[1] || tr('Custom', '自定义')));
   if (conn.tools.some(tool => tool.permissions[client] === 'approval_required')) {
     const approver = conn.approver === conn.household ? tr('Any group member', '群组内任意成员') : nameOf(conn.approver);
@@ -1192,6 +1208,7 @@ function mailboxPathEditor(parent, conn, client) {
   const mode = select(parent, gmail ? tr('Gmail labels', 'Gmail 标签') : tr('Mailbox folders', '邮箱文件夹'), 'mailbox_paths_mode',
     [['all', gmail ? tr('All labels', '所有标签') : tr('All folders', '所有文件夹')],
      ['selected', gmail ? tr('Selected labels', '仅所选标签') : tr('Selected folders', '仅所选文件夹')]], old ? 'selected' : 'all');
+  const disabledHint = el(parent, 'small', tr('Choose read or read and write above to set the mailbox scope.', '先在上方选择只读或读写，即可设置邮箱范围。'), 'muted');
   const optional = el(parent, 'div');
   const list = el(optional, 'div', undefined, 'mailbox-paths');
   let loaded = false, loading = false;
@@ -1220,14 +1237,15 @@ function mailboxPathEditor(parent, conn, client) {
   el(optional, 'small', gmail ? tr('A message is accessible if it has any selected label. Trash and restore require access to all labels.', '邮件带有任一所选标签即可访问。移入或移出废纸篓需要访问所有标签。') :
     tr('Select each folder explicitly, including subfolders. Moving mail requires access to both folders.', '请逐一勾选文件夹和子文件夹。移动邮件需要源和目标文件夹都有权限。'), 'muted');
   function refreshMode() {
-    optional.hidden = mode.value !== 'selected';
-    if (!parent.hidden && !optional.hidden) void load();
+    disabledHint.hidden = !mode.disabled;
+    optional.hidden = mode.disabled || mode.value !== 'selected';
+    if (!optional.hidden) void load();
   }
   mode.addEventListener('change', refreshMode);
   return {
-    visibility(show) { parent.hidden = !show; refreshMode(); },
+    visibility(show) { mode.disabled = !show; refreshMode(); },
     selection() {
-      if (parent.hidden) return {};
+      if (mode.disabled) return {};
       if (mode.value === 'all') return old ? {mailbox_paths: null} : {};
       if (!selected.size || selected.size > 512) throw new Error(tr(...messages.invalid_mailbox_paths));
       const paths = [...selected].sort();
@@ -1275,7 +1293,7 @@ function permissionEditor(id, client) {
     if (writes) options.push(['read_write', tr('Read and write', '读写')]);
     if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
     const mode = select(card, tr('Connection access', '连接权限'), 'connection_access', options, scope);
-    const mailboxPaths = conn.mailbox_access ? mailboxPathEditor(el(card, 'div'), conn, client) : null;
+    const mailboxPaths = conn.mailbox_access ? mailboxPathEditor(el(card, 'section', undefined, 'mailbox-scope'), conn, client) : null;
     if (!writes && !(conn.available_tools || []).some(t => t.access === 'write')) el(card, 'p', tr('This connector only provides read operations.', '此连接器只提供读取操作，不支持写入。'), 'muted');
     const approvalFields = el(card, 'div', undefined, 'form-grid');
     const readSettings = el(approvalFields, 'div'), writeSettings = el(approvalFields, 'div');

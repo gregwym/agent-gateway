@@ -11,10 +11,11 @@ import json
 import sqlite3
 
 import anyio
+from mcp import MCPError
 import httpx2
 import pytest
 from helpers import TOKEN_A, TOKEN_B, TOKEN_HOUSE, agent, prepare, running_gateway, text_of, write_config
-from passkey_helpers import ORIGIN, TOKEN_A2, Authenticator, Page, approval_config, request_id_in
+from passkey_helpers import ORIGIN, TOKEN_A2, Authenticator, Page, approval_config, request_id_in, wait_for_approval
 
 from agent_gateway import passkey
 from agent_gateway.approval import NOT_EXECUTED
@@ -37,9 +38,11 @@ async def test_a_call_runs_once_after_its_owner_approves_it(tmp_path):
         async with agent(gw.url, TOKEN_A) as a:
             first = await a.call_tool("a_add_note", NOTE)
             assert first.is_error and text_of(first).startswith(NOT_EXECUTED)
-            assert "person_a" in text_of(first) and "same arguments" in text_of(first)
+            assert "person_a" in text_of(first) and "Do not resubmit" in text_of(first)
             request_id = request_id_in(text_of(first))
-            assert f"{ORIGIN}/approvals/r/{request_id}" in text_of(first)
+            assert first.structured_content == {"status": "pending", "request_id": request_id,
+                                                "approval_url": f"{ORIGIN}/approvals/r/{request_id}"}
+            assert (await wait_for_approval(a, request_id, 0)).structured_content["status"] == "pending"
             # Asking again does not create a second request and does not run anything.
             again = await a.call_tool("a_add_note", NOTE)
             assert again.is_error and request_id_in(text_of(again)) == request_id
@@ -57,10 +60,11 @@ async def test_a_call_runs_once_after_its_owner_approves_it(tmp_path):
             assert status == 200 and result["request"]["status"] == "approved"
             assert result["request"]["decided_by"] == "person_a"
 
-            assert text_of(await a.call_tool("a_add_note", NOTE)) == "added"
-            # The approval is spent: the same call again is a new request for a new decision.
+            result = await wait_for_approval(a, request_id)
+            assert result.structured_content["status"] == "succeeded" and result.content[1].text == "added"
+            # Retrying an identical action finds the existing request, without submitting another write.
             replay = await a.call_tool("a_add_note", NOTE)
-            assert replay.is_error and request_id_in(text_of(replay)) != request_id
+            assert replay.is_error and replay.structured_content["request_id"] == request_id
             assert (await notes(a)).count("buy milk") == 1
 
         status, shown = await page.view(request_id)
@@ -73,6 +77,7 @@ async def test_a_call_runs_once_after_its_owner_approves_it(tmp_path):
             ("tool_call", "deny", "approval:pending"),
             ("approval_decided", "approve", None),
             ("tool_call", "allow", "approved"),
+            ("tool_call", "deny", "approval:submitted"),
         ]
         decided = next(e for e in gw.audit() if e["event"] == "approval_decided")
         assert (decided["approver"], decided["tool"], decided["account"]) == ("person_a", "a_add_note", "person_a")
@@ -97,9 +102,9 @@ async def test_an_approval_is_only_for_the_exact_arguments_and_the_client_that_a
             # Another client of the same person cannot spend it either.
             other = await a2.call_tool("a_add_note", NOTE)
             assert other.is_error and request_id_in(text_of(other)) != request_id
-            assert "buy milk" not in await notes(a)
-
-            assert text_of(await a.call_tool("a_add_note", NOTE)) == "added"  # still there for the call it was for
+            with pytest.raises(MCPError, match="Unknown approval request"):
+                await wait_for_approval(a2, request_id, 0)
+            assert (await wait_for_approval(a, request_id)).content[1].text == "added"
             assert (await notes(a)).count("buy milk") == 1 and "wire" not in await notes(a)
 
 
@@ -129,7 +134,7 @@ async def test_only_the_account_owner_can_decide_and_only_with_user_verification
             assert "buy milk" not in await notes(a)
 
             assert (await page.decide("approve", request_id, key_a))[0] == 200
-            assert text_of(await a.call_tool("a_add_note", NOTE)) == "added"
+            assert (await wait_for_approval(a, request_id)).content[1].text == "added"
 
 
 async def test_either_person_can_decide_for_a_shared_account(tmp_path):
@@ -144,13 +149,27 @@ async def test_either_person_can_decide_for_a_shared_account(tmp_path):
             assert (await page.view(request_id))[1]["approvers"] == ["person_a", "person_b"]
             status, result = await page.decide("approve", request_id, key_b)
             assert status == 200 and result["request"]["decided_by"] == "person_b"
-            assert text_of(await shared.call_tool("house_add_note", NOTE)) == "added"
+            assert (await wait_for_approval(shared, request_id)).content[1].text == "added"
         async with agent(gw.url, TOKEN_B) as b:
             # Same tool and arguments from another client: its own request, not the spent one.
             assert request_id_in(text_of(await b.call_tool("house_add_note", NOTE))) != request_id
 
 
-async def test_declined_and_withdrawn_requests_never_run(tmp_path):
+def defer_dispatch(monkeypatch):
+    from agent_gateway.approval_dispatch import ApprovalDispatcher
+    start = anyio.Event()
+    execute = ApprovalDispatcher._execute
+
+    async def paused(self, request_id):
+        await start.wait()
+        await execute(self, request_id)
+
+    monkeypatch.setattr(ApprovalDispatcher, "_execute", paused)
+    return start
+
+
+async def test_declined_and_withdrawn_requests_never_run(tmp_path, monkeypatch):
+    start = defer_dispatch(monkeypatch)
     async with running_gateway(await prepare(tmp_path, approval_config())) as gw:
         page = Page(gw.base)
         key_a = await page.enroll(gw.gateway, "person_a")
@@ -171,6 +190,9 @@ async def test_declined_and_withdrawn_requests_never_run(tmp_path):
             after = await a.call_tool("a_add_note", other)
             assert after.is_error and request_id_in(text_of(after)) != withdrawn
 
+            start.set()
+            assert (await wait_for_approval(a, withdrawn)).structured_content["status"] == "cancelled"
+            assert (await wait_for_approval(a, declined)).structured_content["status"] == "denied"
             listing = await notes(a)
             assert "buy milk" not in listing and "second thoughts" not in listing
         decisions = [e["decision"] for e in gw.audit() if e["event"] == "approval_decided"]
@@ -178,6 +200,7 @@ async def test_declined_and_withdrawn_requests_never_run(tmp_path):
 
 
 async def test_requests_and_approvals_expire(tmp_path, monkeypatch):
+    defer_dispatch(monkeypatch)
     clock = [1_800_000_000]
     monkeypatch.setattr(passkey, "_now", lambda: clock[0])
     raw = approval_config(request_ttl_seconds=600, grant_ttl_seconds=120)
@@ -191,7 +214,7 @@ async def test_requests_and_approvals_expire(tmp_path, monkeypatch):
             assert (await page.decide("approve", stale, key_a)) == (403, {"error": "stale_request"})
             assert (await page.view(stale))[1]["status"] == "expired"
 
-            # Approved, but the agent came back too late.
+            # Approved, but the gateway could not start execution before the grant expired.
             late = request_id_in(text_of(await a.call_tool("a_add_note", NOTE)))
             assert late != stale
             assert (await page.decide("approve", late, key_a))[0] == 200
@@ -230,7 +253,7 @@ async def test_a_passkey_answer_cannot_be_replayed_or_moved_to_another_request(t
             key_a.counter -= 2
             assert (await page.decide("approve", big, key_a)) == (403, {"error": "verification_failed"})
 
-            assert text_of(await a.call_tool("a_add_note", NOTE)) == "added"
+            assert (await wait_for_approval(a, small)).content[1].text == "added"
             assert "wire" not in await notes(a)
 
 
@@ -279,12 +302,12 @@ async def test_two_simultaneous_calls_cannot_both_spend_one_approval(tmp_path):
 
             async def call() -> None:
                 async with agent(gw.url, TOKEN_A) as client:
-                    results.append(await client.call_tool("a_add_note", NOTE))
+                    results.append(await wait_for_approval(client, request_id))
 
             async with anyio.create_task_group() as tg:
                 for _ in range(6):
                     tg.start_soon(call)
-            assert sorted(bool(r.is_error) for r in results) == [False, True, True, True, True, True]
+            assert all(r.structured_content["status"] == "succeeded" and r.content[1].text == "added" for r in results)
             assert (await notes(a)).count("buy milk") == 1
 
 
@@ -298,14 +321,15 @@ async def test_an_approval_is_spent_even_when_the_upstream_fails(tmp_path):
         async with agent(gw.url, TOKEN_A) as a:
             request_id = request_id_in(text_of(await a.call_tool("a_crash", {})))
             assert (await page.decide("approve", request_id, key_a))[0] == 200
-            failed = await a.call_tool("a_crash", {})
-            assert failed.is_error and text_of(failed) == "The upstream service is currently unavailable."
+            failed = await wait_for_approval(a, request_id)
+            assert failed.structured_content["status"] == "execution_unknown"
+            assert failed.content[1].text == "The upstream service is currently unavailable."
             status, shown = await page.view(request_id)
-            assert (shown["status"], shown["outcome"]) == ("used", "upstream_unavailable")
-            # No automatic retry of something that may have happened: it needs a new decision.
+            assert (shown["status"], shown["outcome"]) == ("used", "execution_unknown")
+            # No automatic retry of something that may have happened.
             await gw.connected("notes-a")
             again = await a.call_tool("a_crash", {})
-            assert again.is_error and request_id_in(text_of(again)) != request_id
+            assert again.is_error and again.structured_content["request_id"] == request_id
 
 
 async def test_nothing_waits_when_nobody_could_decide_and_requests_are_bounded(tmp_path):
@@ -446,3 +470,44 @@ async def test_admin_commands(tmp_path, capsys):
 
     assert agw(["check", *config]) == 0
     assert "each call needs a passkey approval by person_a" in capsys.readouterr().out
+
+
+async def test_restart_resumes_unclaimed_approval_but_does_not_replay_a_claim(tmp_path, monkeypatch):
+    path = await prepare(tmp_path, approval_config())
+    with monkeypatch.context() as suspended:
+        defer_dispatch(suspended)
+        async with running_gateway(path) as gw:
+            page = Page(gw.base)
+            key = await page.enroll(gw.gateway, "person_a")
+            async with agent(gw.url, TOKEN_A) as client:
+                first = request_id_in(text_of(await client.call_tool("a_add_note", NOTE)))
+                second = request_id_in(text_of(await client.call_tool("a_add_note", {**NOTE, "text": "possibly written"})))
+                assert (await page.decide("approve", first, key))[0] == 200
+                assert (await page.decide("approve", second, key))[0] == 200
+                assert gw.gateway.approver.claim_dispatch(second)["id"] == second
+                assert "buy milk" not in await notes(client)
+    async with running_gateway(path) as gw:
+        async with agent(gw.url, TOKEN_A) as client:
+            assert (await wait_for_approval(client, first)).content[1].text == "added"
+            assert (await wait_for_approval(client, second)).structured_content["status"] == "execution_unknown"
+            assert "possibly written" not in await notes(client)
+            assert (await notes(client)).count("buy milk") == 1
+
+
+async def test_waiting_for_approval_does_not_block_an_admin_permission_change(tmp_path):
+    from test_admin import change, setup, web_gateway
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        key, _ = await setup(http, origin, path)
+        async with agent(origin + "/mcp", TOKEN_A) as client:
+            request_id = request_id_in(text_of(await client.call_tool("a_add_note", NOTE)))
+            waiting = []
+            async def wait():
+                waiting.append(await wait_for_approval(client, request_id))
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(wait)
+                await anyio.wait_all_tasks_blocked()
+                with anyio.fail_after(5):
+                    changed = await change(http, "permissions/connection", client="agent-a", connection="notes-a", access="none")
+                assert changed.status_code == 200
+            assert waiting[0].structured_content["status"] == "cancelled"
+            assert await Page(origin, origin).decide("approve", request_id, key, origin=origin) == (403, {"error": "stale_request"})

@@ -1,8 +1,6 @@
 """Connection presets enforce reads/writes and delegated, one-use approvals."""
 import pytest
-from dataclasses import replace
 
-from agent_gateway.approval import ApprovalRequest, arguments_digest
 from agent_gateway.admin_config import tool_access
 from agent_gateway.config import ConnectionCfg, ToolCfg
 from helpers import TOKEN_A, TOKEN_HOUSE
@@ -10,6 +8,11 @@ from passkey_helpers import Authenticator, Page, request_id_in
 from test_admin import admin_post, change, rpc, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
+
+
+async def wait(origin, token, request_id):
+    reply = await rpc(origin, token, 'tools/call', {'name': 'gateway_wait_for_approval', 'arguments': {'request_id': request_id}})
+    return reply.json()['result']['structuredContent']
 
 
 async def enroll(http, origin, member):
@@ -84,8 +87,8 @@ async def test_read_approval_is_independent_of_write_approval(tmp_path):
         pending = (await rpc(origin, TOKEN_HOUSE, 'tools/call', read)).json()
         request_id = request_id_in(pending['result']['content'][0]['text'])
         assert (await page.decide('approve', request_id, owner, origin=origin))[0] == 200
-        assert not (await rpc(origin, TOKEN_HOUSE, 'tools/call', read)).json()['result'].get('isError')
-        again = (await rpc(origin, TOKEN_HOUSE, 'tools/call', read)).json()
+        assert (await wait(origin, TOKEN_HOUSE, request_id))['status'] == 'succeeded'
+        again = (await rpc(origin, TOKEN_HOUSE, 'tools/call', {**read, 'arguments': {'folder': 'family'}})).json()
         assert request_id_in(again['result']['content'][0]['text']) != request_id
         write = {'name': 'a_add_note', 'arguments': {'folder': 'inbox', 'text': 'independently controlled writes'}}
         assert (await rpc(origin, TOKEN_HOUSE, 'tools/call', write)).json()['error']['code'] == -32602
@@ -114,24 +117,23 @@ async def test_delegate_approval_to_member_or_household_without_changing_owner(t
         conn = next(c for c in (await state(http))['connections'] if c['id'] == 'notes-a')
         assert conn['owner'] == 'person_a' and conn['approvers'] == ['person_b'] and conn['access']['shared-agent'] == 'read_write'
         assert (await change(http, 'members/remove', id='person_b')).json()['error'] == 'member_is_approver'
-        args = {'folder': 'inbox', 'text': 'delegated write'}
         page = Page(origin, origin)
-        async def request():
+        async def request(text):
+            args = {'folder': 'inbox', 'text': text}
             reply = (await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name': 'a_add_note', 'arguments': args})).json()
             return request_id_in(reply['result']['content'][0]['text'])
-        pending = await request()
+        pending = await request("delegated write")
         assert (await page.decide('approve', pending, owner, origin=origin))[0] == 403
         assert (await page.decide('approve', pending, delegate, origin=origin))[0] == 200
-        result = (await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name': 'a_add_note', 'arguments': args})).json()
-        assert not result['result'].get('isError')
-        second = await request()
+        assert (await wait(origin, TOKEN_HOUSE, pending))['status'] == 'succeeded'
+        second = await request("another delegated write")
         assert second != pending
         assert (await change(http, 'permissions/connection', client='shared-agent', connection='notes-a', access='read_write', approver='household')).status_code == 200
         assert (await page.view(second))[1]['status'] == 'cancelled'
-        third = await request()
+        third = await request("another delegated write")
         assert set((await page.view(third))[1]['approvers']) == {'person_a', 'person_b'}
         assert (await page.decide('approve', third, owner, origin=origin))[0] == 200
-        assert not (await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name': 'a_add_note', 'arguments': args})).json()['result'].get('isError')
+        assert (await wait(origin, TOKEN_HOUSE, third))['status'] == 'succeeded'
         assert (await change(http, 'permissions/connection', client='shared-agent', connection='notes-a', access='read_write', approver='missing')).json()['error'] == 'invalid_connection_approver'
         # Editing the connector must preserve its independent approval authority.
         preview = await change(http, 'connections/preview', id='notes-a', kind='demo', owner='person_a')
@@ -147,19 +149,24 @@ def test_custom_tools_are_not_assumed_readonly():
     assert tool_access(conn, ToolCfg(name='reviewed_read', upstream='fetch', access='read')) == 'read'
 
 
-async def test_changing_authority_invalidates_a_grant_even_without_web_revision(tmp_path):
+async def test_changing_authority_invalidates_a_grant_even_without_web_revision(tmp_path, monkeypatch):
+    from test_passkey import defer_dispatch
+    start = defer_dispatch(monkeypatch)
     async with web_gateway(tmp_path) as (gw, http, origin, path):
         owner, _ = await setup(http, origin, path)
         await enroll(http, origin, 'person_b')
         args = {'folder': 'inbox', 'text': 'authority must still match'}
-        request = ApprovalRequest(principal='household', client_id='shared-agent', tool='a_add_note',
-            connection='notes-a', service='notes', account='person_a', upstream_tool='add_note',
-            arguments=args, arguments_sha256=arguments_digest(args), owner='person_a', approvers=('person_a',))
-        approver = gw.app.state.runtime.gateway.approver
-        first = await approver.authorize(request)
+        call = {'name': 'a_add_note', 'arguments': args}
+        first = (await rpc(origin, TOKEN_A, 'tools/call', call)).json()['result']['structuredContent']['request_id']
         page = Page(origin, origin)
-        assert (await page.decide('approve', first.approval_id, owner, origin=origin))[0] == 200
-        second = await approver.authorize(replace(request, approvers=('person_b',)))
-        assert not second.approved and second.approval_id != first.approval_id
-        assert (await page.view(first.approval_id))[1]['status'] == 'cancelled'
-        assert (await page.view(second.approval_id))[1]['approvers'] == ['person_b']
+        assert (await page.decide('approve', first, owner, origin=origin))[0] == 200
+        # Simulate a host-side approval authority change without a web revision.
+        live = gw.app.state.runtime.gateway
+        monkeypatch.setattr(type(live.cfg), "approvers_of", lambda self, conn: ("person_b",))
+        start.set()
+        assert (await wait(origin, TOKEN_A, first))['status'] == 'cancelled'
+        second = (await rpc(origin, TOKEN_A, 'tools/call', call)).json()['result']['structuredContent']['request_id']
+        assert second != first
+        assert (await page.view(second))[1]['approvers'] == ['person_b']
+        notes = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'a_list_notes', 'arguments': {'folder': 'inbox'}})).json()
+        assert args['text'] not in str(notes)

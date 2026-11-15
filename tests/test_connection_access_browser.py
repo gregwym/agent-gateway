@@ -90,8 +90,9 @@ async def test_agent_rename_simple_permissions_and_household_approval(tmp_path, 
         await page.goto(origin + '/approvals/r/' + request_id)
         await playwright.expect(page.locator('dl')).to_contain_text('openclaw')
         await page.get_by_role('button', name=t('Approve with passkey', '用通行密钥批准'), exact=True).click()
-        await playwright.expect(page.locator('h1')).to_have_text(t('Approved', '已批准'))
-        assert not (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'a_add_note', 'arguments': args})).json()['result'].get('isError')
+        waited = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'gateway_wait_for_approval', 'arguments': {'request_id': request_id}})).json()
+        assert waited['result']['structuredContent']['status'] == 'succeeded'
+        await playwright.expect(page.locator('h1')).to_have_text(t('Completed', '已完成'))
         # IMAP exposes real write tools, but read-only access still hides write approval.
         await page.goto(origin + '/admin/')
         await page.get_by_role('link', name=t('Permissions', '权限'), exact=True).click()

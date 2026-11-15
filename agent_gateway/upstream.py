@@ -41,14 +41,16 @@ _MAX_LIST_PAGES = 50
 class UpstreamError(Exception):
     """`reason` is a short code for the audit log; `public` is safe to show an agent."""
 
-    def __init__(self, reason: str, public: str) -> None:
+    def __init__(self, reason: str, public: str, *, execution_uncertain=False) -> None:
         super().__init__(reason)
         self.reason = reason
         self.public = public
+        self.execution_uncertain = execution_uncertain
 
 
-def _unavailable() -> UpstreamError:
-    return UpstreamError("upstream_unavailable", "The upstream service is currently unavailable.")
+def _unavailable(*, execution_uncertain=False) -> UpstreamError:
+    return UpstreamError("upstream_unavailable", "The upstream service is currently unavailable.",
+                         execution_uncertain=execution_uncertain)
 
 
 def http_client(**kwargs):
@@ -216,7 +218,7 @@ class Upstream:
         except MCPError as exc:
             if exc.code == types.CONNECTION_CLOSED:
                 self._broken.set()
-                raise _unavailable() from None
+                raise _unavailable(execution_uncertain=True) from None
             if exc.code == types.REQUEST_TIMEOUT:
                 raise UpstreamError("upstream_timeout", "The upstream service did not answer in time.") from None
             # A protocol-level refusal of this one request. Its text is not forwarded:
@@ -226,12 +228,12 @@ class Upstream:
             raise UpstreamError("upstream_timeout", "The upstream service did not answer in time.") from None
         except (RuntimeError, ValueError):
             if self._client is not client:  # the connection went away underneath this call
-                raise _unavailable() from None
+                raise _unavailable(execution_uncertain=True) from None
             # The SDK's verdict that the reply does not match the tool's own output schema.
             raise UpstreamError("upstream_invalid_reply", "The upstream service returned an invalid reply.") from None
         except Exception:
             self._broken.set()
-            raise _unavailable() from None
+            raise _unavailable(execution_uncertain=True) from None
 
 
 def _class_name(exc: BaseException) -> str:

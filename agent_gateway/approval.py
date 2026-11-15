@@ -1,10 +1,7 @@
-"""Approval interface: the boundary between the gateway core and whoever decides.
+"""Bind a human approval to one exact upstream call.
 
-The core knows three things: a tool whose policy effect is `approval_required`
-must be authorised by an `Approver` right before the upstream call, the request
-it hands over describes the exact call that would be made, and the approver is
-told afterwards what happened. Everything else (where requests wait, how a
-person is asked, what proves their decision) belongs to the approver.
+The built-in Passkey approver queues the call for dispatch after approval. The
+Gateway rechecks the current authorization when dispatching the saved call.
 
 Two approvers exist. `DenyAllApprover` is the default and refuses everything.
 `passkey.PasskeyApprover` is used when the config has an `approvals:` section.
@@ -55,6 +52,8 @@ class ApprovalRequest:
     # The people allowed to decide, resolved from the connection's approval setting.
     approvers: tuple[str, ...] = ()
     configuration_revision: str = ""
+    client_token_sha256: str = field(default="", repr=False)
+    target_sha256: str = ""
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     created_at: float = field(default_factory=time.time)
     ttl_seconds: int = 300
@@ -77,6 +76,8 @@ class ApprovalRequest:
                     "account": self.account,
                     "upstream_tool": self.upstream_tool,
                     "arguments_sha256": self.arguments_sha256,
+                    **({"target_sha256": self.target_sha256} if self.target_sha256 else {}),
+                    **({"client_token_sha256": self.client_token_sha256} if self.client_token_sha256 else {}),
                     **({"configuration_revision": self.configuration_revision} if self.configuration_revision else {}),
                 }
             )

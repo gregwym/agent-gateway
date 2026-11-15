@@ -98,14 +98,15 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 approved, detail = await page.decide('approve', request_id, key, origin=origin)
                 assert approved == 200, detail
                 different = await send({**args, 'to': ['different@example.test']})
-                assert request_id_in(different['content'][0]['text']) != request_id and not messages
-                sent = await send(args)
-                assert not sent.get('isError')
-                outcome = json.loads(sent['content'][0]['text'])
+                assert request_id_in(different['content'][0]['text']) != request_id
+                sent = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'gateway_wait_for_approval',
+                                  'arguments': {'request_id': request_id}})).json()['result']
+                assert sent['structuredContent']['status'] == 'succeeded'
+                outcome = json.loads(sent['content'][1]['text'])
                 assert outcome['results'] == [{'recipient': 'ok@example.test', 'status': 'accepted'}]
                 assert len(messages) == 1
                 repeat = await send(args)
-                assert request_id_in(repeat['content'][0]['text']) != request_id and len(messages) == 1
+                assert repeat['structuredContent']['request_id'] == request_id and len(messages) == 1
 
                 updated = await change(http, 'permissions/connection', client='agent-a', connection=conn['id'],
                                        access='read_write_direct')
