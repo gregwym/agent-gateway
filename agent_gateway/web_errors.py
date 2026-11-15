@@ -69,7 +69,7 @@ def probe_error(kind, result):
     # Compare only fixed errors from bundled connectors. A remote helper's free
     # text may echo credentials, so an unrecognized response is never displayed.
     allowed = {"imap_credentials_rejected", "imap_server_unreachable", "caldav_credentials_rejected",
-               "gmail_authorization_rejected", "connector_timeout", "connector_tls_failed", "connector_dns_failed",
+               "gmail_authorization_rejected", "gmail_readonly_required", "gmail_scope_mismatch", "connector_timeout", "connector_tls_failed", "connector_dns_failed",
                "connector_network_failed", "connector_internal_error", "smtp_credentials_rejected", "smtp_not_configured",
                "smtp_invalid_security", "smtp_invalid_address", "smtp_tls_failed", "smtp_dns_failed", "smtp_not_supported",
                "smtp_request_rejected", "smtp_unreachable"}

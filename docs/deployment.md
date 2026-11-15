@@ -93,7 +93,7 @@ MagicDNS 和 HTTPS 证书；ACL 里放行的端口相应改成 `tcp:443`。经�
 全部录入后才能 `lock`：`lock` 会启动每个 Connector 列出工具，缺 secret 时启动不了。Connector 在第一次被调用时才登录上游，
 所以凭据是否正确要到第一次调用才知道。
 
-**只读的真实范围**（详见 [design.md](design.md) 7.3）：Gmail 的 Token 由 Google 强制只读。iCloud 的 App 专用密码
+**只读的真实范围**（详见 [design.md](design.md) 7.3）：Gmail 选择只读时，Token 由 Google 强制只读。iCloud 的 App 专用密码
 **没有只读版本**，它能收发邮件、改日历；只读靠 Gateway 仅开放已审阅的读取工具，读取工具使用 `EXAMINE` 和 `BODY.PEEK`，密码只存在 Gateway 主机上。
 
 ### 5.1 iCloud 邮件
@@ -414,12 +414,14 @@ admin:
 Google 回调失败也会显示管理页面。iCloud Mail 登录用户名通常是 `@icloud.com` 前的部分，也可尝试完整邮箱地址；
 密码须为 [Apple App 专用密码](https://support.apple.com/en-us/102654)，设置参见 [Apple 的 IMAP 说明](https://support.apple.com/en-us/102525)。
 
-Gmail 可直接点「通过 Google 授权」。在 Google Cloud 创建 **Web 应用** OAuth 客户端，把网页显示的
-`https://<网关域名>/admin/oauth/google/callback` 登记为重定向 URI。需要 `gmail.readonly`、离线授权和刷新令牌；
-服务端校验 scope、state、PKCE，并在审阅时显示已授权邮箱供核对。刷新令牌不会返回浏览器。
-也可以在网页录入已有刷新令牌；原来的 Desktop OAuth CLI 仍可用于 YAML 部署。
-Google Cloud 的测试用户/发布设置仍由账号所有者完成，相关限制见上面的 Gmail 一节和
-[Google 的 Web Server OAuth 文档](https://developers.google.com/identity/protocols/oauth2/web-server)。
+在「连接器 → 添加连接器」选择 **Gmail (Google OAuth)**。首次 [在 Google Cloud](https://console.cloud.google.com/auth/clients)
+启用 Gmail API，创建 **Web 应用** OAuth 客户端，登记网关显示的重定向 URI，再导入 Google 下载的客户端 JSON。
+选择「只读」（`gmail.readonly`）或「读取和发送」（`gmail.readonly` + `gmail.send`），然后点「通过 Google 授权」。
+OAuth 只决定网关能对 Gmail 做什么；到「权限」为各 Agent 单独授权。切回只读会移除发送工具和已有发送授权。
+刷新令牌由网关加密保存。手动录入和 Desktop OAuth CLI 仍可用于已有凭据。
+
+无法使用 OAuth 时，可选择「邮箱 (IMAP + SMTP) → Gmail」，填写完整邮箱和 [Google App 专用密码](https://support.google.com/mail/answer/185833)。
+Google 账号需要开启两步验证，部分账号不提供 App 专用密码。
 
 <a id="remote-mcp"></a>
 

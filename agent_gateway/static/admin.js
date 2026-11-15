@@ -183,6 +183,9 @@ const messages = {
   wrong_origin: ['Open the configured HTTPS address.', '请打开配置的 HTTPS 地址。'],
   oauth_declined: ['OAuth authorization was cancelled. No connector was changed.', 'OAuth 授权已取消，连接器未发生变更。'],
   oauth_failed: ['OAuth authorization failed. Check the web OAuth client and callback URL.', 'OAuth 授权失败，请检查网页 OAuth 客户端和回调地址。'],
+  gmail_access_invalid: ['Choose Read only or Read and send.', '请选择只读或读取和发送。'],
+  gmail_scope_mismatch: ['Google did not grant exactly the selected Gmail permissions. Authorize again and approve both read and send.', 'Google 授予的权限与所选范围不一致。请重新授权，并勾选读取和发送。'],
+  gmail_reauthorize_required: ['Authorize with Google again to change this client or its Gmail permissions.', '要更换客户端或 Gmail 权限，请重新通过 Google 授权。'],
   gmail_readonly_required: ['Google must grant exactly Gmail read-only access.', 'Google 必须只授予 Gmail 只读权限。'],
   oauth_expired: ['OAuth authorization expired. Start again.', 'OAuth 授权已过期，请重新开始。'],
   active_calls_busy: ['Calls are still running. No configuration was changed; try again shortly.', '仍有调用正在执行，配置未变更，请稍后重试。'],
@@ -629,6 +632,7 @@ function connectorDetails(id) {
     const remote = conn.kind === 'remote';
     content.replaceChildren();
     el(content, 'p', [serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email].filter(Boolean).join(' · '), 'muted');
+    if (conn.kind === 'gmail') el(content, 'p', conn.settings.gmail_access === 'read_send' ? tr('Google access: Read and send', 'Google 授权：读取和发送') : tr('Google access: Read only', 'Google 授权：只读'), 'muted');
     if (conn.mailbox?.aliases?.length) el(content, 'p', tr('Aliases: ', '邮箱别名：') + conn.mailbox.aliases.join(', '), 'muted');
     connectionStatus(content, conn);
     if (conn.kind === 'demo') el(content, 'p', tr('Demo notes reset on restart.', '模拟笔记在重启后清空。'), 'muted');
@@ -734,6 +738,70 @@ function registryPicker(onSelect) {
   query.focus();
 }
 
+function gmailSettings(parent, existing) {
+  const settings = {}, credentials = {};
+  settings.gmail_access = select(parent, tr('Google permissions', 'Google 权限'), 'gmail_access', [
+    ['read', tr('Read only', '只读')],
+    ['read_send', tr('Read and send', '读取和发送')],
+  ], existing?.settings.gmail_access || 'read');
+  const permissions = el(parent, 'small', '', 'gmail-scope-note');
+  function scopeNote() {
+    permissions.textContent = settings.gmail_access.value === 'read_send'
+      ? tr('gmail.readonly + gmail.send · Agent access is managed separately.', 'gmail.readonly + gmail.send · Agent 的权限仍在「权限」里配置。')
+      : 'gmail.readonly';
+  }
+  settings.gmail_access.addEventListener('change', scopeNote); scopeNote();
+
+  const guide = el(parent, 'details');
+  el(guide, 'summary', tr('Google Cloud setup', 'Google Cloud 设置'));
+  const link = el(guide, 'a', tr('Open Google Cloud OAuth clients', '打开 Google Cloud OAuth 客户端'));
+  link.href = 'https://console.cloud.google.com/auth/clients';
+  link.target = '_blank'; link.rel = 'noopener noreferrer';
+  el(guide, 'p', tr('Enable Gmail API. Create a Web application OAuth client and register this redirect URI:', '启用 Gmail API，创建「Web 应用」OAuth 客户端，并登记以下重定向 URI：'));
+  const callback = location.origin + '/admin/oauth/google/callback';
+  el(guide, 'code', callback, 'url');
+  button(guide, tr('Copy redirect URI', '复制重定向 URI'), async () => {
+    await navigator.clipboard.writeText(callback);
+    notify(tr('Redirect URI copied.', '已复制重定向 URI。'));
+  });
+  el(guide, 'p', tr('Download the client JSON, then import it here.', '下载该客户端的 JSON 文件，然后在这里导入。'));
+
+  const imported = field(parent, existing ? tr('Replace OAuth client (optional)', '更换 OAuth 客户端（可选）') :
+    tr('Google OAuth client JSON', 'Google OAuth 客户端 JSON'), 'google_client_file', '', 'file');
+  imported.accept = '.json,application/json';
+  const status = el(parent, 'p', '', 'muted');
+  status.setAttribute('role', 'status');
+  const manual = el(parent, 'details');
+  el(manual, 'summary', tr('Enter credentials manually', '手动填写凭据'));
+  settings.client_id = field(manual, tr('Google OAuth client ID', 'Google OAuth 客户端 ID'), 'client_id', existing?.settings.client_id || '');
+  credentials.client_secret = field(manual, tr('Google OAuth client secret', 'Google OAuth 客户端密钥'), 'client_secret', '', 'password',
+    existing ? tr('Leave blank to keep this client’s saved secret.', '留空保留此客户端已保存的密钥。') : '');
+  credentials.refresh_token = field(manual, tr('Existing refresh token (optional)', '已有刷新令牌（可选）'), 'refresh_token', '', 'password',
+    tr('Leave blank to authorize in your browser.', '留空即可通过浏览器授权。'));
+
+  imported.addEventListener('change', async () => {
+    if (!imported.files.length) return;
+    status.textContent = '';
+    imported.closest('dialog').querySelector('.operation-error')?.remove();
+    try {
+      const file = imported.files[0];
+      let data;
+      try { if (file.size <= 64 * 1024) data = JSON.parse(await file.text()); } catch {}
+      if (data?.installed && !data?.web) throw new Error(tr('This is a Desktop app client. Download a Web application client instead.', '这是「桌面应用」客户端，请下载「Web 应用」客户端。'));
+      const {client_id: id, client_secret: secret} = data?.web || {};
+      if ([id, secret].some(value => typeof value !== 'string' || !value.trim() || value.length > 16000)) {
+        throw new Error(tr('This file does not contain a Web application client ID and secret.', '此文件里没有「Web 应用」客户端的 ID 和密钥。'));
+      }
+      settings.client_id.value = id.trim();
+      credentials.client_secret.value = secret.trim();
+      credentials.refresh_token.value = '';
+      manual.open = false;
+      status.textContent = tr('OAuth client loaded.', '已导入 OAuth 客户端。');
+    } catch (error) { showError(imported, error); }
+    finally { imported.value = ''; imported.dispatchEvent(new Event('input', {bubbles: true})); }
+  });
+  return {settings, credentials};
+}
 function connectorForm(existing, reauthorize = false) {
   const revision = state.revision;
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
@@ -742,16 +810,19 @@ function connectorForm(existing, reauthorize = false) {
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
-  const dynamic = el(form, 'div'); let settings = {}, credentials = {};
+  const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider;
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
     smtp_security: tr('SMTP encryption', 'SMTP 加密方式'), smtp_username: tr('SMTP username (optional override)', 'SMTP 用户名（可选覆盖）'),
     smtp_sender: tr('Sender email (defaults to account email)', '发件邮箱（默认账号邮箱）'),
     url: tr('HTTPS service URL', '服务 HTTPS 地址'), timezone: tr('Time zone', '时区'), password: tr('App-specific password', 'App 专用密码'),
-    client_id: tr('Google OAuth client ID', 'Google OAuth 客户端 ID'), client_secret: tr('Google OAuth client secret', 'Google OAuth 客户端密钥'),
-    refresh_token: tr('Google refresh token', 'Google 刷新令牌'), token: tr('Helper bearer token', '辅助服务 Bearer Token')};
+    token: tr('Helper bearer token', '辅助服务 Bearer Token')};
   function fields() {
-    dynamic.replaceChildren(); settings = {}; credentials = {};
+    dynamic.replaceChildren(); settings = {}; credentials = {}; mailProvider = null;
+    if (kind.value === 'gmail') {
+      ({settings, credentials} = gmailSettings(dynamic, existing));
+      return;
+    }
     const spec = state.catalog[kind.value];
     const defaults = {host: 'imap.mail.me.com', port: '993', smtp_host: !existing || (existing.settings.host || 'imap.mail.me.com') === 'imap.mail.me.com' ? 'smtp.mail.me.com' : '', smtp_port: '587', smtp_security: 'starttls', url: kind.value === 'caldav' ? 'https://caldav.icloud.com' : '', timezone: 'UTC'};
     if (kind.value === 'remote') {
@@ -783,6 +854,9 @@ function connectorForm(existing, reauthorize = false) {
       settings.auth.addEventListener('change', authFields); authFields();
       return;
     }
+    if (kind.value === 'imap' && !existing) mailProvider = select(dynamic, tr('Mail provider', '邮箱服务商'), 'mail_provider', [
+      ['icloud', 'iCloud'], ['gmail', 'Gmail'], ['custom', tr('Other', '其他')],
+    ], 'icloud');
     if (kind.value === 'imap') infoHeading(dynamic, 'h3', tr('Mail settings', '邮件设置'),
       tr('iCloud requires an app-specific password. IMAP and SMTP share the password. Leave the SMTP server blank to disable sending.', 'iCloud 需要 App 专用密码。IMAP 和 SMTP 共用密码。SMTP 服务器留空会关闭发信。'));
     for (const key of spec.fields) {
@@ -790,16 +864,19 @@ function connectorForm(existing, reauthorize = false) {
       settings[key] = key === 'smtp_security' ? select(dynamic, labels[key], key, [['starttls', 'STARTTLS (587)'], ['tls', 'TLS (465)']], existing?.settings[key] ?? defaults[key]) : field(dynamic, labels[key], key, existing?.settings[key] ?? defaults[key] ?? '');
     }
     for (const key of spec.secrets) credentials[key] = field(dynamic, labels[key], key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
-    if (kind.value === 'gmail') {
-      el(dynamic, 'p', tr('Create a Google OAuth client of type Web application. Register this exact callback URL:', '创建 Google「Web 应用」类型的 OAuth 客户端，并登记此完整回调地址：'), 'hint');
-      el(dynamic, 'code', location.origin + '/admin/oauth/google/callback', 'url');
-      button(dynamic, tr('Authorize with Google', '通过 Google 授权'), async () => {
-        const result = await api('oauth/start', values());
-        location.assign(result.url);
-      }, 'primary');
-    }
     if (kind.value === 'caldav') el(dynamic, 'p', tr('iCloud requires an app-specific password. Read only.', 'iCloud 使用 App 专用密码。日历连接器只提供读取操作。'), 'hint');
     if (kind.value === 'imap') {
+      if (mailProvider) {
+        const presets = {icloud: ['imap.mail.me.com', 'smtp.mail.me.com'], gmail: ['imap.gmail.com', 'smtp.gmail.com'], custom: ['', '']};
+        const link = el(dynamic, 'a', tr('Create a Google app password', '创建 Google App 专用密码'));
+        link.href = 'https://myaccount.google.com/apppasswords';
+        link.target = '_blank'; link.rel = 'noopener noreferrer'; link.hidden = true;
+        mailProvider.addEventListener('change', () => {
+          [settings.host.value, settings.smtp_host.value] = presets[mailProvider.value];
+          settings.port.value = '993'; settings.smtp_port.value = '587'; settings.smtp_security.value = 'starttls';
+          link.hidden = mailProvider.value !== 'gmail';
+        });
+      }
       const addresses = el(dynamic, 'details');
       el(addresses, 'summary', tr('Mailbox addresses', '邮箱地址与别名'));
       settings.mailbox_email = field(addresses, tr('Primary email address', '主邮箱地址'), 'mailbox_email', existing?.settings.mailbox_email || '', 'email',
@@ -810,9 +887,11 @@ function connectorForm(existing, reauthorize = false) {
   }
   fields();
   function values() {
+    const values = Object.fromEntries(Object.entries(credentials).map(([k, input]) => [k, input.value]));
+    if (mailProvider?.value === 'gmail') values.password = values.password.replace(/\s+/g, '');
     return {revision, id: name.value, kind: kind.value, owner: owner.value,
       settings: Object.fromEntries(Object.entries(settings).map(([k, input]) => [k, input.value])),
-      credentials: Object.fromEntries(Object.entries(credentials).map(([k, input]) => [k, input.value]))};
+      credentials: values};
   }
   function needsReview() {
     return ['remote', 'reminders'].includes(kind.value) && (!existing || settings.url.value.trim() !== existing.settings.url);
@@ -824,6 +903,7 @@ function connectorForm(existing, reauthorize = false) {
     );
   }
   function saveLabel() {
+    if (kind.value === 'gmail' && !credentials.refresh_token?.value.trim()) return tr('Authorize with Google', '通过 Google 授权');
     if (needsReview()) return tr('Preview tools', '预览工具');
     if (needsOAuth()) return tr('Authorize and save', '授权并保存');
     return tr('Save connector', '保存连接器');
@@ -832,6 +912,16 @@ function connectorForm(existing, reauthorize = false) {
     name.value = name.value.trim();
     if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
     if (!form.reportValidity()) return;
+    if (kind.value === 'gmail') {
+      settings.client_id.value = settings.client_id.value.trim();
+      credentials.refresh_token.value = credentials.refresh_token.value.trim();
+      if (!settings.client_id.value || ((!existing || settings.client_id.value !== existing.settings.client_id) && !credentials.client_secret.value)) {
+        throw new Error(tr('Import a Google OAuth client JSON or enter the client ID and secret manually.', '请导入 Google OAuth 客户端 JSON，或手动填写客户端 ID 和密钥。'));
+      }
+      if (!credentials.refresh_token.value) {
+        const result = await api('oauth/start', values()); location.assign(result.url); return;
+      }
+    }
     if (needsOAuth()) {
       const result = await api('oauth/mcp/start', values()); location.assign(result.url); return;
     }

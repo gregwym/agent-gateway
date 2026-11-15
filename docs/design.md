@@ -11,8 +11,8 @@
 - 每个 `(service, account)` 是一条独立的上游连接，只拿到自己账号的凭据。
 - 默认拒绝；工具必须同时出现在连接的 `tools` 和某条 `policy` 规则里才存在。
 - 远程/自定义上游定义经人工审阅写入 lock；定义变化会停用工具。标准内置连接器随安装包同步能力，新工具默认拒绝。
-- 自带统一 IMAP/SMTP 邮件连接，以及只读 iCloud 日历（CalDAV）、Gmail（REST + OAuth）、
-  Apple 提醒事项（EventKit，实验性）。**只有 Gmail 的只读是凭据层的**，见 7.3。
+- 自带统一 IMAP/SMTP 邮件连接、Gmail（REST + OAuth），以及只读 iCloud 日历（CalDAV）和
+  Apple 提醒事项（EventKit，实验性）。**Gmail 选择只读时，由 Google 在凭据层强制执行**，见 7.3。
 - 读取和写入分别可选直接允许或逐次 Passkey 审批。需要审批时，由配置的成员或家庭内任意成员核对
   **那一次调用的确切内容**，批准只能用一次。没有配置审批页面时，`approval_required` 的工具永远不会执行。
 - 部署必须阻止 Agent 读取凭据或控制 Gateway 主机及运行时。
@@ -214,7 +214,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 | | 凭据本身能做什么 | Connector 实际发出什么 | 结论 |
 |---|---|---|---|
-| Gmail | 只能读邮件。Token 的 scope 是 `gmail.readonly`，用它发写请求会被 Google 拒绝 | 对 `gmail.googleapis.com` 的 GET，和对 `oauth2.googleapis.com` 的 Token 刷新 | **凭据层只读。** Connector 每次刷新都检查 Google 报告的 scope，只要不是恰好这一个就拒绝工作 |
+| Gmail | 默认只读；可另授发送。读取和发送以外的 scope 会被拒绝 | Gmail API 搜索和读取；仅在开启发送时调用 `messages.send` | 每次刷新都校验 Google 报告的 scope 与配置完全一致 |
 | iCloud Mail | App 专用密码**能收发邮件、删除邮件，也能访问日历和通讯录**。Apple 不提供只读的、或只限某一项服务的密码 | 读取工具用 `EXAMINE` 和 `BODY.PEEK`；0.5 起同一连接另有状态修改、移动及 SMTP 发信工具，由 Gateway 的 write 权限控制 | **工具白名单层只读。** write 可逐次审批或明确免审批；拿到密码或控制进程的人不受工具列表限制 |
 | iCloud 日历 | 同上，是同一种密码 | 只有 PROPFIND 和 REPORT | 同上 |
 | 提醒事项 | macOS 对提醒事项只有「完全访问」一种授权，没有只读；授权是给**应用**的，同一个应用名下启动的任何程序都有 | 只调用读取接口 | 同上，而且见 7.6 |
@@ -275,7 +275,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 业务理解与跨来源聚合由 Agent 或上游服务负责。
 
 远程 Streamable HTTP MCP 可在网页配置 URL、认证和工具；自定义 stdio 命令由主机配置。
-通用上游 OAuth 使用官方 MCP SDK 处理发现、PKCE 和授权，Gmail 保留专用只读授权流程。
+通用上游 OAuth 使用官方 MCP SDK 处理发现、PKCE 和授权，Gmail 使用独立授权流程，校验所选的只读或读取和发送 scope。
 
 ## 8. 审批
 
@@ -349,7 +349,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 | 上游凭据层的只读 | 只有 Gmail 成立；iCloud 和提醒事项做不到（7.3） |
 | 审批不被主机上的人绕过 | **做不到**（8.5） |
 | 独立主机上的审批服务 | 没有；只有接口 |
-| 自带的写工具 | IMAP 状态/移动/归档/废纸篓、SMTP 发信已实现；Calendar / Gmail / Reminders 仍只读 |
+| 自带的写工具 | IMAP 状态/移动/归档/废纸篓、SMTP 发信已实现；Gmail 可选择发送；Calendar / Reminders 仍只读 |
 | 扩展服务 connector | 尚未接入；通用 Proxy 的可用性不代表具体平台集成已完成 |
 | 通用远程 MCP 网页管理 / 上游 OAuth | 已实现；网页配置 HTTP 连接、工具选择与分类、OAuth 发现和刷新、Bearer / API Key |
 | 防内容中的 Prompt Injection | **不防**。只保证被误导的模型仍受其 Token 的权限约束；邮件正文、日历标题等原样返回（工具描述里提示了它们是数据） |
@@ -383,7 +383,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 | 邮件的搜索、正文、附件、中继地址 | `test_connector_mail.py` | 对面是 [pymap](https://github.com/icgood/pymap)（一个真实的 IMAP 服务器实现）加 TLS；包括连接中断后重连、密码被拒、证书不可信 |
 | 日历的事件、重复事件、冲突检查 | `test_connector_calendar.py` | 对面是 [Radicale](https://radicale.org)（真实的 CalDAV 服务器）；包括家庭日历的 pin |
 | Gmail 的搜索、正文、附件、Token 刷新和失效、scope 检查 | `test_connector_gmail.py` | 对面是一个模拟 Google 接口的本地服务；授权助手用 Google 的真实客户端库走完整流程 |
-| 读取操作不写 | 以上三个文件 | IMAP 读取前后邮箱和标记不变；CalDAV 只出现 PROPFIND / REPORT；Gmail 只出现 GET 和 Token 请求；邮件写工具单独验收 |
+| 读取操作不写 | 以上三个文件 | IMAP 读取前后邮箱和标记不变；CalDAV 只出现 PROPFIND / REPORT；只读 Gmail 只出现 GET 和 Token 请求；邮件写工具单独验收 |
 | 浏览器审批页面 | `test_passkey_browser.py` | 真实 Chromium、真实页面脚本、虚拟 WebAuthn 认证器；中英文手机布局和参数安全显示 |
 | 提醒事项经两层网关 | `test_reminders_gateway.py` | 两个独立 EventKit 替身进程；真实 HTTP 网关串联；列表、详情、完成状态、账号隔离、审计脱敏 |
 | 容器部署 | `test_deployment.py` | 实际镜像、独立临时卷；非 root、只读挂载、无 capabilities、审批跨重启保留、Connector 恢复 |

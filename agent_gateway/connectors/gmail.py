@@ -1,17 +1,7 @@
-"""Gmail over the Gmail REST API, with Google's read-only scope.
+"""Gmail REST connector. Read-only unless sending is explicitly authorized.
 
-    GMAIL_CLIENT_ID      the OAuth client of your own Google Cloud project (type: Desktop app)
-    GMAIL_CLIENT_SECRET  secret
-    GMAIL_REFRESH_TOKEN  secret. Obtained once per Google account with `gmail_auth`.
-
-Here read-only is a property of the credential, not only of this module: the token is
-granted for `gmail.readonly`, and Google refuses writes made with it. The connector
-looks at the scope Google reports for the token and refuses to work if it is anything
-other than that one scope.
-
-It sends GET requests for messages to gmail.googleapis.com and the token refresh to
-oauth2.googleapis.com, and nothing else. Nothing is indexed or stored; access tokens
-are kept in memory only.
+Credentials are per mailbox. Access tokens stay in memory, and Google must
+report precisely the configured scope set on every refresh.
 """
 
 from __future__ import annotations
@@ -19,15 +9,18 @@ from __future__ import annotations
 import base64
 import sys
 import time
+from email.message import EmailMessage
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx2
 
+from ..gmail_scopes import SCOPES, scope_error
+from ..mail_address import email_address
 from . import _mail
-from ._base import ConnectorError, CredentialGate, Tool, integer, result, serve, setting, string
+from ._base import ConnectorError, CredentialGate, Tool, integer, plain, result, serve, setting, string
+from ._smtp import address
 
-SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 _REVOKED = (
     "Google no longer accepts this account's authorisation: it expired or was revoked. "
     "A person has to repeat the consent step and store the new token in the gateway."
@@ -43,7 +36,12 @@ _ID = r"^[0-9a-fA-F]{1,32}$"
 
 
 class Gmail:
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str, api: str, token_url: str) -> None:
+    def __init__(self, client_id: str, client_secret: str, refresh_token: str, api: str, token_url: str, access: str = "read") -> None:
+        self._scope_code = scope_error(access)
+        self._scope_message = (_TOO_BROAD if access == "read" else
+                               "Google granted a different scope from the configured read and send permissions. Reauthorize this Gmail connector.")
+        self._scopes = set(SCOPES[access])
+        self.can_send = access == "read_send"
         self._grant = {
             "grant_type": "refresh_token",
             "client_id": client_id,
@@ -56,11 +54,11 @@ class Gmail:
         self._gate = CredentialGate(_REVOKED, pause_seconds=300, code="gmail_authorization_rejected")
         self._access: str | None = None
         self._expires = 0.0
-        self._too_broad = False
+        self._scope_rejected = False
 
     def _token(self, *, fresh: bool = False) -> str:
-        if self._too_broad:
-            raise ConnectorError(_TOO_BROAD)
+        if self._scope_rejected:
+            raise ConnectorError(self._scope_message, self._scope_code)
         if self._access and not fresh and time.monotonic() < self._expires - 60:
             return self._access
         self._gate.check()
@@ -80,9 +78,9 @@ class Gmail:
             granted = set(str(body.get("scope", "")).split())
         except (ValueError, KeyError, TypeError):
             raise ConnectorError(_UNAVAILABLE) from None
-        if granted != {SCOPE}:
-            self._too_broad = True
-            raise ConnectorError(_TOO_BROAD)
+        if granted != self._scopes:
+            self._scope_rejected = True
+            raise ConnectorError(self._scope_message, self._scope_code)
         self._access, self._expires = access, time.monotonic() + lifetime
         return access
 
@@ -112,6 +110,43 @@ class Gmail:
             raise ConnectorError(_UNAVAILABLE)
         return body
 
+    def send(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self.can_send:
+            raise ConnectorError("Sending was not authorized for this Gmail connector.")
+        recipients = {key: [address(value) for value in args.get(key, [])] for key in ("to", "cc", "bcc")}
+        if not 1 <= len({value for group in recipients.values() for value in group}) <= 50:
+            raise ConnectorError("Use between 1 and 50 recipients in total.")
+        sender = email_address(self.get("profile").get("emailAddress"))
+        if not sender:
+            raise ConnectorError("Gmail did not provide the sender address.")
+        msg = EmailMessage()
+        msg["From"], msg["Subject"] = sender, plain(args["subject"])
+        for key, values in recipients.items():
+            if values:
+                msg[key] = ", ".join(values)
+        msg.set_content(args["text"])
+        if args.get("html"):
+            msg.add_alternative(args["html"], subtype="html")
+        token = self._token()
+        unknown = "Gmail did not confirm the send. Check Sent before retrying."
+        try:
+            reply = self._http.post(
+                f"{self._api}/gmail/v1/users/me/messages/send",
+                json={"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx2.TransportError:
+            raise ConnectorError(unknown, "gmail_send_outcome_unknown") from None
+        if reply.status_code in (408, 429) or reply.status_code >= 500:
+            raise ConnectorError(unknown, "gmail_send_outcome_unknown")
+        if not reply.is_success:
+            raise ConnectorError(f"Gmail refused to send the message (HTTP {reply.status_code}).", "gmail_send_rejected")
+        try:
+            body = reply.json()
+            return {"id": _message_id(body["id"]), "status": "accepted"}
+        except (KeyError, TypeError, ValueError, ConnectorError):
+            raise ConnectorError(unknown, "gmail_send_outcome_unknown") from None
+
 
 def _about(message: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     return {
@@ -123,7 +158,7 @@ def _about(message: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int) -> list[Tool]:
+def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int, *, can_send: bool = False) -> list[Tool]:
     def search_messages(args: dict[str, Any]) -> Any:
         params = [("maxResults", str(args.get("limit", 10)))]
         if args.get("query"):
@@ -165,7 +200,7 @@ def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int)
         return _mail.attachment(parsed, args["index"], max_attachment_bytes)
 
     message_id = string("The message's id, from search_messages.", 32, _ID)
-    return [
+    tools = [
         Tool(
             "search_messages",
             "Search this Gmail account and return the newest matches (headers and a short preview, no body). "
@@ -201,6 +236,22 @@ def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int)
         ),
     ]
 
+    if can_send:
+        addresses = {"type": "array", "items": string("Bare recipient email address.", 254),
+                     "maxItems": 50, "uniqueItems": True}
+        tools.append(Tool(
+            "send_message",
+            "Send an email from this Gmail account. Supports plain text and optional HTML, To/Cc/Bcc. "
+            "Accepted means Gmail accepted the request, not confirmed delivery. No attachments. "
+            "If the outcome is unknown, check Sent before retrying.",
+            lambda args: gmail.send(args),
+            {"to": {**addresses, "minItems": 1}, "cc": addresses, "bcc": addresses,
+             "subject": string("Email subject.", 998), "text": {"type": "string", "maxLength": 200000},
+             "html": {"type": "string", "maxLength": 200000}},
+            ("to", "subject", "text"), read_only=False,
+        ))
+    return tools
+
 
 def _message_id(value: Any) -> str:
     """Message ids go into the request path: hexadecimal only."""
@@ -219,6 +270,9 @@ def _endpoint(name: str, default: str) -> str:
 
 
 def main() -> None:
+    access = setting("GMAIL_ACCESS", "read")
+    if access not in SCOPES:
+        sys.exit("connector: GMAIL_ACCESS must be read or read_send")
     gmail = Gmail(
         client_id=setting("GMAIL_CLIENT_ID"),
         client_secret=setting("GMAIL_CLIENT_SECRET"),
@@ -226,6 +280,7 @@ def main() -> None:
         # Google's own addresses. They can be pointed elsewhere only for tests.
         api=_endpoint("GMAIL_API_BASE", "https://gmail.googleapis.com"),
         token_url=_endpoint("GMAIL_TOKEN_URL", "https://oauth2.googleapis.com/token"),
+        access=access,
     )
     serve(
         "gmail",
@@ -233,6 +288,7 @@ def main() -> None:
             gmail,
             max_message_bytes=int(setting("GMAIL_MAX_MESSAGE_BYTES", "40000000")),
             max_attachment_bytes=int(setting("GMAIL_MAX_ATTACHMENT_BYTES", "5000000")),
+            can_send=gmail.can_send,
         ),
     )
 

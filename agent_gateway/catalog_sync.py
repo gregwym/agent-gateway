@@ -37,7 +37,7 @@ def bundled_kind(conn):
 
 def bundled_manifest(conn):
     """Pure schema factories; no credentials, process launches, or network access."""
-    from .admin_config import CATALOG
+    from .admin_config import CATALOG, catalog_tools
 
     kind = bundled_kind(conn)
     if kind is None:
@@ -47,7 +47,8 @@ def bundled_manifest(conn):
         tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000)]
     elif kind == "gmail":
         from .connectors.gmail import build_tools
-        tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000)]
+        tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000,
+                                                 can_send=conn.env.get("GMAIL_ACCESS") == "read_send")]
     elif kind == "caldav":
         from .connectors.caldav_calendar import build_tools
         tools = [t.as_mcp() for t in build_tools(SimpleNamespace(zone=ZoneInfo(conn.env.get("CALDAV_TIMEZONE", "UTC"))))]
@@ -57,7 +58,7 @@ def bundled_manifest(conn):
     definitions = {t.name: definition_of(t) for t in tools}
     writes = CATALOG[kind].get("writes", {"add_note"} if kind == "demo" else set())
     return {name: {"definition": definitions[name], "suffix": suffix, "access": "write" if name in writes else "read"}
-            for name, suffix in CATALOG[kind]["tools"]}
+            for name, suffix in catalog_tools(conn)}
 
 
 def sync_catalog(cfg, lock, previous=None):

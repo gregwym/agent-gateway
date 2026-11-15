@@ -205,7 +205,18 @@ class AdminController:
                     "secret_env": previous.secret_env | conn.secret_env,
                     "mailbox_email": conn.mailbox_email,
                     "mailbox_aliases": conn.mailbox_aliases,
+                    **({"tools": conn.tools} if kind_of(conn) == "gmail" else {}),
                 })
+                if kind_of(conn) == "gmail":
+                    removed = {tool.name for tool in previous.tools} - {tool.name for tool in conn.tools}
+                    if removed:
+                        state["config"]["policy"] = [
+                            {**rule, "tools": [name for name in rule["tools"] if name not in removed]}
+                            for rule in state["config"]["policy"]
+                            if any(name not in removed for name in rule["tools"])
+                        ]
+                        state["locks"].get(conn.id, {}).pop("send_message", None)
+                        state.get("bundled_catalog", {}).get(conn.id, {}).pop("send_message", None)
             else:
                 conn, added = previous, {}
             _, _, values = self.store.effective(state)

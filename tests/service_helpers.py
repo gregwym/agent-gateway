@@ -228,6 +228,7 @@ class FakeGoogle:
     """
 
     READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+    SEND = "https://www.googleapis.com/auth/gmail.send"
 
     def __init__(self) -> None:
         import uvicorn
@@ -238,12 +239,16 @@ class FakeGoogle:
         self.access: dict[str, str] = {}  # access token -> refresh token
         self.requests: list[tuple[str, str]] = []
         self.token_requests = 0
+        self.sent: list[bytes] = []
+        self.send_status = 200
         self.consenting: str | None = None  # the account whose owner is "at the browser"
         self.codes: dict[str, str] = {}  # authorisation code -> refresh token
         app = Starlette(
             routes=[
                 Route("/token", self._token, methods=["POST"]),
                 Route("/auth", self._consent, methods=["GET"]),
+                Route("/gmail/v1/users/me/profile", self._profile, methods=["GET"]),
+                Route("/gmail/v1/users/me/messages/send", self._send, methods=["POST"]),
                 Route("/gmail/v1/users/me/messages", self._list, methods=["GET"]),
                 Route("/gmail/v1/users/me/messages/{message_id}", self._get, methods=["GET"]),
                 Route("/{rest:path}", self._other, methods=["GET", "POST", "PUT", "PATCH", "DELETE"]),
@@ -318,6 +323,25 @@ class FakeGoogle:
         self.requests.append((request.method, request.url.path))
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         return self.accounts.get(self.access.get(token, ""))
+
+    async def _profile(self, request):
+        from starlette.responses import JSONResponse
+
+        if self._account(request) is None:
+            return JSONResponse({}, 401)
+        return JSONResponse({"emailAddress": "mailbox@example.test"})
+
+    async def _send(self, request):
+        import base64
+
+        from starlette.responses import JSONResponse
+
+        account = self._account(request)
+        if account is None or self.SEND not in account["scope"].split():
+            return JSONResponse({}, 403)
+        body = await request.json()
+        self.sent.append(base64.urlsafe_b64decode(body["raw"]))
+        return JSONResponse({"id": "18c0f1"}, self.send_status)
 
     async def _list(self, request):  # type: ignore[no-untyped-def]
         from starlette.responses import JSONResponse

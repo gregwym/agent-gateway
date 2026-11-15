@@ -6,6 +6,7 @@ import httpx2
 import pytest
 
 from agent_gateway.admin_oauth import AUTHORIZE, PROFILE, SCOPE, TOKEN
+from agent_gateway.gmail_scopes import SEND_SCOPE
 from test_admin import change, login, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
@@ -36,15 +37,16 @@ async def test_google_failures_report_the_specific_step_without_provider_text(tm
         assert 'private-' not in response.text + gw.audit_text()
 
 
-async def start(http):
+async def start(http, access='read'):
     reply = await change(http, 'oauth/start', kind='gmail', id='google-mail', owner='person_a',
-                         settings={'client_id':'test-web-client'}, credentials={'client_secret':'very-secret-client'})
+                         settings={'client_id':'test-web-client', 'gmail_access': access}, credentials={'client_secret':'very-secret-client'})
     assert reply.status_code == 200, reply.text
     url = reply.json()['url']
     assert url.startswith(AUTHORIZE)
     assert 'very-secret-client' not in url
     query = parse_qs(urlsplit(url).query)
-    assert query['scope'] == [SCOPE] and query['access_type'] == ['offline']
+    assert set(query['scope'][0].split()) == ({SCOPE, SEND_SCOPE} if access == 'read_send' else {SCOPE})
+    assert query['access_type'] == ['offline']
     assert query['code_challenge_method'] == ['S256']
     return query
 
@@ -128,3 +130,42 @@ async def test_google_flow_expires_on_logout_or_config_change(tmp_path):
         await change(http, 'members/add', id='new-member')
         await http.get('/admin/oauth/google/callback', params={'state':query['state'][0],'code':'fake-code'})
         assert (await http.post('/admin/api/oauth/complete', json={'id':query['state'][0]})).status_code == 409
+
+
+async def test_gmail_scope_changes_drop_send_grants_until_explicitly_restored(tmp_path):
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+
+        async def authorize(access, returned_scope):
+            query = await start(http, access)
+            provider(gw.app.state.admin.google, query, scope=returned_scope, refresh=f'private-refresh-{access}')
+            flow = query['state'][0]
+            assert (await http.get('/admin/oauth/google/callback', params={'state': flow, 'code': 'fake-code'})).status_code == 303
+            return await http.post('/admin/api/oauth/complete', json={'id': flow})
+
+        async def connection():
+            return next(c for c in (await state(http))['connections'] if c['id'] == 'google-mail')
+
+        rejected = await authorize('read_send', SCOPE)
+        assert rejected.status_code == 400 and rejected.json()['error'] == 'gmail_scope_mismatch'
+        assert (await state(http))['revision'] == 0
+        assert (await authorize('read_send', f'{SCOPE} {SEND_SCOPE}')).status_code == 200
+        conn = await connection()
+        assert conn['settings']['gmail_access'] == 'read_send'
+        send = next(t for t in conn['tools'] if t['upstream'] == 'send_message')
+        assert send['access'] == 'write' and send['permissions']['agent-a'] == 'deny'
+
+        allowed = await change(http, 'permissions/connection', client='agent-a', connection='google-mail', access='read_write')
+        assert allowed.status_code == 200, allowed.text
+        conn = await connection()
+        assert next(t for t in conn['tools'] if t['upstream'] == 'send_message')['permissions']['agent-a'] == 'approval_required'
+
+        assert (await authorize('read', SCOPE)).status_code == 200
+        conn = await connection()
+        assert conn['settings']['gmail_access'] == 'read'
+        assert all(t['upstream'] != 'send_message' for t in conn['tools'] + conn['available_tools'])
+        assert conn['access']['agent-a'] == 'read'
+
+        assert (await authorize('read_send', f'{SEND_SCOPE} {SCOPE}')).status_code == 200
+        send = next(t for t in (await connection())['tools'] if t['upstream'] == 'send_message')
+        assert send['permissions']['agent-a'] == 'deny'

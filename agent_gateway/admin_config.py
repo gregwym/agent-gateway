@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Config, ConnectionCfg, allocate_tool_name, validate_name
 from .credentials import EncryptedFileStore
+from .gmail_scopes import SCOPES
 from .lock import Lock, digest_of
 from .mail_address import email_address
 from .passkey import Refused
@@ -35,7 +36,7 @@ CATALOG = {
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
              "probe": ("list_notes", {"folder": "inbox"})},
-    "imap": {"label": "Mail / 邮箱 (iCloud, IMAP + SMTP)",
+    "imap": {"label": "Mail / 邮箱 (IMAP + SMTP)",
              "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender",
                         "mailbox_email", "mailbox_aliases"], "secrets": ["password"],
              "tools": [("list_mailboxes", "mailboxes"), ("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment"),
@@ -46,8 +47,9 @@ CATALOG = {
     "caldav": {"label": "iCloud Calendar / CalDAV", "fields": ["username", "url", "timezone"], "secrets": ["password"],
                "tools": [("list_calendars", "calendars"), ("list_events", "events"), ("get_event", "event"), ("check_conflicts", "conflicts")],
                "probe": ("list_calendars", {})},
-    "gmail": {"label": "Gmail", "fields": ["client_id"], "secrets": ["client_secret", "refresh_token"],
-              "tools": [("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment")],
+    "gmail": {"label": "Gmail (Google OAuth)", "fields": ["client_id", "gmail_access"], "secrets": ["client_secret", "refresh_token"],
+              "tools": [("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment"), ("send_message", "send")],
+              "writes": {"send_message"},
               "probe": ("search_messages", {"query": "in:inbox", "limit": 1})},
     "reminders": {"label": "Reminders Mac helper / 提醒事项 Mac 辅助服务", "fields": ["url"], "secrets": ["token"],
                   "tools": [("reminders_lists", "lists"), ("reminders_list", "list"), ("reminders_get", "get")],
@@ -195,7 +197,7 @@ def settings_of(conn):
              "SMTP_HOST": "smtp_host", "SMTP_PORT": "smtp_port", "SMTP_SECURITY": "smtp_security",
              "SMTP_USERNAME": "smtp_username", "SMTP_SENDER": "smtp_sender",
              "CALDAV_USERNAME": "username", "CALDAV_URL": "url", "CALDAV_TIMEZONE": "timezone",
-             "GMAIL_CLIENT_ID": "client_id"}
+             "GMAIL_CLIENT_ID": "client_id", "GMAIL_ACCESS": "gmail_access"}
     result = {names[key]: value for key, value in conn.env.items() if key in names}
     if kind_of(conn) == "imap":
         result.update(mailbox_email=conn.mailbox_email or "", mailbox_aliases="\n".join(conn.mailbox_aliases))
@@ -248,11 +250,19 @@ def tool_access(conn, tool):
     return "write"
 
 
+def catalog_tools(conn):
+    kind = kind_of(conn)
+    tools = CATALOG.get(kind, {}).get("tools", ())
+    if kind == "gmail" and conn.env.get("GMAIL_ACCESS") != "read_send":
+        return [tool for tool in tools if tool[0] != "send_message"]
+    return tools
+
+
 def catalog_additions(conn, cfg):
     registered = {tool.upstream for tool in conn.tools}
     occupied = {tool.name for c in cfg.connections for tool in c.tools}
     return [{"upstream": upstream, "name": allocate_tool_name(conn.id, upstream, suffix, occupied)}
-            for upstream, suffix in CATALOG.get(kind_of(conn), {}).get("tools", ()) if upstream not in registered]
+            for upstream, suffix in catalog_tools(conn) if upstream not in registered]
 
 
 def extend_catalog_tools(conn, cfg):
@@ -386,7 +396,16 @@ def make_connection(body, cfg, values, *, gmail_email=None):
         raw["env"] = {"CALDAV_USERNAME": field("username"), "CALDAV_URL": url, "CALDAV_TIMEZONE": zone}
         raw["secret_env"] = {"CALDAV_PASSWORD": secret("password", "CALDAV_PASSWORD")}
     elif kind == "gmail":
-        raw["env"] = {"GMAIL_CLIENT_ID": field("client_id")}
+        old_access = previous.env.get("GMAIL_ACCESS", "read") if previous else "read"
+        access = settings.get("gmail_access", old_access)
+        if access not in SCOPES:
+            raise Refused("gmail_access_invalid", 400)
+        client_id = field("client_id")
+        if previous and ((access != old_access and not provided.get("refresh_token")) or
+                         (client_id != previous.env.get("GMAIL_CLIENT_ID") and
+                          not (provided.get("client_secret") and provided.get("refresh_token")))):
+            raise Refused("gmail_reauthorize_required", 400)
+        raw["env"] = {"GMAIL_CLIENT_ID": client_id, "GMAIL_ACCESS": access}
         raw["secret_env"] = {"GMAIL_CLIENT_SECRET": secret("client_secret", "GMAIL_CLIENT_SECRET"),
                              "GMAIL_REFRESH_TOKEN": secret("refresh_token", "GMAIL_REFRESH_TOKEN")}
         if gmail_email:
@@ -404,5 +423,6 @@ def make_connection(body, cfg, values, *, gmail_email=None):
         # existing YAML-only escape hatch remains unavailable to web input.
     # Keep reviewed restrictions and names, and present newly bundled tools for
     # explicit review. No policy rule is added, so additions start denied.
-    raw["tools"] = [t.model_dump(mode="json") for t in previous.tools] if previous else []
+    raw["tools"] = [t.model_dump(mode="json") for t in previous.tools
+                    if kind != "gmail" or t.upstream != "send_message" or access == "read_send"] if previous else []
     return extend_catalog_tools(ConnectionCfg.model_validate(raw), cfg), fresh

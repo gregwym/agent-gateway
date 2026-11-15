@@ -9,10 +9,10 @@ import httpx2
 from fido2.utils import websafe_encode
 
 from .admin_config import make_connection
+from .gmail_scopes import SCOPE, SCOPES, scope_error
 from .mail_address import email_address
 from .passkey import Refused
 
-SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 AUTHORIZE = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN = "https://oauth2.googleapis.com/token"
 PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
@@ -42,11 +42,16 @@ class GoogleConsent(ConsentSessions):
         body = copy.deepcopy(body)
         if body.get("kind") != "gmail":
             raise Refused("invalid_connector", 400)
-        body.setdefault("credentials", {})["refresh_token"] = "pending-consent"
+        credentials = body.setdefault("credentials", {})
+        if not isinstance(credentials, dict):
+            raise Refused("invalid_connector", 400)
+        credentials["refresh_token"] = "pending-consent"
         gateway = self.controller.runtime.gateway
         conn, values = make_connection(body, gateway.cfg, gateway.secrets)
         client_secret = (gateway.secrets | values)[conn.secret_env["GMAIL_CLIENT_SECRET"]]
         body["credentials"] = {"client_secret": client_secret}
+        access = conn.env["GMAIL_ACCESS"]
+        body["settings"] = {"client_id": conn.env["GMAIL_CLIENT_ID"], "gmail_access": access}
         now = time.time()
         self.flows = {key: value for key, value in self.flows.items() if value["expires"] > now}
         if len(self.flows) >= 16:
@@ -56,7 +61,7 @@ class GoogleConsent(ConsentSessions):
                              "verifier": verifier, "phase": "pending"}
         return {"url": AUTHORIZE + "?" + urlencode({
             "client_id": conn.env["GMAIL_CLIENT_ID"], "redirect_uri": self.redirect,
-            "response_type": "code", "scope": SCOPE, "access_type": "offline", "prompt": "consent",
+            "response_type": "code", "scope": " ".join(SCOPES[access]), "access_type": "offline", "prompt": "consent",
             "state": state, "code_challenge": websafe_encode(hashlib.sha256(verifier.encode()).digest()),
             "code_challenge_method": "S256", "include_granted_scopes": "false",
         })}
@@ -83,8 +88,9 @@ class GoogleConsent(ConsentSessions):
                 })
                 response.raise_for_status()
                 token = response.json()
-                if set(str(token.get("scope", "")).split()) != {SCOPE}:
-                    raise Refused("gmail_readonly_required", 400)
+                access = body["settings"]["gmail_access"]
+                if set(str(token.get("scope", "")).split()) != set(SCOPES[access]):
+                    raise Refused(scope_error(access), 400)
                 if not isinstance(token.get("refresh_token"), str) or not 1 <= len(token["refresh_token"]) <= 16000:
                     raise Refused("oauth_refresh_token_missing", 400)
                 profile = await http.get(PROFILE, headers={"Authorization": "Bearer " + token["access_token"]})

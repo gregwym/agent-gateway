@@ -12,7 +12,9 @@ import base64
 import json
 import subprocess
 import sys
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 
 import httpx2
 import pytest
@@ -259,3 +261,35 @@ def test_the_consent_helper_hands_over_a_read_only_token_and_nothing_else(google
     google.add_account(broad, CLIENT_ID, CLIENT_SECRET, scope="https://mail.google.com/")
     refused = consent(broad)
     assert refused.returncode != 0 and refused.stdout == "" and broad not in refused.stderr
+
+
+async def test_gmail_send_uses_the_mailbox_and_never_retries_an_uncertain_submission():
+    google = FakeGoogle()
+    account = google.add_account(REFRESH_A, CLIENT_ID, CLIENT_SECRET, scope=f"{FakeGoogle.READONLY} {FakeGoogle.SEND}")
+    env = {"GMAIL_CLIENT_ID": CLIENT_ID, "GMAIL_CLIENT_SECRET": CLIENT_SECRET, "GMAIL_REFRESH_TOKEN": REFRESH_A,
+           "GMAIL_API_BASE": google.base, "GMAIL_TOKEN_URL": f"{google.base}/token", "GMAIL_ACCESS": "read_send"}
+    params = StdioServerParameters(command=sys.executable, args=["-m", "agent_gateway.connectors.gmail"], env=env)
+    try:
+        async with Client(stdio_client(params), cache=None) as client:
+            send = next(tool for tool in (await client.list_tools()).tools if tool.name == "send_message")
+            assert send.annotations.read_only_hint is False
+            args = {"to": ["to@example.test"], "bcc": ["bcc@example.test"], "subject": "模拟邮件", "text": "Only the fake provider sees this."}
+            reply = await ask(client, 'send_message', **args)
+            assert json.loads(text_of(reply)) == {"id": "18c0f1", "status": "accepted"}
+            sent = BytesParser(policy=policy.default).parsebytes(google.sent[0])
+            assert str(sent["From"]) == "mailbox@example.test"
+            assert str(sent["Bcc"]) == "bcc@example.test"
+            assert str(sent["Subject"]) == args["subject"]
+            assert sent.get_content().strip() == args["text"]
+            google.send_status = 503
+            reply = await client.call_tool("send_message", args)
+            assert reply.is_error and "Check Sent before retrying" in text_of(reply)
+            assert len(google.sent) == 2
+
+        account["scope"] = FakeGoogle.READONLY
+        async with Client(stdio_client(params), cache=None) as client:
+            missing_scope = await client.call_tool("send_message", args)
+            assert missing_scope.is_error and "different scope" in text_of(missing_scope)
+            assert len(google.sent) == 2
+    finally:
+        google.close()

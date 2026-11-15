@@ -79,7 +79,7 @@ Agent Gateway 是一个自托管的 MCP Proxy。它让多个 Agent 通过统一�
 | Passkey 审批 | 同进程实现可用；外部审批服务 adapter 尚未实现 |
 | IMAP + SMTP | 同一连接提供邮件读写、分页、批量操作和发送；SMTP 暂不支持附件发送 |
 | CalDAV | 只读日历、事件与冲突检查；列表有数量限制，无续页 |
-| Gmail | 只读搜索、正文、附件与 OAuth；无搜索续页、批量读取或写入 |
+| Gmail | OAuth 默认只读；可另授发送权限。支持搜索、正文、附件和发送；无搜索续页、批量读取或邮箱状态修改 |
 | Reminders | 实验性只读 EventKit helper；依赖 macOS 会话与系统授权，列表无续页 |
 | OAuth | Gmail 及通用上游 MCP OAuth 已实现，包括发现、PKCE、刷新及撤销；网关客户端 OAuth 尚未实现 |
 
@@ -117,7 +117,7 @@ Agent Gateway 是一个自托管的 MCP Proxy。它让多个 Agent 通过统一�
 6. OAuth 支持授权服务器发现、PKCE S256、已注册客户端、动态注册及客户端元数据 URL。授权绑定发起登录会话和配置版本。
 7. OAuth Token 加密持久化，自动刷新并保存轮换后的刷新令牌；失效时提示重新授权。撤销先停止网关使用，再尝试服务商撤销，并区分两者结果。
 
-自定义 stdio 命令由主机配置。通用 OAuth 与 Gmail 使用独立的协议验收；Gmail 保留只读 scope 限制。
+自定义 stdio 命令由主机配置。通用 OAuth 与 Gmail 使用独立的协议验收；Gmail 校验 Google 授予的 scope 与所选权限完全一致。
 
 ### 验收
 
