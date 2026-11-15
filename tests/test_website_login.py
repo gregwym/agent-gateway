@@ -26,12 +26,18 @@ def socket_dir():
         yield Path(directory)
 
 
-def fake_browser(monkeypatch, *, screenshot=None):
+def fake_browser(monkeypatch, *, screenshot=None, localized=False):
     backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100}
 
     def fetch(host, target, headers, receive):
         if headers.get("Cookie") != "auth=" + SECRET or not backend["auth"]:
             return response(receive, status=302, location="/ap/signin")
+        if localized:
+            assert host == "www.weee.com"
+            if target == "/en/account/my_orders":
+                return response(receive, status=307, location="/zh/account/my_orders")
+            assert target == "/zh/account/my_orders"
+            return response(receive, b'<main class="order-list"><p>Simulated order</p></main>')
         assert host == "www.amazon.com" and target == "/your-orders/orders"
         return response(receive, PAGE)
 
@@ -44,8 +50,9 @@ def fake_browser(monkeypatch, *, screenshot=None):
         if action == "zoom":
             backend["zoom"] = data["percent"]
         if action == "cookies":
-            assert data["origin"] == "https://www.amazon.com"
-            return {"cookies": [{"name": "auth", "domain": ".amazon.com", "value": SECRET},
+            site = "www.weee.com" if localized else "www.amazon.com"
+            assert data["origin"] == "https://" + site
+            return {"cookies": [{"name": "auth", "domain": site, "value": SECRET},
                                 {"name": "auth", "domain": "evil.test", "value": "unrelated-password"}]}
         return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"]}
 
@@ -55,12 +62,13 @@ def fake_browser(monkeypatch, *, screenshot=None):
     return backend
 
 
-async def test_verified_website_login_is_private_and_atomic(tmp_path, socket_dir, monkeypatch):
+@pytest.mark.parametrize("plugin", ["amazon-us", "weee-orders"])
+async def test_verified_website_login_is_private_and_atomic(tmp_path, socket_dir, monkeypatch, plugin):
     monkeypatch.setenv("AGW_BROWSER_SOCKET", str(socket_dir / "control.sock"))
-    backend = fake_browser(monkeypatch)
+    backend = fake_browser(monkeypatch, localized=plugin == "weee-orders")
     async with web_gateway(tmp_path) as (gw, http, origin, config):
         key, _ = await setup(http, origin, config)
-        form = {"id": "amazon-orders", "owner": "person_a", "plugin": "amazon-us"}
+        form = {"id": "shop-orders", "owner": "person_a", "plugin": plugin}
         first = await http.post("/admin/api/web-login/start", json={**form, "revision": 0})
         assert first.status_code == 403 and first.json()["error"] == "admin_confirmation_required"
         started = await change(http, "web-login/start", **form)
@@ -85,7 +93,8 @@ async def test_verified_website_login_is_private_and_atomic(tmp_path, socket_dir
         settings = await state(http)
         conn = next(c for c in settings["connections"] if c["id"] == form["id"])
         assert conn["test"]["ok"] and conn["access"]["agent-a"] == "none"
-        assert len(conn["tools"]) == 2 and all(t["access"] == "read" for t in conn["tools"])
+        assert len(conn["tools"]) == (1 if plugin == "weee-orders" else 2)
+        assert all(t["access"] == "read" for t in conn["tools"])
         assert SECRET.encode() not in (tmp_path / "admin.enc").read_bytes()
         assert all(s not in str(settings) + gw.audit_text() for s in (SECRET, typed, "unrelated-password"))
         refreshed = await change(http, "web-login/start", **form)

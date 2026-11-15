@@ -124,3 +124,55 @@ def test_unknown_page_and_login_failure_are_distinct():
         with pytest.raises(web.ConnectorError) as exc:
             session.read(expected, {})
         assert exc.value.code == code
+
+
+def _weee_session(fetch, *, persist=None):
+    profile = bundled_profiles()["weee-orders"][1]
+    raw = web.import_session('[{"name":"auth","value":"start-private-session","domain":"www.weee.com"},'
+                             '{"name":"site_lang","value":"zh","domain":"www.weee.com"}]', profile)
+    return web.SiteSession(profile, raw, fetch=fetch, persist=persist), profile.actions["list_orders"]
+
+
+def test_weee_can_read_localized_orders_with_a_rotated_cookie():
+    requests, rotations = [], []
+
+    def fetch(host, target, headers, receive):
+        assert host == "www.weee.com"
+        requests.append(target)
+        if target == "/en/account/my_orders":
+            assert "auth=start-private-session" in headers["Cookie"]
+            return response(receive, status=307, location="https://www.weee.com/zh/account/my_orders",
+                            rotate="fresh-private-session")
+        assert target == "/zh/account/my_orders" and "auth=fresh-private-session" in headers["Cookie"]
+        return response(receive, '<main class="order-list">糯米和苹果 fresh-private-session</main>'.encode())
+
+    session, action = _weee_session(fetch, persist=lambda raw, seen: rotations.append(raw))
+    rendered = session.read(action, {})
+    assert requests == ["/en/account/my_orders", "/zh/account/my_orders"]
+    assert rendered == "糯米和苹果 [REDACTED]"
+    assert len(rotations) == 1 and "fresh-private-session" in rotations[0]
+
+
+@pytest.mark.parametrize(("location", "expected"), [
+    ("https://orders.weee.com/zh/account/my_orders", "web_redirect_refused"),
+    ("http://www.weee.com/zh/account/my_orders", "web_redirect_refused"),
+    ("//www.weee.com/zh/account/my_orders", "web_redirect_refused"),
+    ("/zh/account/my_orders?unapproved=value", "web_redirect_refused"),
+    ("/zh/account/buy_again", "web_redirect_refused"),
+    ("/zh/account/%6dy_orders", "web_redirect_refused"),
+    ("/zh/account/my_orders#unapproved", "web_redirect_refused"),
+    ("/en/account/my_orders", "web_redirect_loop"),
+    ("/account/login", "web_login_required"),
+])
+def test_weee_redirects_are_exact_bounded_and_fail_before_forwarding_cookies(location, expected):
+    requests = []
+
+    def fetch(host, target, headers, receive):
+        requests.append((host, target))
+        return response(receive, status=307, location=location)
+
+    session, action = _weee_session(fetch)
+    with pytest.raises(web.ConnectorError) as exc:
+        session.read(action, {})
+    assert exc.value.code == expected
+    assert requests == [("www.weee.com", "/en/account/my_orders")]

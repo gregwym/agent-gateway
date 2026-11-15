@@ -193,6 +193,7 @@ const messages = {
   web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
   web_profile_mismatch: ['The site did not return the expected page. This profile may need an update.', '网站未返回预期页面，可能需要更新站点配置。'],
   web_http_rejected: ['The website rejected the read request.', '网站拒绝了读取请求。'],
+  web_redirect_loop: ['The website kept redirecting between order pages. Try signing in again.', '网站在订单页之间反复跳转，请重新登录后再试。'],
   web_redirect_refused: ['The site redirected to an unapproved page. The gateway stopped the request.', '网站跳转到了站点配置之外的页面，网关已停止请求。'],
   web_unsafe_address: ['The website resolved to a non-public address. The gateway stopped the request.', '网站解析到了非公网地址，网关已停止请求。'],
   web_response_limit: ['The website exceeded the connector’s response or session size limit.', '网站响应或会话超出了连接器的大小限制。'],

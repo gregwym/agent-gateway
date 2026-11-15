@@ -1,4 +1,4 @@
-"""Credentialed reads of explicitly profiled pages; no redirects or browser code."""
+"""Credentialed reads of explicitly profiled pages, without browser code."""
 from __future__ import annotations
 
 import html
@@ -17,11 +17,13 @@ from types import SimpleNamespace
 from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import Request
 
-from ..web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+from ..web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile, read_redirect_paths
 from ._base import ConnectorError, CredentialGate, Tool, serve, setting, string
 
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_TEXT = 60_000
+MAX_REDIRECTS = 2
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 IDENTIFIER = r"^[a-zA-Z0-9_-]{1,128}$"
 _COOKIE_NAME = re.compile(r"^[a-zA-Z0-9!#$%&'*+.^_`|~-]{1,128}$")
 _COOKIE_VALUE = re.compile(r"^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]{1,8192}$")
@@ -108,7 +110,7 @@ class _PublicHTTPS(http.client.HTTPSConnection):
 
 
 def _fetch(host, target, headers, receiver):
-    # No proxy, redirect, compression, scripts, or other asset requests.
+    # One HTTPS hop; the caller validates any continuation before sending it.
     with closing(_PublicHTTPS(host)) as connection:
         connection.request("GET", target, headers=headers)
         response = connection.getresponse()
@@ -207,15 +209,68 @@ class SiteSession:
 
     def _read(self, action, args):
         self.gate.check()
-        query = action.query | {param: args[key] for key, param in action.parameters.items() if key in args}
-        target = action.path + (("?" + urlencode(query)) if query else "")
+        query = urlencode(action.query | {param: args[key] for key, param in action.parameters.items() if key in args})
+        target = action.path + (("?" + query) if query else "")
+        started = time.monotonic()
+        allowed_paths = read_redirect_paths(self.profile.origin, action.path)
+        visited = {target}
+        while True:
+            if time.monotonic() - started > 23:
+                raise ConnectorError("The Web read timed out.", "connector_timeout")
+            page, redirect = self._read_hop(action, target, started)
+            if redirect is None:
+                break
+            path = self._redirect_path(redirect, allowed_paths, query)
+            target = path + (("?" + query) if query else "")
+            if target in visited or len(visited) > MAX_REDIRECTS:
+                raise ConnectorError("The site repeated its order page redirects.", "web_redirect_loop")
+            visited.add(target)
+
+        if any(marker.casefold() in page.casefold() for marker in action.reject):
+            raise self.gate.refused()
+        if action.expect and not any(marker.casefold() in page.casefold() for marker in action.expect):
+            raise _shape_error()
+        if action.format == "json":
+            try:
+                body = json.loads(page)
+                if not isinstance(body, dict) or not set(action.json_fields) & body.keys():
+                    raise _shape_error()
+                rendered = json.dumps(_filter_json({k: body[k] for k in action.json_fields if k in body}), ensure_ascii=False)
+            except (ValueError, RecursionError):
+                raise _shape_error() from None
+        else:
+            parser = _VisibleText()
+            parser.feed(page)
+            parser.close()
+            rendered = "\n".join(parser.parts)
+            if not rendered:
+                raise _shape_error()
+        rendered = self._redact(rendered)
+        if len(rendered) > MAX_TEXT:
+            raise ConnectorError("The Web read exceeded the output limit.", "web_response_limit")
+        return rendered
+
+    def _redirect_path(self, location, allowed_paths, query):
+        if allowed_paths and location and location.isascii() and not re.search(r"[\x00-\x20\x7f\\#]", location):
+            try:
+                parts = urlsplit(location)
+            except ValueError:
+                pass
+            else:
+                origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else None
+                relative = location.startswith("/") and not location.startswith("//") and not parts.scheme and not parts.netloc
+                if ((relative or origin == self.profile.origin) and parts.path in allowed_paths
+                        and (parts.query == query)):
+                    return parts.path
+        raise ConnectorError("The site redirected outside the allowed read page.", "web_redirect_refused")
+
+    def _read_hop(self, action, target, started):
         request = Request(self.profile.origin + target, headers={"User-Agent": "Agent-Gateway/1.0",
                           "Accept": "text/html" if action.format == "html" else "application/json",
                           "Accept-Language": "en-US,en;q=0.9"})
         self.jar.add_cookie_header(request)
         if not request.has_header("Cookie"):
             raise _session_error()
-        started = time.monotonic()
         prior_state = self._cookies()
         prior_secrets = len(self.seen_secrets)
 
@@ -244,8 +299,11 @@ class SiteSession:
             if status in (401, 403) or (300 <= status < 400 and re.search(
                     r"sign[-_]?in|login|captcha|challenge", headers.get("Location", "").split("?", 1)[0], re.I)):
                 raise self.gate.refused()
+            if status in _REDIRECT_STATUSES:
+                locations = headers.get_all("Location", [])
+                return None, locations[0] if len(locations) == 1 else ""
             if 300 <= status < 400:
-                raise ConnectorError("The site redirected the request. The redirect was blocked.", "web_redirect_refused")
+                raise ConnectorError("The site redirected outside the allowed read page.", "web_redirect_refused")
             if status == 429:
                 raise ConnectorError("The website is rate limiting this connection.", "connector_rate_limited")
             if status != 200:
@@ -260,10 +318,10 @@ class SiteSession:
                     raise ConnectorError("The Web read exceeded the response size limit.", "web_response_limit")
                 if time.monotonic() - started > 23:
                     raise TimeoutError()
-            return bytes(buffer).decode("utf-8", errors="replace")
+            return bytes(buffer).decode("utf-8", errors="replace"), None
 
         try:
-            page = self.fetch(self.host, target, dict(request.header_items()), receive)
+            return self.fetch(self.host, target, dict(request.header_items()), receive)
         except TimeoutError:
             raise ConnectorError("The Web read timed out.", "connector_timeout") from None
         except ssl.SSLError:
@@ -272,29 +330,6 @@ class SiteSession:
             raise ConnectorError("The website's name could not be resolved.", "connector_dns_failed") from None
         except (OSError, http.client.HTTPException):
             raise ConnectorError("The website could not be reached.", "connector_network_failed") from None
-        if any(marker.casefold() in page.casefold() for marker in action.reject):
-            raise self.gate.refused()
-        if action.expect and not any(marker.casefold() in page.casefold() for marker in action.expect):
-            raise _shape_error()
-        if action.format == "json":
-            try:
-                body = json.loads(page)
-                if not isinstance(body, dict) or not set(action.json_fields) & body.keys():
-                    raise _shape_error()
-                rendered = json.dumps(_filter_json({k: body[k] for k in action.json_fields if k in body}), ensure_ascii=False)
-            except (ValueError, RecursionError):
-                raise _shape_error() from None
-        else:
-            parser = _VisibleText()
-            parser.feed(page)
-            parser.close()
-            rendered = "\n".join(parser.parts)
-            if not rendered:
-                raise _shape_error()
-        rendered = self._redact(rendered)
-        if len(rendered) > MAX_TEXT:
-            raise ConnectorError("The Web read exceeded the output limit.", "web_response_limit")
-        return rendered
 
     def tools(self):
         return [Tool(name, action.description, lambda args, action=action: self.read(action, args),

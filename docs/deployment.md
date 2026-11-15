@@ -531,7 +531,7 @@ Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据�
 登录时，可在自己的电脑运行 `python -m examples.export_web_session amazon-us ./browser-session.json`，
 Weee 用 `weee-orders`。导入后删除文件。
 
-订单读取只向配置的 HTTPS 来源发送 Cookie，不跟随跳转。会话备份包括 `admin.enc` 和存在时的
+订单读取只向配置的 HTTPS 来源发送 Cookie。Weee! 的订单页允许同站点的语言跳转；其他未知跳转会被拦截。会话备份包括 `admin.enc` 和存在时的
 `admin.enc.web-sessions`。删除连接会删除网关保存的会话；撤销网站端会话请使用网站账户设置。
 
 Amazon US 和 Weee! 为实验配置。模拟验收覆盖登录、账号隔离和限定读取；实站可能要求额外验证，

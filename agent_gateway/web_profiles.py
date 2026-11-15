@@ -13,6 +13,17 @@ from .plugins import ManifestModel
 SESSION_ENV = "AGW_WEB_SESSION"
 PROFILE_ENV = "AGW_WEB_PROFILE"
 PARAM = r"[a-zA-Z][a-zA-Z0-9_-]{0,63}"
+WEEE_ORIGIN = "https://www.weee.com"
+WEEE_ORDER_PATH = "/en/account/my_orders"
+# Weee uses the site_lang session cookie to canonicalize the same read page.
+# These are runtime aliases so previously installed profiles need no changes.
+WEEE_ORDER_ALIASES = frozenset({WEEE_ORDER_PATH, "/zh/account/my_orders", "/account/my_orders"})
+
+
+def read_redirect_paths(origin, path):
+    if origin == WEEE_ORIGIN and path in WEEE_ORDER_ALIASES:
+        return WEEE_ORDER_ALIASES
+    return frozenset()
 
 
 class ReadAction(ManifestModel):
@@ -85,9 +96,9 @@ def bundled_profiles():
                     reject=["<title>Amazon Sign-In", "<title>Robot Check"]),
             })),
         "weee-orders": ("Weee! · experimental", WebProfile(
-            origin="https://www.weee.com", probe="list_orders", experimental=True, actions={
+            origin=WEEE_ORIGIN, probe="list_orders", experimental=True, actions={
                 "list_orders": ReadAction(description="Read the Weee! My Orders page.",
-                                          path="/en/account/my_orders",
+                                          path=WEEE_ORDER_PATH,
                                           expect=['class="order-list', 'class="order-card', 'data-testid="order-list"']),
             })),
     }
