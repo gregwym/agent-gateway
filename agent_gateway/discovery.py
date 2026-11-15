@@ -8,6 +8,7 @@ import mcp_types as types
 
 from .admin_config import kind_of, mailbox_metadata
 from .approval_dispatch import KEY_PROPERTY, WAIT_PROPERTY
+from .web_profiles import PROFILE_ENV, WebProfile
 
 SEARCH_TOOLS = "gateway_search_tools"
 SEARCH_CONNECTIONS = "gateway_search_connections"
@@ -58,7 +59,7 @@ BY_NAME = {tool.name: tool for tool in TOOLS}
 
 def shared_name(route):
     kind = kind_of(route.conn)
-    namespace = {"imap": "mail", "caldav": "calendar", "gmail": "gmail", "demo": "notes", "reminders": "reminders"}.get(kind)
+    namespace = {"imap": "mail", "caldav": "calendar", "gmail": "gmail", "demo": "notes", "reminders": "reminders", "web": "web"}.get(kind)
     raw = f"{namespace or 'service_' + route.conn.service}_{route.tool.upstream}"
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", raw)
     if cleaned != raw or len(cleaned) > 64:
@@ -112,17 +113,27 @@ def search_connections(gateway, who, args):
         conn = routes[0].conn
         owner = gateway.cfg.name_of(conn.owner)
         mailbox = mailbox_metadata(conn)
-        if not matches(args.get("query", ""), name, conn.service, owner, mailbox.get("email", ""),
+        origin = WebProfile.saved(conn.env[PROFILE_ENV]).origin if kind_of(conn) == "web" else None
+        if not matches(args.get("query", ""), name, conn.service, owner, origin or "", mailbox.get("email", ""),
                        mailbox.get("sender_email", ""), *mailbox.get("aliases", ())):
             continue
         item = {"connection": name, "service": conn.service, "owner": owner,
                 "tool_count": len({shared_name(r) for r in routes}), **mailbox}
+        if origin:
+            item["origin"] = origin
         if who.client_id in conn.mailbox_access:
             item["mailbox_paths_restricted"] = True
         if args.get("tool"):
-            item["variants"] = [{"id": r.tool.name, "description": r.exposed.description or "", "inputSchema": r.exposed.input_schema,
-                                 "approval_required": gateway.policy.effect(who.principal, r.tool.name, who.client_id) == "approval_required"}
-                                for r in sorted(routes, key=lambda r: r.tool.name)]
+            item["variants"] = []
+            for route in sorted(routes, key=lambda r: r.tool.name):
+                tool = route.tool.name
+                variant = {"id": tool, "description": route.exposed.description or "", "inputSchema": route.exposed.input_schema}
+                if origin:
+                    variant["access"] = {kind: gateway.policy.effect(who.principal, tool, who.client_id, operation=kind)
+                                         for kind in ("read", "write")}
+                else:
+                    variant["approval_required"] = gateway.policy.effect(who.principal, tool, who.client_id) == "approval_required"
+                item["variants"].append(variant)
         items.append(item)
     return page(items, args, "connections")
 

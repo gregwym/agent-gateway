@@ -228,10 +228,12 @@ class ConnectionCfg(_Model):
         if self.plugin and self.transport != "stdio":
             raise ValueError(f"{where}: local plugins require stdio")
         if self.plugin and "AGW_WEB_PROFILE" in self.env:
-            from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
-            WebProfile.model_validate_json(self.env[PROFILE_ENV])
-            if set(self.secret_env) != {SESSION_ENV} or any(t.access != "read" for t in self.tools):
-                raise ValueError(f"{where}: Website connections require one browser session and read-only tools")
+            from .web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile
+            WebProfile.saved(self.env[PROFILE_ENV])
+            if set(self.secret_env) != {SESSION_ENV}:
+                raise ValueError(f"{where}: Website connections require one browser session")
+            if any(t.access is not None for t in self.tools if t.upstream in WEB_TOOLS):
+                raise ValueError(f"{where}: Website request tools classify each operation automatically")
         if self.mailbox_access:
             from .catalog_sync import bundled_kind
             if bundled_kind(self) not in ("imap", "gmail"):
@@ -272,6 +274,7 @@ class RuleCfg(_Model):
     connection: str
     tools: list[str] = Field(min_length=1)  # exposed names; no wildcards
     effect: Effect
+    operation: Literal["read", "write"] | None = None  # Websites classify each request.
     mail_send_direct: bool = False  # explicit exception for built-in mail send tools
     # Must be set to grant a principal access to an account it does not own
     # (unless the owner is listed under `shared`). Guards against copy-paste grants.
@@ -388,6 +391,9 @@ class Config(_Model):
             for tool in rule.tools:
                 if tool not in exposed:
                     raise ValueError(f"{where}: {tool!r} is not a tool of connection {conn.id}")
+                from .web_profiles import WEB_TOOLS, is_website
+                if (rule.operation is not None) != (is_website(conn) and exposed[tool].upstream in WEB_TOOLS):
+                    raise ValueError(f"{where}: only Website request rules must select read or write")
                 if rule.mail_send_direct and (rule.effect != "allow" or not is_mail_send(conn, exposed[tool])):
                     raise ValueError(f"{where}: mail_send_direct is only valid on allow rules for built-in send tools")
             for principal in rule.principals:

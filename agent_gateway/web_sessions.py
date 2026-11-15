@@ -30,7 +30,7 @@ class WebSessions:
                 if ref in self.file.names():
                     record = json.loads(self.file.get(ref))
                     raw, redactions = record["cookies"], record["redactions"]
-                profile = WebProfile.model_validate_json(conn.env[PROFILE_ENV])
+                profile = WebProfile.saved(conn.env[PROFILE_ENV])
 
                 def persist(raw, redactions):
                     with self.lock:

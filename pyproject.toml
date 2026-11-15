@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-gateway"
-version = "0.15.3"
+version = "0.16.0"
 description = "A small self-hosted MCP gateway for a household: per-person identity, tool allowlists, credential isolation, audit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,7 @@ dependencies = [
     "PyYAML>=6,<7",
     "cryptography>=43",
     "jsonschema>=4.20,<5",
+    "graphql-core>=3.2.14,<3.3",
     "referencing>=0.35",
     "uvicorn>=0.30",
     # WebAuthn verification for passkey approvals. Used only when `approvals:` is configured.

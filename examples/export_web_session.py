@@ -23,7 +23,7 @@ def main():
         context = browser.new_context()
         page = context.new_page()
         page.goto(profile.origin, wait_until="domcontentloaded", timeout=30000)
-        input(f"Sign in to {host}, verify that you can see your orders, then press Enter here. ")
+        input(f"Sign in to {host}, then press Enter here. ")
         import json
         cookies = [cookie for cookie in context.cookies()
                    if cookie["domain"] == host or (cookie["domain"].startswith(".") and host.endswith(cookie["domain"]))]

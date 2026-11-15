@@ -1,4 +1,4 @@
-"""A Passkey-bound website login saves only credentials proven by the HTTP connector."""
+"""A Passkey-bound website login saves the session without contacting the site."""
 import asyncio
 import base64
 import os
@@ -16,7 +16,7 @@ from test_web_connector import response
 
 pytestmark = pytest.mark.anyio
 SECRET = "private-session-from-browser"
-PAGE = b'<main id="ordersContainer"><p>Simulated order</p></main>'
+
 
 
 @pytest.fixture
@@ -26,23 +26,14 @@ def socket_dir():
         yield Path(directory)
 
 
-def fake_browser(monkeypatch, *, screenshot=None, localized=False):
-    backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": [], "changed_page": False}
+def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
+    backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": []}
 
-    def fetch(host, target, headers, receive):
+    def fetch(host, target, method, headers, body, receive):
+        assert host == site and method == "HEAD" and target == "/" and body is None
         backend["reads"].append(target)
-        if backend["changed_page"]:
-            return response(receive, b"<main>Changed order page</main>")
-        if headers.get("Cookie") != "auth=" + SECRET or not backend["auth"]:
-            return response(receive, status=302, location="/ap/signin")
-        if localized:
-            assert host == "www.weee.com"
-            if target == "/en/account/my_orders":
-                return response(receive, status=307, location="/zh/account/my_orders")
-            assert target == "/zh/account/my_orders"
-            return response(receive, b'<main class="order-list"><p>Simulated order</p></main>')
-        assert host == "www.amazon.com" and target == "/your-orders/orders"
-        return response(receive, PAGE)
+        assert headers.get("Cookie") == "auth=" + SECRET
+        return response(receive, status=200 if backend["auth"] else 403)
 
     async def worker(self, action, data):
         backend["actions"].append(action)
@@ -52,8 +43,9 @@ def fake_browser(monkeypatch, *, screenshot=None, localized=False):
             backend["swipes"].append((data["dx"], data["dy"]))
         if action == "zoom":
             backend["zoom"] = data["percent"]
+        if action == "start":
+            assert data["url"] == "https://" + site + "/"
         if action == "cookies":
-            site = "www.weee.com" if localized else "www.amazon.com"
             assert data["origin"] == "https://" + site
             if not backend["cookie_ready"]:
                 return {"cookies": []}
@@ -70,7 +62,7 @@ def fake_browser(monkeypatch, *, screenshot=None, localized=False):
 @pytest.mark.parametrize("plugin", ["amazon-us", "weee-orders"])
 async def test_website_session_save_is_private_and_independent_of_read_checks(tmp_path, socket_dir, monkeypatch, plugin):
     monkeypatch.setenv("AGW_BROWSER_SOCKET", str(socket_dir / "control.sock"))
-    backend = fake_browser(monkeypatch, localized=plugin == "weee-orders")
+    backend = fake_browser(monkeypatch, site="www.weee.com" if plugin == "weee-orders" else "www.amazon.com")
     async with web_gateway(tmp_path) as (gw, http, origin, config):
         key, _ = await setup(http, origin, config)
         form = {"id": "shop-orders", "owner": "person_a", "plugin": plugin}
@@ -92,7 +84,6 @@ async def test_website_session_save_is_private_and_independent_of_read_checks(tm
         assert failure.status_code == 422 and failure.json()["error"] == "web_browser_sign_in_required", failure.text
         assert not any(c["id"] == form["id"] for c in (await state(http))["connections"])
         backend["cookie_ready"] = True
-        backend["changed_page"] = True
         saved = await http.post("/admin/api/web-login/save", json=ref)
         assert saved.status_code == 200, saved.text
         assert not backend["reads"]
@@ -101,15 +92,14 @@ async def test_website_session_save_is_private_and_independent_of_read_checks(tm
         settings = await state(http)
         conn = next(c for c in settings["connections"] if c["id"] == form["id"])
         assert conn["test"] is None and conn["access"]["agent-a"] == "none"
-        assert len(conn["tools"]) == (1 if plugin == "weee-orders" else 2)
-        assert all(t["access"] == "read" for t in conn["tools"])
+        assert {t["upstream"] for t in conn["tools"]} == {"http_request", "graphql_request"}
         assert SECRET.encode() not in (tmp_path / "admin.enc").read_bytes()
         assert all(s not in str(settings) + gw.audit_text() for s in (SECRET, typed, "unrelated-password"))
         before = (tmp_path / "admin.enc").read_bytes()
         mismatch = await http.post("/admin/api/connections/test", json={"id": conn["id"]})
-        assert mismatch.status_code == 422 and mismatch.json()["error"] == "web_profile_mismatch"
+        assert mismatch.status_code == 422 and mismatch.json()["error"] == "connector_access_denied"
         assert backend["reads"] and (tmp_path / "admin.enc").read_bytes() == before
-        backend["changed_page"], backend["auth"] = False, True
+        backend["auth"] = True
         assert (await http.post("/admin/api/connections/test", json={"id": conn["id"]})).status_code == 200
         refreshed = await change(http, "web-login/start", **form)
         assert refreshed.status_code == 200, refreshed.text
@@ -145,7 +135,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
 
     monkeypatch.setenv("AGW_BROWSER_SOCKET", str(socket_dir / "control.sock"))
     # Real JPEG from the UI browser. The upstream worker is replaced by a
-    # deterministic simulated site and server-side order probe.
+    # deterministic simulated site.
     async with playwright.async_playwright() as driver:
         browser = await driver.chromium.launch()
         page = await browser.new_page(viewport={"width": 420, "height": 620})
@@ -190,7 +180,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         backend["auth"] = True
         await login_box.get_by_role("button", name="保存会话", exact=True).tap()
         row = page.locator('tr[data-connection="amazon-orders"]')
-        await playwright.expect(row).to_contain_text("会话已保存 · 待读取验证")
+        await playwright.expect(row).to_contain_text("会话已保存")
         assert not backend["reads"]
         assert backend["inputs"] == ["demo-only-login"] and "tap" in backend["actions"]
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")

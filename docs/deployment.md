@@ -522,26 +522,28 @@ stdio MCP 示例：
 
 在手机或电脑打开「连接器 → 添加连接器 → 网站」，选择站点后点「登录网站」。在登录页点选输入框，
 再用下方的输入框输入账号、密码或验证码。可用「− / +」调整网页大小。登录后点「保存会话」。
-网关加密保存会话；需要检查订单读取时，再点「验证连接」。旧会话失效时，在「编辑设置」中点
-「重新登录」。新连接默认不向 Agent 开放。
+网关加密保存会话。旧会话失效时，在「编辑设置」中点「重新登录」。「验证网站连通性」只检查
+网站能否响应，不判断是否已登录。新连接默认不向 Agent 开放。
 
 Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据，也没有直接网络访问。登录窗口仅供
 管理员使用，关闭后清除浏览器数据。依赖手机本机通行密钥的站点登录方式无法在此窗口使用。
 
-「高级：导入会话文件」仍支持 Cookie JSON 数组或 Playwright `storageState`。无法在登录窗口完成
-登录时，可在自己的电脑运行 `python -m examples.export_web_session amazon-us ./browser-session.json`，
-Weee 用 `weee-orders`。导入后删除文件。
+「高级：导入会话文件」支持 Cookie JSON 数组或 Playwright `storageState`。也可用
+`python -m examples.export_web_session amazon-us ./browser-session.json`（Weee 用 `weee-orders`）。
+导入后删除文件。备份包括 `admin.enc` 和存在时的 `admin.enc.web-sessions`。
 
-订单读取只向配置的 HTTPS 来源发送 Cookie。Weee! 的订单页允许同站点的语言跳转；其他未知跳转会被拦截。会话备份包括 `admin.enc` 和存在时的
-`admin.enc.web-sessions`。删除连接会删除网关保存的会话；撤销网站端会话请使用网站账户设置。
+所有网站连接共用 `web_http_request` 和 `web_graphql_request`。Agent 指定连接与相对路径，读取
+HTTP 状态和文本响应。网关只向该连接的 HTTPS 来源发送 Cookie，不返回 Cookie 请求头或响应头，
+也不会自动跟随跳转。跨站跳转不返回目标，同源跳转可由 Agent 另行请求。网站若在普通页面中展示
+额外的敏感信息，该页面也属于获授权 Agent 可读取的数据范围。
 
-Amazon US 和 Weee! 为实验配置。模拟验收覆盖登录、账号隔离和限定读取；实站可能要求额外验证，
-或返回与已知读取规则不同的页面。
+HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理。HTTP 的 POST、PUT、PATCH、DELETE
+和 GraphQL mutation 按写处理。读写由请求内容决定，同一连接可分别设置审批。只读依赖网站遵循
+协议对读写的约定；对提供权限范围的服务，优先使用站点自身的最小权限账号。升级后，旧订单工具的
+授权不会转给通用工具；已保存的会话可继续使用。
 
-可用 `kind: "web"` 的扩展增加任意**已知读取操作**的站点：清单的 `web` 字段声明 `origin`、`probe` 和 `actions`。
-每个操作指定 `path`、`description`、可选 `query` 和 `parameters`（工具参数名映射到查询参数名）。
-HTML 操作需声明 `expect`（预期页面标记），返回剥除脚本及隐藏字段后的文字；JSON 操作指定 `format: "json"`
-和允许返回的顶层 `json_fields`。站点发布者负责验证路径只读；浏览器会话在站点上仍可能有写权限。
+新增站点可用 `kind: "web"` 的主机清单，`web` 只需指定 `origin`（例如
+`"https://service.example.com"`）。Amazon US 和 Weee! 是实验性的登录预设。
 
 ## 9. 日常操作
 

@@ -86,11 +86,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                         'name': 'weee-session.json', 'mimeType': 'application/json',
                         'buffer': b'[{"domain":"www.weee.com","name":"auth","value":"fake-browser-session"}]'})
                     await page.get_by_role('button', name='Import session', exact=True).click()
-                    review = page.get_by_role('dialog', name='Review tool definitions')
-                    await playwright.expect(review.get_by_label('Operation type: list_orders')).to_be_disabled()
-                    await review.get_by_label('I reviewed these definitions and permissions.').check()
-                    await review.get_by_role('button', name='Apply connector').click()
-                    await playwright.expect(page.locator('tr[data-connection=browser-weee]')).to_be_visible()
+                    await playwright.expect(page.locator('tr[data-connection=browser-weee]')).to_contain_text("Session saved")
                     await page.get_by_role('button', name='Add connector', exact=True).click()
                 await service.select_option('demo')
                 await page.get_by_label(t('Connector name','连接器名称'), exact=True).fill('browser-notes')

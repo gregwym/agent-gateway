@@ -1,4 +1,4 @@
-"""Credentialed reads of explicitly profiled pages, without browser code."""
+"""Bound-origin HTTP and GraphQL requests using a stored website session."""
 from __future__ import annotations
 
 import html
@@ -11,33 +11,25 @@ import ssl
 import time
 import threading
 from contextlib import closing
-from html.parser import HTMLParser
+from dataclasses import dataclass
 from http.cookiejar import Cookie, CookieJar
 from types import SimpleNamespace
-from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urljoin, urlsplit
 from urllib.request import Request
 
-from ..web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile, read_redirect_paths
-from ._base import ConnectorError, CredentialGate, Tool, serve, setting, string
+from graphql import GraphQLError, OperationDefinitionNode, FragmentDefinitionNode, OperationType, parse
+
+from ..web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile
+from ._base import ConnectorError, Tool, serve, setting, string
 
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_TEXT = 60_000
-MAX_REDIRECTS = 2
-_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
-IDENTIFIER = r"^[a-zA-Z0-9_-]{1,128}$"
+MAX_BODY = 128_000
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 _COOKIE_NAME = re.compile(r"^[a-zA-Z0-9!#$%&'*+.^_`|~-]{1,128}$")
 _COOKIE_VALUE = re.compile(r"^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]{1,8192}$")
-_SECRET_FIELD = re.compile(r"token|secret|cookie|csrf|xsrf|credential|password|authorization|session|api.?key", re.I)
 _TLS = ssl.create_default_context()
-
-
-def _session_error():
-    return ConnectorError("The browser session expired or requires signing in again. Import a fresh session.",
-                          "web_login_required")
-
-
-def _shape_error():
-    return ConnectorError("The page did not match this site's read profile.", "web_profile_mismatch")
 
 
 def import_session(raw, profile):
@@ -109,55 +101,178 @@ class _PublicHTTPS(http.client.HTTPSConnection):
         self._create_connection = _public_socket  # SNI and certificate checks still use the profile hostname.
 
 
-def _fetch(host, target, headers, receiver):
-    # One HTTPS hop; the caller validates any continuation before sending it.
+def _fetch(host, target, method, headers, body, receiver):
     with closing(_PublicHTTPS(host)) as connection:
-        connection.request("GET", target, headers=headers)
+        connection.request(method, target, body=body, headers=headers)
         response = connection.getresponse()
         return receiver(response.status, response.headers, response)
 
 
-class _VisibleText(HTMLParser):
-    SKIP = {"script", "style", "template", "noscript", "head", "svg", "iframe", "textarea", "input", "select"}
-    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+_HEADERS = {name.lower(): name for name in (
+    "Accept", "Accept-Language", "Content-Type", "If-Match", "If-None-Match", "Range", "X-Requested-With",
+)}
+_PATH = r"^/(?!/)[\x21-\x7e]*$"
+_MAX_QUERY = 16_384
 
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.stack = []
-        self.parts = []
 
-    def handle_starttag(self, tag, attrs):
-        if tag in self.VOID:
-            return
-        attrs = dict(attrs)
-        hidden = (tag in self.SKIP or "hidden" in attrs or attrs.get("aria-hidden") == "true"
-                  or bool(re.search(r"(?:display:\s*none|visibility:\s*hidden)", attrs.get("style") or "", re.I)))
-        if len(self.stack) >= 256:
-            raise _shape_error()
-        self.stack.append((tag, hidden or (self.stack[-1][1] if self.stack else False)))
+@dataclass(frozen=True)
+class RequestPlan:
+    method: str
+    target: str
+    headers: dict[str, str]
+    body: bytes | None
+    access: str
 
-    def handle_startendtag(self, tag, attrs):
+
+def _invalid(message):
+    return ConnectorError(message, "web_invalid_request")
+
+
+def _target(value):
+    try:
+        if (not isinstance(value, str) or len(value) > 4096 or not re.fullmatch(_PATH, value)
+                or re.search(r"[#\\]|%(?![0-9a-fA-F]{2})", value)):
+            raise ValueError()
+        return urlsplit(value)
+    except ValueError:
+        raise _invalid("Use a relative path on the website, starting with a single slash.") from None
+
+
+def _operation(document, name):
+    try:
+        if not isinstance(document, str) or not document or len(document) > _MAX_QUERY:
+            raise ValueError()
+        parsed = parse(document, no_location=True, max_tokens=2000)
+        operations = [op for op in parsed.definitions if isinstance(op, OperationDefinitionNode)]
+        names = [op.name.value if op.name else None for op in operations]
+        if (not operations or len(set(names)) != len(names) or (len(names) > 1 and None in names)
+                or any(not isinstance(node, (OperationDefinitionNode, FragmentDefinitionNode)) for node in parsed.definitions)):
+            raise ValueError()
+        if name is None and len(operations) == 1:
+            return operations[0].operation
+        if isinstance(name, str) and name in names:
+            return operations[names.index(name)].operation
+    except (GraphQLError, ValueError, RecursionError):
         pass
-
-    def handle_endtag(self, tag):
-        for i in range(len(self.stack) - 1, -1, -1):
-            if self.stack[i][0] == tag:
-                del self.stack[i:]
-                break
-
-    def handle_data(self, text):
-        if not self.stack or not self.stack[-1][1]:
-            value = " ".join(text.split())
-            if value:
-                self.parts.append(value)
+    raise _invalid("Provide a valid GraphQL document and select its operation if it has more than one.")
 
 
-def _filter_json(value):
-    if isinstance(value, dict):
-        return {k: _filter_json(v) for k, v in value.items() if not _SECRET_FIELD.search(k)}
-    if isinstance(value, list):
-        return [_filter_json(v) for v in value]
-    return value
+def _http_query(parts, is_read):
+    try:
+        parameters = parse_qsl(parts.query, keep_blank_values=True, max_num_fields=150)
+    except ValueError:
+        raise _invalid("The HTTP path contains too many query parameters.") from None
+    grouped = {}
+    for key, value in parameters:
+        folded = key.lower()
+        if folded in ("_method", "_http_method", "x-http-method-override", "x-method-override"):
+            raise _invalid("HTTP method overrides are not supported.")
+        grouped.setdefault(folded, []).append(value)
+    if not is_read:
+        return
+    # Standard GraphQL GET must never execute a mutation. Require the typed
+    # tool for any executable document or named/persisted operation we detect
+    # on this path, while allowing normal REST searches such as ?query=apples.
+    if "operationname" in grouped or "extensions" in grouped or "persistedquery" in grouped:
+        raise _invalid("Use graphql_request for GraphQL operations.")
+    for value in grouped.get("query", ()):
+        begin = re.sub(r"(?m)#[^\r\n]*", "", value).lstrip(",\ufeff \r\n\t")
+        if re.match(r"(?:\{|(?:query|mutation|subscription|fragment)\b)", begin):
+            raise _invalid("Use graphql_request for GraphQL operations.")
+
+
+def _request_headers(values):
+    if not isinstance(values, dict) or len(values) > len(_HEADERS):
+        raise _invalid("Invalid HTTP request headers.")
+    headers = {}
+    for name, value in values.items():
+        canonical = _HEADERS.get(name.lower())
+        if (not canonical or canonical in headers or not isinstance(value, str)
+                or not re.fullmatch(r"[\x20-\x7e]{1,1024}", value)):
+            raise _invalid("Unsupported or invalid HTTP request header. The gateway supplies the session.")
+        headers[canonical] = value
+    return headers
+
+
+def plan_request(tool, args):
+    target = args.get("path")
+    parts = _target(target)
+    headers = _request_headers(args.get("headers", {}))
+    body = None
+    try:
+        if tool == "http_request":
+            method = args.get("method")
+            if method not in _METHODS:
+                raise _invalid("Unsupported HTTP method.")
+            read = method in _READ_METHODS
+            _http_query(parts, read)
+            if "body" in args:
+                if read:
+                    raise _invalid("GET, HEAD and OPTIONS cannot include a request body.")
+                body = args["body"].encode("utf-8")
+        elif tool == "graphql_request":
+            if "?" in target:
+                raise _invalid("Use a GraphQL endpoint path without a URL query string.")
+            document, name = args.get("query"), args.get("operation_name")
+            operation = _operation(document, name)
+            if operation == OperationType.SUBSCRIPTION:
+                raise _invalid("GraphQL subscriptions are not supported.")
+            method, read = "POST", operation == OperationType.QUERY
+            payload = {"query": document}
+            if name is not None:
+                payload["operationName"] = name
+            if "variables" in args:
+                payload["variables"] = args["variables"]
+            body = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
+            headers.setdefault("Accept", "application/graphql-response+json, application/json;q=0.9")
+            headers["Content-Type"] = "application/json"
+        else:
+            raise _invalid("Unknown Web request tool.")
+    except (ValueError, RecursionError):
+        raise _invalid("The request body could not be encoded.") from None
+    if body is not None and len(body) > MAX_BODY:
+        raise _invalid("The request body is too large.")
+    return RequestPlan(method, target, headers, body, "read" if read else "write")
+
+
+def _same_origin_location(origin, current_path, locations):
+    if len(locations) != 1:
+        return None
+    location = locations[0]
+    if not re.fullmatch(r"[\x21-\x7e]{1,4096}", location) or "\\" in location:
+        return None
+    try:
+        parts = urlsplit(urljoin(origin + current_path, location))
+        if f"{parts.scheme}://{parts.netloc}" != origin:
+            return None
+        target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        _target(target)
+        return target
+    except (ValueError, ConnectorError):
+        return None
+
+
+def build_tools(handler=None):
+    path = string("Relative path on the connection's website, starting with /. Percent-encode URL values.", 4096, _PATH)
+    headers = {"type": "object", "maxProperties": len(_HEADERS), "description":
+               "Optional HTTP headers: Accept, Accept-Language, Content-Type, If-Match, If-None-Match, Range, X-Requested-With. The session is supplied by the Gateway.",
+               "additionalProperties": string("Header value", 1024, r"^[\x20-\x7e]+$")}
+    http, graphql = WEB_TOOLS
+    result = " Returns the HTTP status and text body, plus a relative Location for same-site redirects. Redirects are never followed automatically."
+    return [
+        Tool(http, "Make an HTTP request to the connection's website. GET, HEAD and OPTIONS are reads; POST, PUT, PATCH and DELETE are writes." + result,
+             lambda args: handler(http, args),
+             {"path": path, "method": {"type": "string", "enum": list(_METHODS)}, "headers": headers,
+              "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for write methods."}},
+             ("path", "method"), read_only=False),
+        Tool(graphql, "Send a GraphQL request to the connection's website. A selected query is a read and a mutation is a write." + result,
+             lambda args: handler(graphql, args),
+             {"path": path, "query": {"type": "string", "minLength": 1, "maxLength": _MAX_QUERY}, "headers": headers,
+              "operation_name": string("Operation to execute when the document contains multiple operations.", 128,
+                                       r"^[_A-Za-z][_0-9A-Za-z]*$"),
+              "variables": {"type": "object", "maxProperties": 100}},
+             ("path", "query"), read_only=False),
+    ]
 
 
 class SiteSession:
@@ -169,7 +284,6 @@ class SiteSession:
         self.persist = persist
         self.lock = threading.Lock()
         self.seen_secrets = set(redactions)
-        self.gate = CredentialGate(str(_session_error()), code="web_login_required")
         for item in json.loads(raw):
             self.jar.set_cookie(Cookie(
                 version=0, name=item["name"], value=item["value"], port=None, port_specified=False,
@@ -199,78 +313,25 @@ class SiteSession:
             value = re.sub("|".join(re.escape(s) for s in secrets), "[REDACTED]", value)
         return value
 
-    def read(self, action, args):
+    def request(self, tool, arguments):
+        plan = plan_request(tool, arguments)
         if not self.lock.acquire(timeout=2):
-            raise ConnectorError("Another read is in progress for this browser session.", "web_session_busy")
+            raise ConnectorError("Another request is in progress for this website session.", "web_session_busy")
         try:
-            return self._read(action, args)
+            return self._request(plan)
         finally:
             self.lock.release()
 
-    def _read(self, action, args):
-        self.gate.check()
-        query = urlencode(action.query | {param: args[key] for key, param in action.parameters.items() if key in args})
-        target = action.path + (("?" + query) if query else "")
+    def _request(self, plan):
         started = time.monotonic()
-        allowed_paths = read_redirect_paths(self.profile.origin, action.path)
-        visited = {target}
-        while True:
-            if time.monotonic() - started > 23:
-                raise ConnectorError("The Web read timed out.", "connector_timeout")
-            page, redirect = self._read_hop(action, target, started)
-            if redirect is None:
-                break
-            path = self._redirect_path(redirect, allowed_paths, query)
-            target = path + (("?" + query) if query else "")
-            if target in visited or len(visited) > MAX_REDIRECTS:
-                raise ConnectorError("The site repeated its order page redirects.", "web_redirect_loop")
-            visited.add(target)
-
-        if any(marker.casefold() in page.casefold() for marker in action.reject):
-            raise self.gate.refused()
-        if action.expect and not any(marker.casefold() in page.casefold() for marker in action.expect):
-            raise _shape_error()
-        if action.format == "json":
-            try:
-                body = json.loads(page)
-                if not isinstance(body, dict) or not set(action.json_fields) & body.keys():
-                    raise _shape_error()
-                rendered = json.dumps(_filter_json({k: body[k] for k in action.json_fields if k in body}), ensure_ascii=False)
-            except (ValueError, RecursionError):
-                raise _shape_error() from None
-        else:
-            parser = _VisibleText()
-            parser.feed(page)
-            parser.close()
-            rendered = "\n".join(parser.parts)
-            if not rendered:
-                raise _shape_error()
-        rendered = self._redact(rendered)
-        if len(rendered) > MAX_TEXT:
-            raise ConnectorError("The Web read exceeded the output limit.", "web_response_limit")
-        return rendered
-
-    def _redirect_path(self, location, allowed_paths, query):
-        if allowed_paths and location and location.isascii() and not re.search(r"[\x00-\x20\x7f\\#]", location):
-            try:
-                parts = urlsplit(location)
-            except ValueError:
-                pass
-            else:
-                origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else None
-                relative = location.startswith("/") and not location.startswith("//") and not parts.scheme and not parts.netloc
-                if ((relative or origin == self.profile.origin) and parts.path in allowed_paths
-                        and (parts.query == query)):
-                    return parts.path
-        raise ConnectorError("The site redirected outside the allowed read page.", "web_redirect_refused")
-
-    def _read_hop(self, action, target, started):
-        request = Request(self.profile.origin + target, headers={"User-Agent": "Agent-Gateway/1.0",
-                          "Accept": "text/html" if action.format == "html" else "application/json",
-                          "Accept-Language": "en-US,en;q=0.9"})
+        request = Request(self.profile.origin + plan.target, headers={
+            "User-Agent": "Agent-Gateway/1.0", "Accept-Encoding": "identity",
+            **plan.headers,
+        }, method=plan.method)
+        self.jar.clear_expired_cookies()
+        if not len(self.jar):
+            raise ConnectorError("The website session has expired. Sign in again.", "web_login_required")
         self.jar.add_cookie_header(request)
-        if not request.has_header("Cookie"):
-            raise _session_error()
         prior_state = self._cookies()
         prior_secrets = len(self.seen_secrets)
 
@@ -296,34 +357,47 @@ class SiteSession:
                 except (OSError, SecretStoreError):
                     self.jar.clear()
                     raise ConnectorError("The updated browser session could not be saved.", "web_session_storage_failed") from None
-            if status in (401, 403) or (300 <= status < 400 and re.search(
-                    r"sign[-_]?in|login|captcha|challenge", headers.get("Location", "").split("?", 1)[0], re.I)):
-                raise self.gate.refused()
-            if status in _REDIRECT_STATUSES:
-                locations = headers.get_all("Location", [])
-                return None, locations[0] if len(locations) == 1 else ""
-            if 300 <= status < 400:
-                raise ConnectorError("The site redirected outside the allowed read page.", "web_redirect_refused")
-            if status == 429:
-                raise ConnectorError("The website is rate limiting this connection.", "connector_rate_limited")
-            if status != 200:
-                raise ConnectorError("The Web read returned HTTP " + str(status) + ".", "web_http_rejected")
-            expected = "text/html" if action.format == "html" else "application/json"
-            if headers.get_content_type() != expected or headers.get("Content-Encoding", "identity") != "identity":
-                raise _shape_error()
+            content_type = headers.get_content_type()
+            result = {"status": status, "content_type": self._redact(content_type), "body": ""}
+            if fields := {name.lower(): self._redact(value) for name in ("ETag", "Last-Modified", "Content-Range")
+                          if (value := headers.get(name)) and len(value) <= 1024}:
+                result["headers"] = fields
+            # Expose only same-origin redirects. An Agent may submit the next
+            # hop as a new, separately authorized call; we never replay a write.
+            if 300 <= status < 400 and (locations := headers.get_all("Location", [])):
+                location = _same_origin_location(self.profile.origin, plan.target, locations)
+                if location is not None:
+                    result["location"] = self._redact(location)
+                else:
+                    result["redirect_blocked"] = True
+                return result
+            if plan.method == "HEAD" or status in (204, 304):
+                return result
+            if headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ConnectorError("The website returned an unsupported content encoding.", "web_response_encoding")
+            if (not content_type.startswith("text/") and not content_type.endswith(("+json", "+xml"))
+                    and content_type not in ("application/json", "application/xml", "application/javascript")):
+                # Preserve the status of empty or binary responses, without
+                # copying an opaque body that we cannot redact.
+                result["body_omitted"] = True
+                return result
             buffer = bytearray()
             while data := stream.read1(16384):
                 buffer.extend(data)
                 if len(buffer) > MAX_RESPONSE:
-                    raise ConnectorError("The Web read exceeded the response size limit.", "web_response_limit")
+                    raise ConnectorError("The Web request exceeded the response size limit.", "web_response_limit")
                 if time.monotonic() - started > 23:
                     raise TimeoutError()
-            return bytes(buffer).decode("utf-8", errors="replace"), None
+            rendered = self._redact(bytes(buffer).decode("utf-8", errors="replace"))
+            result["body"] = rendered[:MAX_TEXT]
+            if len(rendered) > MAX_TEXT:
+                result["truncated"] = True
+            return result
 
         try:
-            return self.fetch(self.host, target, dict(request.header_items()), receive)
+            return self.fetch(self.host, plan.target, plan.method, dict(request.header_items()), plan.body, receive)
         except TimeoutError:
-            raise ConnectorError("The Web read timed out.", "connector_timeout") from None
+            raise ConnectorError("The Web request timed out.", "connector_timeout") from None
         except ssl.SSLError:
             raise ConnectorError("The website TLS check failed.", "connector_tls_failed") from None
         except socket.gaierror:
@@ -332,13 +406,11 @@ class SiteSession:
             raise ConnectorError("The website could not be reached.", "connector_network_failed") from None
 
     def tools(self):
-        return [Tool(name, action.description, lambda args, action=action: self.read(action, args),
-                     {key: string("Identifier for " + key, 128, IDENTIFIER) for key in action.parameters},
-                     tuple(action.required)) for name, action in self.profile.actions.items()]
+        return build_tools(self.request)
 
 
 def main():
-    profile = WebProfile.model_validate_json(setting(PROFILE_ENV))
+    profile = WebProfile.saved(setting(PROFILE_ENV))
     session = SiteSession(profile, setting(SESSION_ENV))
     serve(urlsplit(profile.origin).hostname, session.tools())
 

@@ -139,11 +139,12 @@ connections support OAuth, Bearer or API-key headers, and unauthenticated
 endpoints. OAuth tokens stay encrypted and refresh automatically.
 
 Host-installed [connector manifests](docs/deployment.md#connector-plugins)
-add stdio MCP servers, fixed CLI operations, and read-only website profiles.
-Sign in to a website from the admin page on a phone or computer. Save the session
-per account and test order access separately. Agents never receive browser cookies.
-Amazon US and Weee! profiles are experimental; authenticated reads have only
-been tested against simulated sites.
+add stdio MCP servers, fixed CLI operations, and website origins. Website
+connections share `web_http_request` and `web_graphql_request`. An Agent selects
+a connection, supplies the relative path and request, and interprets the
+response. The Gateway attaches the saved session and applies the connection's
+read/write policy. Sign in from the admin page on a phone or computer.
+Amazon US and Weee! are experimental sign-in presets.
 
 See [product requirements](docs/requirements.md) and
 [remote connection setup](docs/deployment.md#remote-mcp).

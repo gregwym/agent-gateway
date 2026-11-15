@@ -1,20 +1,28 @@
-"""Simulated retailer pages: real Gateway permissions and file-backed session rotation."""
+"""Exercise the shared website tools with simulated HTTPS responses and real approvals."""
 import json
 import socket
+import uuid
 from email.message import Message
 from io import BytesIO
+from urllib.parse import urlencode
 
 import pytest
+from mcp import MCPError
 
 from agent_gateway.connectors import web
-from agent_gateway.web_profiles import SESSION_ENV, bundled_profiles
-from helpers import TOKEN_A
-from test_admin import change, rpc, setup, state, web_gateway
+from agent_gateway.config import Config
+from agent_gateway.web_profiles import PROFILE_ENV, SESSION_ENV, bundled_profiles
+from agent_gateway.web_sessions import session_ref
+from helpers import TOKEN_A, TOKEN_B, agent, prepare, text_of
+from passkey_helpers import Page, approval_config, request_id_in
+from service_helpers import free_port
+from test_admin import change, login, setup, state, web_gateway
+from test_discovery import execute, search
 
 
-def response(receive, body=b'', *, status=200, rotate=None, location=None):
+def response(receive, body=b'', *, status=200, rotate=None, location=None, content_type="text/html; charset=utf-8"):
     headers = Message()
-    headers["Content-Type"] = "text/html; charset=utf-8"
+    headers["Content-Type"] = content_type
     if rotate:
         headers["Set-Cookie"] = f"auth={rotate}; Secure; HttpOnly; Path=/"
     if location:
@@ -22,88 +30,161 @@ def response(receive, body=b'', *, status=200, rotate=None, location=None):
     return receive(status, headers, BytesIO(body))
 
 
-@pytest.mark.parametrize("plugin,host,marker,path,query", [
-    ("amazon-us", "www.amazon.com", 'id="ordersContainer"', "/your-orders/orders", {"start_index": "10"}),
-    ("weee-orders", "www.weee.com", 'class="order-list"', "/en/account/my_orders", {}),
-])
+async def start_site(tmp_path):
+    port = free_port()
+    origin = f"http://localhost:{port}"
+    raw = approval_config(origin=origin)
+    raw["server"]["tool_discovery"] = "search"
+    raw["admin"] = {"owner": "person_a", "state": "admin.enc"}
+    return await prepare(tmp_path, raw), port
+
+
+async def add_site(http, name, plugin, cookie):
+    profile = bundled_profiles()[plugin][1]
+    cookies = [{"domain": profile.origin.removeprefix("https://"), "name": "auth", "value": cookie},
+               {"domain": "unrelated.example", "name": "auth", "value": "not-our-cookie"}]
+    saved = await change(http, "connections/save", id=name, kind="web", owner="person_a",
+                         settings={"plugin": plugin}, credentials={SESSION_ENV: json.dumps(cookies)})
+    assert saved.status_code == 200, saved.text
+    assert cookie not in saved.text
+
+
+def payload(result):
+    assert not result.is_error, text_of(result)
+    return json.loads(result.content[-1].text)
+
+
 @pytest.mark.anyio
-async def test_retail_profile_isolation_renewal_and_permissions(tmp_path, monkeypatch, plugin, host, marker, path, query):
-    calls = []
-    alpha = "alpha-private-cookie"
-    bravo = "bravo-private-cookie"
-    rotated = "rotated-private-cookie"
+async def test_two_shared_tools_account_isolation_read_rules_and_write_approval(tmp_path, monkeypatch):
+    requests = []
+    private = {"www.amazon.com": "alpha-private-cookie", "www.weee.com": "bravo-private-cookie"}
 
-    def fake_fetch(hostname, target, headers, receive):
-        assert hostname == host and target.split("?", 1)[0] == path
-        assert "unrelated-private-cookie" not in str(headers)
-        auth = headers["Cookie"]
-        calls.append((target, auth))
-        if auth == "auth=" + bravo:
-            return response(receive, status=302, location="https://cross-origin.example/session")
-        assert auth in ["auth=" + alpha, "auth=" + rotated]
-        return response(receive, f"""
-            <main {marker}><p>Rice and apples</p><p>{alpha} {rotated}</p>
-            <script>hidden-script-credential</script><span hidden>hidden-field-value</span>
-            <input value="hidden-input-value"></main>
-        """.encode(), rotate=rotated)
+    def fetch(host, target, method, headers, body, receive):
+        assert headers["Cookie"] == f"auth={private[host]}"
+        requests.append((host, target, method, body))
+        if target == "/redirect":
+            return response(receive, status=307, location="https://other.example/steal")
+        if target == "/locale":
+            return response(receive, status=307, location="/zh/page?language=zh")
+        if target == "/api":
+            return response(receive, b'{"data":{"result":"simulated"}}', content_type="application/graphql-response+json")
+        return response(receive, f"<main>Simulated page {private[host]}</main>".encode())
 
-    monkeypatch.setattr(web, "_fetch", fake_fetch)
-    port, cfg_path = None, None
-    for restarting in (False, True):
-        async with web_gateway(tmp_path, path=cfg_path, port=port) as (gw, http, origin, cfg_file):
-            if not restarting:
-                cfg_path = cfg_file
-                port = int(origin.rsplit(":", 1)[-1])
-                key, _ = await setup(http, origin, cfg_file)
-                for name, cookie in [("web-a", alpha), ("web-b", bravo)]:
-                    creds = {"cookies": [{"domain": host, "name": "auth", "value": cookie},
-                                         {"domain": "unrelated.example", "name": "auth", "value": "unrelated-private-cookie"}]}
-                    body = dict(id=name, kind="web", owner="person_a", settings={"plugin": plugin},
-                                credentials={SESSION_ENV: json.dumps(creds)})
-                    test = await change(http, "connections/preview", **{
-                        **body, "credentials": {SESSION_ENV: json.dumps({"cookies": creds["cookies"][1:]})}})
-                    assert test.json()["error"] == "web_session_invalid"
-                    review = await change(http, "connections/preview", **body)
-                    assert review.status_code == 200, review.text
-                    preview = review.json()
-                    assert preview["read_only"] and not calls
-                    assert all(tool["access"] == "read" for tool in preview["tools"])
-                    selection = dict(draft=preview["draft"], reviewed=True, tools=preview["tools"])
-                    invalid = await change(http, "connections/apply", **{**selection, "tools": [
-                        {**preview["tools"][0], "access": "write"}]})
-                    assert invalid.json()["error"] == "invalid_remote_tool_selection"
-                    assert (await change(http, "connections/apply", **selection)).status_code == 200
-                    config = await state(http)
-                    conn = next(c for c in config["connections"] if c["id"] == name)
-                    assert conn["access"]["agent-a"] == "none"
-                    assert cookie not in str(config) + review.text
-                    tool = next(t["name"] for t in conn["tools"] if t["upstream"] == "list_orders")
-                    denied = await rpc(origin, TOKEN_A, "tools/call", {"name": tool, "arguments": {}})
-                    assert denied.json()["error"]
-                assert not calls
-                assert (await change(http, "permissions/connection", connection="web-a", client="agent-a", access="read")).status_code == 200
-                assert (await change(http, "connections/test", id="web-a")).status_code == 200
-                assert calls == [(path, "auth=" + alpha)]
-                failed = await change(http, "connections/test", id="web-b")
-                assert failed.json()["error"] == "web_redirect_refused"
-                conn = next(c for c in (await state(http))["connections"] if c["id"] == "web-a")
-                tool = next(t["name"] for t in conn["tools"] if t["upstream"] == "list_orders")
-                assert (await rpc(origin, TOKEN_A, "tools/call", {"name": tool, "arguments": {"url": "https://evil.example/"}})).json()["result"]["isError"]
-                assert calls == [(path, "auth=" + alpha), (path, "auth=" + bravo)]
-                assert rotated.encode() not in (tmp_path / "admin.enc.web-sessions").read_bytes()
-            else:
-                from test_admin import login
-                await login(http, key, origin)
-            result = (await rpc(origin, TOKEN_A, "tools/call", {"name": tool, "arguments": query})).json()["result"]
-            assert not result.get("isError"), result
-            combined = str(result) + gw.audit_text()
-            assert "Rice and apples" in combined
-            assert all(value not in combined for value in (alpha, bravo, rotated, "hidden-script-credential",
-                                                            "hidden-input-value", "hidden-field-value"))
-            assert calls[-1] == (path + ("?startIndex=10" if query else ""), "auth=" + rotated)
-            if restarting:
-                assert (await change(http, "connections/remove", id="web-a")).status_code == 200
-                assert not gw.app.state.admin.web_sessions.file.names()
+    monkeypatch.setattr(web, "_fetch", fetch)
+    path, port = await start_site(tmp_path)
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
+        key, _ = await setup(http, origin, path)
+        await add_site(http, "shop-a", "amazon-us", private["www.amazon.com"])
+        await add_site(http, "shop-b", "weee-orders", private["www.weee.com"])
+        assert not requests
+        config = await state(http)
+        for conn in (c for c in config["connections"] if c["kind"] == "web"):
+            assert {t["upstream"] for t in conn["tools"]} == {"http_request", "graphql_request"}
+            assert conn["access"]["agent-a"] == "none"
+        assert all(cookie not in str(config) for cookie in private.values())
+
+        async with agent(origin + "/mcp", TOKEN_A) as allowed, agent(origin + "/mcp", TOKEN_B) as denied:
+            assert (await search(allowed, "tools", query="web_http_request"))["total"] == 0
+            for name in ("shop-a", "shop-b"):
+                grant = await change(http, "permissions/connection", connection=name, client="agent-a", access="read")
+                assert grant.status_code == 200, grant.text
+            tools = (await search(allowed, "tools", connection="shop-a"))["tools"]
+            assert {t["name"] for t in tools} == {"web_http_request", "web_graphql_request"}
+            assert (await search(allowed, "tools", query="web_http_request"))["tools"][0]["connection_count"] == 2
+            item, = (await search(allowed, "connections", query="weee.com", tool="web_graphql_request"))["connections"]
+            assert item["origin"] == "https://www.weee.com"
+            assert item["variants"][0]["access"] == {"read": "allow", "write": "deny"}
+            assert (await search(denied, "connections", query="weee.com"))["total"] == 0
+            assert (await search(allowed, "tools", query="list_orders"))["total"] == 0
+            with pytest.raises(MCPError, match="Unknown tool"):
+                await execute(allowed, "service_amazon_us_list_orders", "shop-a", {})
+            result = await execute(allowed, "web_http_request", "shop-a", {"method": "GET", "path": "/account/items?q=10"})
+            assert payload(result)["body"] == "<main>Simulated page [REDACTED]</main>"
+            assert requests[-1][:3] == ("www.amazon.com", "/account/items?q=10", "GET")
+
+            document = "query View($q: String) { items(q:$q) } mutation Delete { deleteItem }"
+            query = {"path": "/api", "query": document, "operation_name": "View", "variables": {"q": "rice"}}
+            assert payload(await execute(allowed, "web_graphql_request", "shop-b", query))["status"] == 200
+            assert requests[-1][:3] == ("www.weee.com", "/api", "POST")
+            assert json.loads(requests[-1][3]) == {"query": document, "operationName": "View", "variables": {"q": "rice"}}
+            mutation = {**query, "operation_name": "Delete"}
+            count = len(requests)
+            for tool, args in [
+                ("graphql", mutation),
+                ("graphql", {**query, "operation_name": "NoSuchOperation"}),
+                ("graphql", {"path": "/api", "query": "query Same {a} mutation Same {b}", "operation_name": "Same"}),
+                ("graphql", {"path": "/api?operationName=Delete", "query": "{ items }"}),
+                ("http", {"path": "/account/archive", "method": "POST"}),
+                ("http", {"path": "/api?" + urlencode({"query": "# check\nmutation { deleteItem }"}), "method": "GET"}),
+                ("http", {"path": "/path?%5fmethod=DELETE", "method": "GET"}),
+                ("http", {"path": "//other.example/stolen", "method": "GET"}),
+                ("http", {"path": "/page", "method": "GET", "headers": {"Cookie": "fake"}}),
+                ("http", {"path": "/page", "method": "GET", "headers": {"X-HTTP-Method-Override": "DELETE"}}),
+            ]:
+                assert (await execute(allowed, f"web_{tool}_request", "shop-b", args)).is_error
+            assert len(requests) == count
+            result = payload(await execute(allowed, "web_http_request", "shop-b", {"method": "GET", "path": "/redirect"}))
+            assert result["status"] == 307 and result["redirect_blocked"] and "location" not in result
+            result = payload(await execute(allowed, "web_http_request", "shop-b", {"method": "GET", "path": "/locale"}))
+            assert result["location"] == "/zh/page?language=zh"
+            assert len(requests) == count + 2  # neither redirect was followed
+
+            grant = await change(http, "permissions/connection", connection="shop-b", client="agent-a", access="read_write")
+            assert grant.status_code == 200, grant.text
+            idem = uuid.uuid4().hex
+            pending = await execute(allowed, "web_graphql_request", "shop-b", mutation, idempotency_key=idem)
+            ident = request_id_in(text_of(pending))
+            assert len(requests) == count + 2
+            assert (await Page(origin, origin).decide("approve", ident, key, origin=origin))[0] == 200
+            resumed = await allowed.call_tool("gateway_call_tool", {"idempotency_key": idem, "wait_seconds": 10})
+            assert payload(resumed)["status"] == 200
+            assert json.loads(requests[-1][3])["operationName"] == "Delete"
+            assert len(requests) == count + 3
+        assert all(cookie not in gw.audit_text() for cookie in private.values())
+
+
+@pytest.mark.anyio
+async def test_upgrade_removes_order_tools_and_grants_without_losing_rotated_session(tmp_path, monkeypatch):
+    old_cookie, saved_cookie = "initial-private-cookie", "rotated-private-cookie"
+    observed = []
+
+    def fetch(host, target, method, headers, body, receive):
+        observed.append(headers["Cookie"])
+        return response(receive, status=204)
+
+    monkeypatch.setattr(web, "_fetch", fetch)
+    path, port = await start_site(tmp_path)
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
+        key, _ = await setup(http, origin, path)
+        await add_site(http, "retail", "weee-orders", old_cookie)
+        admin = gw.app.state.admin
+        legacy = admin.store.candidate()
+        conn = next(c for c in legacy["config"]["connections"] if c["id"] == "retail")
+        conn["env"][PROFILE_ENV] = json.dumps({"origin": "https://www.weee.com", "probe": "list_orders",
+                                               "experimental": True, "actions": {"list_orders": {"path": "/old"}}})
+        conn["tools"] = [{"upstream": "list_orders", "name": "retail_list_orders", "access": "read"}]
+        legacy["config"]["policy"].append({"clients": ["agent-a"], "connection": "retail", "tools": ["retail_list_orders"], "effect": "allow"})
+        legacy["locks"].pop("retail")
+        legacy["bundled_catalog"].pop("retail")
+        cfg = Config.model_validate({**admin.store.base.model_dump(), **legacy["config"]})
+        ref = session_ref(cfg.connection("retail"), legacy["secrets"])
+        rotated = [{"name":"auth", "value":saved_cookie, "path":"/", "expires":-1}]
+        admin.web_sessions.file.set(ref, json.dumps({"cookies": json.dumps(rotated), "redactions": [old_cookie]}))
+        admin.store.save(legacy)
+        original_bytes = (tmp_path / "admin.enc.web-sessions").read_bytes()
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, _):
+        await login(http, key, origin)
+        conn = next(c for c in (await state(http))["connections"] if c["id"] == "retail")
+        assert conn["access"]["agent-a"] == "none"
+        assert "retail_list_orders" in conn["catalog_sync"]["revoked"]
+        assert (tmp_path / "admin.enc.web-sessions").read_bytes() == original_bytes
+        async with agent(origin + "/mcp", TOKEN_A) as still_denied:
+            assert (await search(still_denied, "tools", connection="retail"))["total"] == 0
+        assert (await change(http, "permissions/connection", connection="retail", client="agent-a", access="read")).status_code == 200
+        async with agent(origin + "/mcp", TOKEN_A) as allowed:
+            assert payload(await execute(allowed, "web_http_request", "retail", {"method": "GET", "path": "/new"}))["status"] == 204
+        assert observed == ["auth=" + saved_cookie]
+        assert saved_cookie.encode() not in original_bytes
 
 
 def test_non_public_dns_answer_is_refused_before_connect(monkeypatch):
@@ -112,67 +193,3 @@ def test_non_public_dns_answer_is_refused_before_connect(monkeypatch):
     with pytest.raises(web.ConnectorError) as exc:
         web._public_socket(("www.amazon.com", 443), 1, None)
     assert exc.value.code == "web_unsafe_address"
-
-
-def test_unknown_page_and_login_failure_are_distinct():
-    profile = bundled_profiles()["amazon-us"][1]
-    raw = web.import_session('[{"name":"auth","value":"private-test","domain":".amazon.com"}]', profile)
-    wrong = web.SiteSession(profile, raw, fetch=lambda h, t, headers, recv: response(recv, b'<main>Changed page</main>'))
-    expired = web.SiteSession(profile, raw, fetch=lambda h, t, headers, recv: response(recv, status=302, location='/ap/signin'))
-    expected = profile.actions["list_orders"]
-    for session, code in [(wrong, "web_profile_mismatch"), (expired, "web_login_required")]:
-        with pytest.raises(web.ConnectorError) as exc:
-            session.read(expected, {})
-        assert exc.value.code == code
-
-
-def _weee_session(fetch, *, persist=None):
-    profile = bundled_profiles()["weee-orders"][1]
-    raw = web.import_session('[{"name":"auth","value":"start-private-session","domain":"www.weee.com"},'
-                             '{"name":"site_lang","value":"zh","domain":"www.weee.com"}]', profile)
-    return web.SiteSession(profile, raw, fetch=fetch, persist=persist), profile.actions["list_orders"]
-
-
-def test_weee_can_read_localized_orders_with_a_rotated_cookie():
-    requests, rotations = [], []
-
-    def fetch(host, target, headers, receive):
-        assert host == "www.weee.com"
-        requests.append(target)
-        if target == "/en/account/my_orders":
-            assert "auth=start-private-session" in headers["Cookie"]
-            return response(receive, status=307, location="https://www.weee.com/zh/account/my_orders",
-                            rotate="fresh-private-session")
-        assert target == "/zh/account/my_orders" and "auth=fresh-private-session" in headers["Cookie"]
-        return response(receive, '<main class="order-list">糯米和苹果 fresh-private-session</main>'.encode())
-
-    session, action = _weee_session(fetch, persist=lambda raw, seen: rotations.append(raw))
-    rendered = session.read(action, {})
-    assert requests == ["/en/account/my_orders", "/zh/account/my_orders"]
-    assert rendered == "糯米和苹果 [REDACTED]"
-    assert len(rotations) == 1 and "fresh-private-session" in rotations[0]
-
-
-@pytest.mark.parametrize(("location", "expected"), [
-    ("https://orders.weee.com/zh/account/my_orders", "web_redirect_refused"),
-    ("http://www.weee.com/zh/account/my_orders", "web_redirect_refused"),
-    ("//www.weee.com/zh/account/my_orders", "web_redirect_refused"),
-    ("/zh/account/my_orders?unapproved=value", "web_redirect_refused"),
-    ("/zh/account/buy_again", "web_redirect_refused"),
-    ("/zh/account/%6dy_orders", "web_redirect_refused"),
-    ("/zh/account/my_orders#unapproved", "web_redirect_refused"),
-    ("/en/account/my_orders", "web_redirect_loop"),
-    ("/account/login", "web_login_required"),
-])
-def test_weee_redirects_are_exact_bounded_and_fail_before_forwarding_cookies(location, expected):
-    requests = []
-
-    def fetch(host, target, headers, receive):
-        requests.append((host, target))
-        return response(receive, status=307, location=location)
-
-    session, action = _weee_session(fetch)
-    with pytest.raises(web.ConnectorError) as exc:
-        session.read(action, {})
-    assert exc.value.code == expected
-    assert requests == [("www.weee.com", "/en/account/my_orders")]

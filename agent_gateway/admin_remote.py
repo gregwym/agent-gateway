@@ -96,8 +96,7 @@ def apply_selection(draft, body):
     raw = draft["state"]["config"]
     conn = next(c for c in raw["connections"] if c["id"] == draft["connection"])
     from .plugins import MANIFEST_ENV
-    from .web_profiles import PROFILE_ENV
-    fixed = bool({MANIFEST_ENV, PROFILE_ENV} & conn.get("env", {}).keys()) and conn.get("plugin")
+    fixed = MANIFEST_ENV in conn.get("env", {}) and conn.get("plugin")
     available = {t["upstream"]: t for t in conn["tools"]}
     chosen, names, revoke = [], set(), set()
     for item in selection:

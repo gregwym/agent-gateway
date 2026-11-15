@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Config, ToolCfg, allocate_tool_name
 from .lock import Lock, definition_of, digest_of
+from .web_profiles import is_website
 
 MODULES = {
     "agent_gateway.connectors.imap_mail": "imap",
@@ -22,6 +23,8 @@ MODULES = {
 
 
 def bundled_kind(conn):
+    if is_website(conn):
+        return "web"
     if conn.plugin or conn.transport != "stdio" or len(conn.command) != 3 or conn.command[1] != "-m":
         return None
     executable = Path(conn.command[0]).name
@@ -42,6 +45,10 @@ def bundled_manifest(conn):
     kind = bundled_kind(conn)
     if kind is None:
         return None
+    if kind == "web":
+        from .connectors.web import build_tools
+        tools = [t.as_mcp() for t in build_tools()]
+        return {t.name: {"definition": definition_of(t), "suffix": t.name, "access": "dynamic"} for t in tools}
     if kind == "imap":
         from .connectors.imap_mail import build_tools
         tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000)]
@@ -86,7 +93,15 @@ Incompatible restrictions remain intact and produce a visible, disabled tool.
         reports[conn.id] = report
         old_metadata = previous.get(conn.id, {})
         metadata[conn.id] = copy.deepcopy(old_metadata)
-        registered = {tool.upstream for tool in conn.tools}
+        if is_website(conn):
+            # The retired business tools never grant access to the broader proxy.
+            obsolete = [t for t in conn.tools if t.upstream not in manifest]
+            report["revoked"].extend(t.name for t in obsolete)
+            revoke.update(t.name for t in obsolete)
+            updated["tools"] = [t for t in updated["tools"] if t["upstream"] in manifest]
+            entries[conn.id] = {name: entry for name, entry in entries.get(conn.id, {}).items() if name in manifest}
+            metadata[conn.id] = {name: info for name, info in old_metadata.items() if name in manifest}
+        registered = {tool["upstream"] for tool in updated["tools"]}
         for upstream, spec in manifest.items():
             if upstream not in registered:
                 name = allocate_tool_name(conn.id, upstream, spec["suffix"], occupied)

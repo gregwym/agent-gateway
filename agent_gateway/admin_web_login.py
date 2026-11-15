@@ -17,14 +17,12 @@ from .admin_config import CONNECTOR_NAME, kind_of, make_connection
 from .browser_tunnel import connect
 from .browser_worker import HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
 from .connectors.web import import_session
-from .lock import definition_of
 from .passkey import Refused
 from .plugins import connector_plugins
-from .upstream import list_all_tools, open_client
 from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
 
 # Additional network origins for first-party sign-in and assets. These are never
-# accepted as an order endpoint or as a destination supplied by an Agent.
+# accepted as destinations supplied by an Agent.
 BUNDLED = {
     "www.amazon.com": (("www.amazon.com",), ("media-amazon.com", "ssl-images-amazon.com", "amazon.com")),
     "www.weee.com": (("www.weee.com", "www.sayweee.com", "weee.com", "sayweee.com"), ("static.weeecdn.com",)),
@@ -90,7 +88,7 @@ class WebsiteLogin:
         if previous:
             if kind_of(previous) != "web" or previous.owner != owner or previous.plugin != plugin_id:
                 raise Refused("connector_identity_is_fixed", 409)
-            profile = WebProfile.model_validate_json(previous.env[PROFILE_ENV])
+            profile = WebProfile.saved(previous.env[PROFILE_ENV])
         else:
             if len(gateway.cfg.connections) >= 50:
                 raise Refused("connector_limit", 400)
@@ -135,7 +133,7 @@ class WebsiteLogin:
                          "path": path, "proxy": proxy, "tunnels": tunnels, "body": body}
             try:
                 await self.worker("start", {"id": ident, "expires": expires,
-                                           "url": profile.origin + profile.actions[profile.probe].path,
+                                           "url": profile.origin + "/",
                                            "navigation": navigation})
             except BaseException:
                 with anyio.CancelScope(shield=True):
@@ -183,8 +181,7 @@ class WebsiteLogin:
             candidate = import_session(json.dumps(cookies), profile)
         except (ValueError, RecursionError):
             raise Refused("web_browser_sign_in_required", 422) from None
-        # Session capture is independent of the site's read profile. The admin
-        # can test it later without repeating login if the order page changed.
+        # Saving the session does not contact the website.
         form = flow["body"]
         async with admin.editing():
             admin.auth.session(token)
@@ -196,15 +193,9 @@ class WebsiteLogin:
                        "settings": {"plugin": form["plugin"]}, "credentials": {SESSION_ENV: candidate}}
             conn, added = make_connection(payload, cfg, values, plugins=plugins)
             # The profile used for the authorization must be the one being saved.
-            if WebProfile.model_validate_json(conn.env[PROFILE_ENV]) != profile:
+            if WebProfile.saved(conn.env[PROFILE_ENV]) != profile:
                 raise Refused("configuration_changed", 409)
             previous = next((c for c in cfg.connections if c.id == conn.id), None)
-            if previous:
-                result = await admin.save_connection(state, cfg, conn, added, previous)
-            else:
-                async with open_client(conn, added) as client:
-                    definitions = {t.name: definition_of(t) for t in await list_all_tools(client)}
-                admin.stage_website(state, cfg, conn, added, definitions)
-                result = await admin._commit(state, "web-login/save")
+            result = await admin.save_connection(state, cfg, conn, added, previous)
         await self.close()
         return result

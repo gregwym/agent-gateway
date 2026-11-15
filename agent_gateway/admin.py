@@ -285,29 +285,15 @@ class AdminController:
         result = await self._commit(state, "connections/save")
         return {**result, "saved": True, "id": conn.id}
 
-    def stage_website(self, state, cfg, conn, added, definitions):
-        from .admin_remote import remote_tools
-        conn = remote_tools(conn, definitions, cfg)
-        if not conn.tools:
-            raise Refused("remote_no_tools", 422)
-        conn = conn.model_copy(update={"tools": [t.model_copy(update={"access": "read"}) for t in conn.tools]})
-        self.stage_connection(state, cfg, conn, added)
-        lock = Lock()
-        for tool in conn.tools:
-            lock.put(conn.id, definitions[tool.upstream])
-        state["locks"][conn.id] = lock.entries[conn.id]
-
     def preview_result(self, state, conn, added, definitions, session):
         from .admin_remote import remote_tools
         cfg, _, _ = self.store.effective(state)
         kind = kind_of(conn)
-        remote = kind in ("remote", "local", "web")
+        remote = kind in ("remote", "local")
         cli = kind == "local" and MANIFEST_ENV in conn.env
         if remote:
             conn = remote_tools(conn, definitions, cfg)
-            if kind == "web":
-                conn = conn.model_copy(update={"tools": [t.model_copy(update={"access": "read"}) for t in conn.tools]})
-            elif cli:
+            if cli:
                 conn = conn.model_copy(update={"tools": [
                     t.model_copy(update={"access": "read" if definitions[t.upstream].get("annotations", {}).get("readOnlyHint") else "write"})
                     for t in conn.tools]})
@@ -335,7 +321,7 @@ class AdminController:
         # Definitions can echo credentials. Scrub prior to displaying them too.
         scrubber = self._gateway(state).scrubber
         return {"draft": draft, "connection": conn.id, "definitions": scrubber.data(list({t.upstream: definitions[t.upstream] for t in conn.tools}.values())),
-                "owner": conn.owner, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote, "fixed_access": kind == "web" or cli, "read_only": kind == "web",
+                "owner": conn.owner, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote, "fixed_access": cli,
                 "tools": [{"upstream": t.upstream, "access": tool_access(conn, t)} for t in conn.tools],
                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None}
 
@@ -355,7 +341,7 @@ class AdminController:
     def website(conn):
         if kind_of(conn) != "web":
             return None
-        spec = WebProfile.model_validate_json(conn.env[PROFILE_ENV])
+        spec = WebProfile.saved(conn.env[PROFILE_ENV])
         return {"origin": spec.origin, "experimental": spec.experimental}
 
     def connection_settings(self, conn):
@@ -445,8 +431,6 @@ class AdminController:
             if not conn or kind_of(conn) not in CATALOG:
                 raise Refused("unsupported_connector", 400)
             probe, arguments = CATALOG[kind_of(conn)]["probe"]
-            if kind_of(conn) == "web":
-                probe = WebProfile.model_validate_json(conn.env[PROFILE_ENV]).probe
             values = self.runtime.gateway.secrets
             problem = None
             try:
@@ -462,6 +446,11 @@ class AdminController:
                             result = await client.call_tool(probe, arguments)
                             if result.is_error:
                                 problem = probe_error(kind_of(conn), result)
+                            elif kind_of(conn) == "web":
+                                code = json.loads(result.content[0].text)["status"]
+                                if code >= 400:
+                                    problem = {401: "connector_auth_rejected", 403: "connector_access_denied",
+                                               404: "connector_endpoint_missing", 429: "connector_rate_limited"}.get(code, "connector_http_error")
                             elif kind_of(conn) == "imap" and conn.env.get("SMTP_HOST", "smtp.mail.me.com" if conn.env.get("IMAP_HOST", "imap.mail.me.com").lower() == "imap.mail.me.com" else ""):
                                 result = await client.call_tool("check_smtp", {})
                                 if result.is_error:
@@ -661,6 +650,8 @@ class AdminController:
             if operation == "connections/save":
                 previous = next((c for c in cfg.connections if c.id == conn.id), None)
                 return await self.save_connection(state, cfg, conn, added, previous)
+            if kind_of(conn) == "web":
+                raise Refused("unsupported_connector", 400)
             values.update(added)
             try:
                 with anyio.fail_after(35):
@@ -710,7 +701,7 @@ class AdminController:
                 raise Refused("invalid_connection_access", 400)
             if client.household != cfg.household_of(conn.owner):
                 raise Refused("outside_household", 400)
-            if mode != "custom" and CONNECTION_ACCESS[mode]["write"] != "deny" and not any(tool_access(conn, t) == "write" for t in conn.tools):
+            if mode != "custom" and CONNECTION_ACCESS[mode]["write"] != "deny" and not any(tool_access(conn, t) in ("write", "dynamic") for t in conn.tools):
                 raise Refused("connection_tools_update_required" if any(tool_access(conn, ToolCfg.model_validate(t)) == "write" for t in catalog_additions(conn, cfg)) else "connection_readonly", 400)
             send_effect = body.get("mail_send")
             if "mail_send" in body and (mode == "custom" or CONNECTION_ACCESS[mode]["write"] == "deny"
@@ -741,7 +732,13 @@ class AdminController:
                     if other:
                         raw["policy"].append({**rule, "clients": other})
             for tool in conn.tools:
-                effect = CONNECTION_ACCESS[mode][tool_access(conn, tool)]
+                access = tool_access(conn, tool)
+                if access == "dynamic":
+                    for kind, effect in CONNECTION_ACCESS[mode].items():
+                        raw["policy"].append({"clients": [client_id], "connection": name, "tools": [tool.name],
+                                              "effect": effect, "operation": kind})
+                    continue
+                effect = CONNECTION_ACCESS[mode][access]
                 send = is_mail_send(conn, tool)
                 if send:
                     if CONNECTION_ACCESS[mode]["write"] == "deny":
@@ -761,6 +758,8 @@ class AdminController:
                 raise Refused("unknown_agent", 400)
             if not conn or not any(t["name"] == tool for t in conn["tools"]):
                 raise Refused("not_found", 404)
+            if PROFILE_ENV in conn.get("env", {}) and conn.get("plugin"):
+                raise Refused("unsupported_connector", 400)
             if body.get("effect") not in ("deny", "allow", "approval_required"):
                 raise Refused("invalid_permission_effect", 400)
             cfg, _, _ = self.store.effective(state)

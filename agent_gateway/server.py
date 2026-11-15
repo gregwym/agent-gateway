@@ -300,7 +300,7 @@ class Gateway:
             raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
 
         try:
-            return await self._call(ctx, dispatcher, who, route, effect, arguments, done,
+            return await self._call(ctx, dispatcher, who, route, arguments, done,
                                     background=background, key=key, key_value=key_value)
         except IdempotencyConflict:
             raise MCPError(types.INVALID_PARAMS, "This idempotency_key is already bound to another operation.") from None
@@ -348,6 +348,18 @@ class Gateway:
 
         return final_arguments, upstream_arguments
 
+    def _request_effect(self, principal, client_id, route, arguments, done):
+        from .web_profiles import is_website
+        operation = None
+        if is_website(route.conn):
+            from .connectors.web import ConnectorError, plan_request
+            try:
+                operation = plan_request(route.tool.upstream, arguments).access
+            except ConnectorError as exc:
+                done("deny", exc.code)
+                return _error(str(exc))
+        return self.policy.effect(principal, route.tool.name, client_id, operation=operation)
+
     def _approval_request(self, client, route, final_arguments, *, requires_approval=True):
         return ApprovalRequest(
             principal=client.subject, client_id=client.id, tool=route.tool.name, connection=route.conn.id,
@@ -362,11 +374,17 @@ class Gateway:
             }),
         )
 
-    async def _call(self, ctx, dispatcher, who, route, effect, arguments, done, *, background=False, key=None, key_value=None):
+    async def _call(self, ctx, dispatcher, who, route, arguments, done, *, background=False, key=None, key_value=None):
         prepared = self._prepare_call(who.client_id, route, arguments, done)
         if isinstance(prepared, types.CallToolResult):
             return prepared
         final_arguments, upstream_arguments = prepared
+        effect = self._request_effect(who.principal, who.client_id, route, final_arguments, done)
+        if isinstance(effect, types.CallToolResult):
+            return effect
+        if effect == "deny":
+            done("deny", "policy_deny")
+            return _error("The Agent does not have permission for this operation on the connection.")
         if effect != "approval_required" and key is None:
             return await self._run(route, upstream_arguments, done, "ok")
 
@@ -436,7 +454,6 @@ class Gateway:
 
         if (not client or client.subject != row["principal"] or not route
                 or row["revision"] != self.configuration_revision
-                or self.policy.effect(client.subject, route.tool.name, client.id) != ("approval_required" if approval_required else "allow")
                 or (approval_required and set(self.cfg.approvers_of(route.conn)) != set(json.loads(row["approvers"])))):
             done("deny", "configuration_changed")
             return None, outcome
@@ -445,6 +462,9 @@ class Gateway:
         if isinstance(prepared, types.CallToolResult):
             return None, outcome
         final_arguments, upstream_arguments = prepared
+        if self._request_effect(client.subject, client.id, route, final_arguments, done) != ("approval_required" if approval_required else "allow"):
+            done("deny", "configuration_changed")
+            return None, outcome
         if self._approval_request(client, route, final_arguments, requires_approval=approval_required).binding != row["binding"]:
             done("deny", "configuration_changed")
             return None, outcome

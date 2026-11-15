@@ -68,7 +68,7 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         from .connectors._base import build_server
         from .connectors.web import SiteSession
         web = (web_sessions.get(conn, secrets) if web_sessions else
-               SiteSession(WebProfile.model_validate_json(conn.env[PROFILE_ENV]), secrets[conn.secret_env[SESSION_ENV]]))
+               SiteSession(WebProfile.saved(conn.env[PROFILE_ENV]), secrets[conn.secret_env[SESSION_ENV]]))
         async with _client(conn, build_server(conn.service, web.tools())) as client:
             yield client
     elif conn.transport == "stdio":

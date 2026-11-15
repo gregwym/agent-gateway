@@ -180,7 +180,7 @@ const messages = {
   duplicate_connector: ['This connector name already exists. Choose another name.', '此连接器名称已存在，请使用其他名称。'],
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
-  web_session_busy: ['Another read is in progress. Try again shortly.', '正在读取这个网站，请稍后重试。'],
+  web_session_busy: ['Another request is in progress. Try again shortly.', '这个网站正有请求在执行，请稍后重试。'],
   web_session_storage_failed: ['The updated session could not be saved. Check the gateway storage and import a fresh session.', '更新后的会话无法保存。请检查网关存储，再导入新会话。'],
   web_browser_sign_in_required: ['No session for this website was available to save. Finish signing in and try again.', '没有可保存的该网站会话。请完成登录后再保存。'],
   web_browser_unavailable: ['The sign-in browser could not start. Check the Gateway browser service.', '登录浏览器无法启动，请检查网关的浏览器服务。'],
@@ -191,10 +191,7 @@ const messages = {
   web_browser_input: ['This browser action is invalid. Try again.', '浏览器操作无效，请重试。'],
   web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
   web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
-  web_profile_mismatch: ['The site did not return the expected page. This profile may need an update.', '网站未返回预期页面，可能需要更新站点配置。'],
-  web_http_rejected: ['The website rejected the read request.', '网站拒绝了读取请求。'],
-  web_redirect_loop: ['The website kept redirecting between order pages. Try signing in again.', '网站在订单页之间反复跳转，请重新登录后再试。'],
-  web_redirect_refused: ['The site redirected to an unapproved page. The gateway stopped the request.', '网站跳转到了站点配置之外的页面，网关已停止请求。'],
+  web_response_encoding: ['The website returned an unsupported content encoding.', '网站返回了不支持的内容编码。'],
   web_unsafe_address: ['The website resolved to a non-public address. The gateway stopped the request.', '网站解析到了非公网地址，网关已停止请求。'],
   web_response_limit: ['The website exceeded the connector’s response or session size limit.', '网站响应或会话超出了连接器的大小限制。'],
   local_plugin_unavailable: ['This connector plugin is not installed on the gateway host.', '网关主机未安装这个连接器扩展。'],
@@ -669,11 +666,11 @@ function connectionSearchText(conn) {
   return [conn.id, serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email, ...(conn.mailbox?.aliases || [])].join(' ');
 }
 function connectionStatus(parent, conn) {
-  const remote = ['remote', 'local'].includes(conn.kind), failed = conn.test?.ok === false;
-  const [label, style] = failed ? [remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败'), 'bad'] :
+  const remote = ['remote', 'local'].includes(conn.kind), website = conn.kind === 'web', failed = conn.test?.ok === false;
+  const [label, style] = failed ? [website ? tr('Site check failed', '网站连通性验证失败') : remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败'), 'bad'] :
     conn.oauth?.error ? [tr('Authorization error', '授权异常'), 'bad'] :
-    conn.test?.ok ? [remote ? tr('MCP check passed', 'MCP 验证通过') : tr('Read check passed', '读取验证通过'), ''] :
-    conn.kind === 'web' ? [tr('Session saved · Read not tested', '会话已保存 · 待读取验证'), 'warn'] :
+    conn.test?.ok ? [website ? tr('Site reachable', '网站可达') : remote ? tr('MCP check passed', 'MCP 验证通过') : tr('Read check passed', '读取验证通过'), ''] :
+    website ? [tr('Session saved', '会话已保存'), ''] :
     conn.connected ? [tr('Not yet tested', '待验证'), 'warn'] : [tr('Connecting', '连接中'), 'warn'];
   el(parent, 'span', label, ('badge ' + style).trim());
   if (conn.available_tools?.length && parent.matches('td')) el(parent, 'small', tr('Tools to review', '有工具待审阅'));
@@ -716,7 +713,7 @@ function connectorDetails(id) {
     }
     toolUpdateNotice(content, conn);
     const actions = el(content, 'div', undefined, 'actions');
-    if (conn.kind) button(actions, tr('Test connection', '验证连接'), async () => {
+    if (conn.kind) button(actions, conn.kind === 'web' ? tr('Check site reachability', '验证网站连通性') : tr('Test connection', '验证连接'), async () => {
       try { await api('connections/test', {id}); }
       catch (error) {
         if (state) {
@@ -726,10 +723,10 @@ function connectorDetails(id) {
         return;
       }
       await refresh(); populate();
-      notify(remote ? tr('MCP check passed.', 'MCP 验证通过。') : tr('Read check passed.', '读取验证通过。'));
+      notify(conn.kind === 'web' ? tr('Site reachable. Sign-in was not tested.', '网站可达，未验证登录状态。') : remote ? tr('MCP check passed.', 'MCP 验证通过。') : tr('Read check passed.', '读取验证通过。'));
     }, 'primary', tr('Testing connection…', '正在验证连接…'));
     button(actions, tr('Rename', '改名'), () => renameConnector(conn, box));
-    if (remote || conn.kind === 'web') button(actions, tr('Review current tools', '审阅当前工具'), async () => {
+    if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
     if (conn.kind === 'gmail' || conn.oauth) {
@@ -961,7 +958,7 @@ function connectorForm(existing, reauthorize = false) {
         const plugin = state.plugins.find(p => p.id === settings.plugin.value);
         if (web) {
           const site = existing?.website || plugin;
-          if (site.experimental) el(fields, 'p', tr('Experimental · read only', '实验功能 · 只读'), 'hint');
+          if (site?.experimental) el(fields, 'p', tr('Experimental', '实验功能'), 'hint');
           if (!state.website_login) el(fields, 'p', tr('The sign-in browser is offline. You can still import a session under Advanced.', '登录浏览器暂不可用。仍可在高级选项中导入会话。'), 'hint');
           const advanced = el(fields, 'details');
           el(advanced, 'summary', tr('Advanced: import a session file', '高级：导入会话文件'));
@@ -1048,7 +1045,7 @@ function connectorForm(existing, reauthorize = false) {
     return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values};
   }
   function needsReview() {
-    if (['local', 'web'].includes(kind.value)) return !existing;
+    if (kind.value === 'local') return !existing;
     return ['remote', 'reminders'].includes(kind.value) && (!existing || settings.url.value.trim() !== existing.settings.url);
   }
   function needsOAuth() {
@@ -1172,7 +1169,7 @@ function showWebsiteLogin(flow, connector) {
         box.close();
         connector.close();
         await refresh();
-        notify(tr('Session saved. Use Test connection to check order access.', '会话已保存。可用「验证连接」检查订单能否读取。'));
+        notify(tr('Session saved.', '会话已保存。'));
       } else frame(result);
     } finally { busy = false; send.disabled = false; }
   }
@@ -1284,7 +1281,8 @@ function toolUpdateNotice(parent, conn) {
   const sync = conn.catalog_sync;
   if (sync?.automatic) {
     if (sync.added.length) el(parent, 'p', tr(`${sync.added.length} new tools were registered automatically. Review their access under Permissions.`, `已自动登记 ${sync.added.length} 个新工具，请到权限页为它们授权。`), 'hint');
-    if (sync.revoked.length) el(parent, 'p', tr('Some tools changed from reading to writing. Their old grants were removed; choose write permissions before using them.', '部分工具从读取变为写入，已撤销这些工具的旧授权，请重新选择写入权限。'), 'hint');
+    if (sync.revoked.length && conn.kind === 'web') el(parent, 'p', tr('The website now uses shared HTTP and GraphQL tools. Set this Agent’s permissions again.', '网站现在使用通用 HTTP 和 GraphQL 工具，请为 Agent 重新设置权限。'), 'hint');
+    else if (sync.revoked.length) el(parent, 'p', tr('Some tools changed from reading to writing. Their old grants were removed; choose write permissions before using them.', '部分工具从读取变为写入，已撤销这些工具的旧授权，请重新选择写入权限。'), 'hint');
   }
   for (const issue of sync?.issues || []) {
     const reasons = {
@@ -1340,7 +1338,7 @@ function accessProfile(conn, client) {
 function accessSummary(parent, conn, client) {
   const {scope, readApprovalRequired, writeApprovalRequired} = accessProfile(conn, client);
   const send = mailSendEffect(conn, client);
-  const otherWrites = conn.tools.some(t => t.access === 'write' && !t.mail_send);
+  const otherWrites = conn.tools.some(t => (t.access === 'write' || t.access === 'dynamic') && !t.mail_send);
   const labels = {none: tr('No access', '禁止访问'), read: tr('Read only', '只读'), read_write: tr('Read and write', '读写'), custom: tr('Custom', '自定义')};
   el(parent, 'span', labels[scope], 'badge');
   if (scope === 'read' || scope === 'read_write') {
@@ -1450,7 +1448,7 @@ function permissionEditor(id, client) {
     toolUpdateNotice(card, conn);
     const reads = conn.tools.filter(t => t.access === 'read').length, writes = conn.tools.length - reads;
     const {current, scope, readApprovalRequired, writeApprovalRequired} = accessProfile(conn, client);
-    const mailSend = mailSendEffect(conn, client), otherWrites = conn.tools.some(t => t.access === 'write' && !t.mail_send);
+    const mailSend = mailSendEffect(conn, client), otherWrites = conn.tools.some(t => (t.access === 'write' || t.access === 'dynamic') && !t.mail_send);
     const options = [['none', tr('No access', '禁止访问')], ['read', tr('Read only', '只读')]];
     if (writes) options.push(['read_write', tr('Read and write', '读写')]);
     if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
@@ -1512,6 +1510,7 @@ function permissionEditor(id, client) {
         populate(); notify(tr('Connection permissions updated.', '连接权限已更新。'));
       } finally { controls.forEach((control, index) => { control.disabled = disabled[index]; }); }
     }, 'primary');
+    if (conn.kind === 'web') return;
     const details = el(card, 'details', undefined, 'advanced-permissions'); details.open = advancedOpen;
     el(details, 'summary', tr('Advanced: individual tools and argument limits', '高级设置：逐工具权限与参数限制'));
     const tools = el(details, 'div');

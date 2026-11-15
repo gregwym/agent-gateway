@@ -31,11 +31,11 @@ CONNECTION_ACCESS = {
 CONNECTOR_NAME = r"[a-z][a-z0-9_-]{0,31}"
 from .admin_remote import SPEC, make_remote
 from .plugins import SPEC as LOCAL_SPEC
-from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+from .web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile, is_website
 
 CATALOG = {
     "remote": SPEC,
-    "web": {**LOCAL_SPEC, "label": "Website / 网站"},
+    "web": {**LOCAL_SPEC, "label": "Website / 网站", "probe": ("http_request", {"method": "HEAD", "path": "/"})},
     "imap": {"label": "Mail / 邮箱 (IMAP + SMTP)",
              "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender",
                         "mailbox_email", "mailbox_aliases"], "secrets": ["password"],
@@ -126,9 +126,10 @@ class ManagedStore:
         for client in raw["clients"]:
             client["household"] = home
         raw["policy"] = [{"clients": [c.id], "connection": conn.id, "tools": [tool.name], "effect": effect,
-                          "mail_send_direct": effect == "allow" and is_mail_send(conn, tool)}
+                          "operation": operation, "mail_send_direct": effect == "allow" and is_mail_send(conn, tool)}
                          for c in cfg.clients for conn in cfg.connections for tool in conn.tools
-                         if (effect := policy.effect(c.subject, tool.name, c.id)) != "deny"]
+                         for operation in (("read", "write") if is_website(conn) and tool.upstream in WEB_TOOLS else (None,))
+                         if (effect := policy.effect(c.subject, tool.name, c.id, operation=operation)) != "deny"]
         result.update(schema=2, config=raw)
         normalized, _, _ = self.effective(result)
         result["config"] = {key: normalized.model_dump(mode="json")[key] for key in SECTIONS}
@@ -187,7 +188,7 @@ class ManagedStore:
 
 def kind_of(conn):
     if conn.plugin:
-        return "web" if PROFILE_ENV in conn.env else "local"
+        return "web" if is_website(conn) else "local"
     if conn.transport == "http" and conn.service == "reminders":
         return "reminders"
     if conn.transport == "http":
@@ -251,6 +252,8 @@ def tool_access(conn, tool):
 
     Do not trust upstream MCP readOnlyHint annotations to grant unapproved access.
     """
+    if is_website(conn) and tool.upstream in WEB_TOOLS:
+        return "dynamic"
     if tool.access:
         return tool.access
     kind = kind_of(conn)
@@ -282,8 +285,10 @@ def extend_catalog_tools(conn, cfg):
 
 
 def connection_access(policy, client, conn):
-    effects = [(tool_access(conn, t), policy.effect(client.subject, t.name, client.id))
-               for t in conn.tools if not is_mail_send(conn, t)]
+    effects = [(operation or access, policy.effect(client.subject, t.name, client.id, operation=operation))
+               for t in conn.tools if not is_mail_send(conn, t)
+               for access in (tool_access(conn, t),)
+               for operation in (("read", "write") if access == "dynamic" else (None,))]
     has_send = any(policy.effect(client.subject, t.name, client.id) != "deny"
                    for t in conn.tools if is_mail_send(conn, t))
     for name, settings in CONNECTION_ACCESS.items():
@@ -372,7 +377,7 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
     if kind in ("local", "web"):
         if kind == "web" and provided.get(SESSION_ENV):
             from .connectors.web import import_session
-            profile = (WebProfile.model_validate_json(previous.env[PROFILE_ENV]) if previous
+            profile = (WebProfile.saved(previous.env[PROFILE_ENV]) if previous
                        else WebProfile.model_validate(plugin.web))
             try:
                 provided = {SESSION_ENV: import_session(provided[SESSION_ENV], profile)}

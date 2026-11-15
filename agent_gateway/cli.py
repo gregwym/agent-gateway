@@ -96,6 +96,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         from .catalog_sync import sync_catalog
         cfg, lock, _, _ = sync_catalog(cfg, lock)
         gateway = Gateway(cfg, lock, gateway.secrets, Audit(None))
+    from .web_profiles import is_website
     policy = Policy(cfg)
     problems: list[str] = []
 
@@ -122,7 +123,10 @@ def cmd_check(args: argparse.Namespace) -> int:
                 notes.append("restricted: " + ", ".join(sorted(route.tool.allow_values)))
             if route.problem:
                 notes.append(f"NOT SERVED ({route.problem})")
-            if effect == "approval_required":
+            if is_website(route.conn):
+                notes.extend(f"{kind}: {policy.effect(principal, name, client_id, operation=kind)}" for kind in ("read", "write"))
+                effect = "per request"
+            elif effect == "approval_required":
                 if cfg.approvals is None:
                     notes.append("never runs: no `approvals:` section")
                 else:
