@@ -195,7 +195,7 @@ async def test_the_connector_checks_its_own_input_and_settings(google):
     google.requests.clear()
     async with Client(stdio_client(params), cache=None) as client:
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-        assert set(tools) == set(TOOLS)
+        assert set(tools) == set(TOOLS) | {"list_labels"}
         for tool in tools.values():
             assert tool.annotations.read_only_hint and tool.input_schema["additionalProperties"] is False
             assert not {"account", "user", "userId", "token", "url"} & set(tool.input_schema["properties"])
@@ -291,5 +291,61 @@ async def test_gmail_send_uses_the_mailbox_and_never_retries_an_uncertain_submis
             missing_scope = await client.call_tool("send_message", args)
             assert missing_scope.is_error and "different scope" in text_of(missing_scope)
             assert len(google.sent) == 2
+    finally:
+        google.close()
+
+
+async def test_gmail_organize_preserves_unrelated_labels_and_reports_each_message():
+    google = FakeGoogle()
+    account = google.add_account(REFRESH_A, CLIENT_ID, CLIENT_SECRET, scope=FakeGoogle.MODIFY)
+    raw = message("Example", "a@example.test", "b@example.test", "Synthetic only.").as_bytes()
+    google.add_message(REFRESH_A, "a1", raw, ("INBOX", "UNREAD", "Label_2", "IMPORTANT"))
+    google.add_message(REFRESH_A, "a2", raw, ("UNREAD",))
+    env = {"GMAIL_CLIENT_ID": CLIENT_ID, "GMAIL_CLIENT_SECRET": CLIENT_SECRET, "GMAIL_REFRESH_TOKEN": REFRESH_A,
+           "GMAIL_API_BASE": google.base, "GMAIL_TOKEN_URL": f"{google.base}/token", "GMAIL_ACCESS": "read_organize"}
+    params = StdioServerParameters(command=sys.executable, args=["-m", "agent_gateway.connectors.gmail"], env=env)
+    try:
+        async with Client(stdio_client(params), cache=None) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            assert "send_message" not in tools
+            assert not tools["set_message_state"].annotations.read_only_hint
+
+            async def run(name, **kwargs):
+                return json.loads(text_of(await ask(client, name, **kwargs)))
+
+            labels = await run("list_labels", query="receipts")
+            assert labels["labels"] == [{"id": "Label_1", "name": "Receipts", "type": "user"}]
+            await ask(client, "get_message", id="a1")
+            assert "UNREAD" in account["messages"]["a1"]["labels"]
+
+            state = (await run("set_message_state", ids=["a1", "dead"], read=True, starred=True))["results"]
+            assert [(r["id"], r["status"]) for r in state] == [("a1", "success"), ("dead", "error")]
+            assert set(state[0]["labels"]) == {"INBOX", "STARRED", "Label_2", "IMPORTANT"}
+            assert state[1]["code"] == "gmail_message_missing"
+            reverse = await run("set_message_state", ids=["a1"], read=False, starred=False)
+            assert set(reverse["results"][0]["labels"]) == {"INBOX", "UNREAD", "Label_2", "IMPORTANT"}
+
+            moved = (await run("move_messages", ids=["a1", "a2"], source="INBOX", destination="Label_1"))["results"]
+            assert [r["status"] for r in moved] == ["success", "error"]
+            assert set(moved[0]["labels"]) == {"Label_1", "Label_2", "UNREAD", "IMPORTANT"}
+            assert set(account["messages"]["a2"]["labels"]) == {"UNREAD"}
+            reject = (await run("set_message_labels", ids=["a1"], add=["TRASH"]))["results"]
+            assert reject[0]["status"] == "not_attempted"
+            changed = (await run("set_message_labels", ids=["a1"], remove=["Label_2"]))["results"]
+            assert set(changed[0]["labels"]) == {"Label_1", "UNREAD", "IMPORTANT"}
+            await run("move_messages", ids=["a1"], source="Label_1", destination="INBOX")
+            archived = (await run("archive_messages", ids=["a1"]))["results"]
+            assert set(archived[0]["labels"]) == {"UNREAD", "IMPORTANT"}
+
+            trashed = (await run("trash_messages", ids=["a1"]))["results"]
+            assert "TRASH" in trashed[0]["labels"]
+            restored = (await run("restore_messages", ids=["a1"]))["results"]
+            assert "TRASH" not in restored[0]["labels"]
+            google.change_status = 503
+            uncertain = (await run("trash_messages", ids=["a1", "a2"]))["results"]
+            assert [r["status"] for r in uncertain] == ["unknown", "not_attempted"]
+            assert google.requests.count(("POST", "/gmail/v1/users/me/messages/a1/trash")) == 2
+            assert "TRASH" not in account["messages"]["a2"]["labels"]
+            assert not any(method == "DELETE" for method, _ in google.requests)
     finally:
         google.close()

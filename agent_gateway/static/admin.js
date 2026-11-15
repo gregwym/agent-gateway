@@ -183,8 +183,8 @@ const messages = {
   wrong_origin: ['Open the configured HTTPS address.', '请打开配置的 HTTPS 地址。'],
   oauth_declined: ['OAuth authorization was cancelled. No connector was changed.', 'OAuth 授权已取消，连接器未发生变更。'],
   oauth_failed: ['OAuth authorization failed. Check the web OAuth client and callback URL.', 'OAuth 授权失败，请检查网页 OAuth 客户端和回调地址。'],
-  gmail_access_invalid: ['Choose Read only or Read and send.', '请选择只读或读取和发送。'],
-  gmail_scope_mismatch: ['Google did not grant exactly the selected Gmail permissions. Authorize again and approve both read and send.', 'Google 授予的权限与所选范围不一致。请重新授权，并勾选读取和发送。'],
+  gmail_access_invalid: ['Choose a Gmail permissions preset.', '请选择 Gmail 权限。'],
+  gmail_scope_mismatch: ['Google did not grant the selected Gmail permissions. Authorize again and approve the requested access.', 'Google 授予的权限与所选范围不一致。请重新授权并批准所请求的权限。'],
   gmail_reauthorize_required: ['Authorize with Google again to change this client or its Gmail permissions.', '要更换客户端或 Gmail 权限，请重新通过 Google 授权。'],
   gmail_readonly_required: ['Google must grant exactly Gmail read-only access.', 'Google 必须只授予 Gmail 只读权限。'],
   oauth_expired: ['OAuth authorization expired. Start again.', 'OAuth 授权已过期，请重新开始。'],
@@ -632,7 +632,7 @@ function connectorDetails(id) {
     const remote = conn.kind === 'remote';
     content.replaceChildren();
     el(content, 'p', [serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email].filter(Boolean).join(' · '), 'muted');
-    if (conn.kind === 'gmail') el(content, 'p', conn.settings.gmail_access === 'read_send' ? tr('Google access: Read and send', 'Google 授权：读取和发送') : tr('Google access: Read only', 'Google 授权：只读'), 'muted');
+    if (conn.kind === 'gmail') el(content, 'p', tr('Gmail access: ', 'Gmail 权限：') + gmailAccessLabels()[conn.settings.gmail_access || 'read'], 'muted');
     if (conn.mailbox?.aliases?.length) el(content, 'p', tr('Aliases: ', '邮箱别名：') + conn.mailbox.aliases.join(', '), 'muted');
     connectionStatus(content, conn);
     if (conn.kind === 'demo') el(content, 'p', tr('Demo notes reset on restart.', '模拟笔记在重启后清空。'), 'muted');
@@ -738,17 +738,27 @@ function registryPicker(onSelect) {
   query.focus();
 }
 
+function gmailAccessLabels() {
+  return {
+    read: tr('Read only', '只读'),
+    read_send: tr('Read and send', '读取和发送'),
+    read_organize: tr('Read and organize', '读取和整理'),
+    read_organize_send: tr('Read, organize, and send', '读取、整理和发送'),
+  };
+}
 function gmailSettings(parent, existing) {
   const settings = {}, credentials = {};
-  settings.gmail_access = select(parent, tr('Google permissions', 'Google 权限'), 'gmail_access', [
-    ['read', tr('Read only', '只读')],
-    ['read_send', tr('Read and send', '读取和发送')],
-  ], existing?.settings.gmail_access || 'read');
+  settings.gmail_access = select(parent, tr('Google permissions', 'Google 权限'), 'gmail_access',
+    Object.entries(gmailAccessLabels()), existing?.settings.gmail_access || 'read');
   const permissions = el(parent, 'small', '', 'gmail-scope-note');
   function scopeNote() {
-    permissions.textContent = settings.gmail_access.value === 'read_send'
-      ? tr('gmail.readonly + gmail.send · Agent access is managed separately.', 'gmail.readonly + gmail.send · Agent 的权限仍在「权限」里配置。')
-      : 'gmail.readonly';
+    const value = settings.gmail_access.value;
+    permissions.textContent = value === 'read_organize' || value === 'read_organize_send'
+      ? tr('gmail.modify · Google also permits sending with this scope. The gateway exposes Send only when selected above.',
+           'gmail.modify · Google 的此权限也允许发信；只有在上方选了「发送」，网关才开放发送工具。')
+      : value === 'read_send'
+        ? tr('gmail.readonly + gmail.send · Agent access is managed separately.', 'gmail.readonly + gmail.send · Agent 的权限仍在「权限」里配置。')
+        : 'gmail.readonly';
   }
   settings.gmail_access.addEventListener('change', scopeNote); scopeNote();
 

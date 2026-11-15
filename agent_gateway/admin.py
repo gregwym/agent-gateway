@@ -215,8 +215,10 @@ class AdminController:
                             for rule in state["config"]["policy"]
                             if any(name not in removed for name in rule["tools"])
                         ]
-                        state["locks"].get(conn.id, {}).pop("send_message", None)
-                        state.get("bundled_catalog", {}).get(conn.id, {}).pop("send_message", None)
+                        upstreams = {t.upstream for t in previous.tools} - {t.upstream for t in conn.tools}
+                        for name in upstreams:
+                            state["locks"].get(conn.id, {}).pop(name, None)
+                            state.get("bundled_catalog", {}).get(conn.id, {}).pop(name, None)
             else:
                 conn, added = previous, {}
             _, _, values = self.store.effective(state)

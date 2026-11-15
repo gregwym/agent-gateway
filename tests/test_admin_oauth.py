@@ -6,7 +6,7 @@ import httpx2
 import pytest
 
 from agent_gateway.admin_oauth import AUTHORIZE, PROFILE, SCOPE, TOKEN
-from agent_gateway.gmail_scopes import SEND_SCOPE
+from agent_gateway.gmail_scopes import MODIFY_SCOPE, ORGANIZE_TOOLS, SCOPES, SEND_SCOPE
 from test_admin import change, login, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
@@ -45,7 +45,7 @@ async def start(http, access='read'):
     assert url.startswith(AUTHORIZE)
     assert 'very-secret-client' not in url
     query = parse_qs(urlsplit(url).query)
-    assert set(query['scope'][0].split()) == ({SCOPE, SEND_SCOPE} if access == 'read_send' else {SCOPE})
+    assert set(query['scope'][0].split()) == set(SCOPES[access])
     assert query['access_type'] == ['offline']
     assert query['code_challenge_method'] == ['S256']
     return query
@@ -169,3 +169,32 @@ async def test_gmail_scope_changes_drop_send_grants_until_explicitly_restored(tm
         assert (await authorize('read_send', f'{SEND_SCOPE} {SCOPE}')).status_code == 200
         send = next(t for t in (await connection())['tools'] if t['upstream'] == 'send_message')
         assert send['permissions']['agent-a'] == 'deny'
+
+
+async def test_gmail_organize_scope_does_not_auto_grant_tools_or_expose_send(tmp_path):
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        organize = {name for name, _ in ORGANIZE_TOOLS}
+
+        async def authorize(access):
+            query = await start(http, access)
+            provider(gw.app.state.admin.google, query, scope=" ".join(SCOPES[access]), refresh=f"fake-refresh-{access}")
+            flow = query['state'][0]
+            assert (await http.get('/admin/oauth/google/callback', params={'state': flow, 'code': 'fake-code'})).status_code == 303
+            saved = await http.post('/admin/api/oauth/complete', json={'id': flow})
+            assert saved.status_code == 200, saved.text
+            return {t['upstream']: t for t in next(c for c in (await state(http))['connections'] if c['id'] == 'google-mail')['tools']}
+
+        tools = await authorize('read_organize')
+        assert SCOPES['read_organize'] == (MODIFY_SCOPE,)
+        assert organize <= tools.keys() and 'send_message' not in tools
+        assert all(tools[name]['access'] == 'write' and tools[name]['permissions']['agent-a'] == 'deny' for name in organize)
+        assert (await change(http, 'permissions/connection', client='agent-a', connection='google-mail', access='read_write')).status_code == 200
+        tools = await authorize('read_organize_send')
+        assert tools['send_message']['permissions']['agent-a'] == 'deny'
+        assert all(tools[name]['permissions']['agent-a'] == 'approval_required' for name in organize)
+        tools = await authorize('read_send')
+        assert not (organize & tools.keys())
+        assert tools['send_message']['permissions']['agent-a'] == 'deny'
+        tools = await authorize('read_organize')
+        assert 'send_message' not in tools and all(tools[name]['permissions']['agent-a'] == 'deny' for name in organize)

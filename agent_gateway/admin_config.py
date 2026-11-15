@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Config, ConnectionCfg, allocate_tool_name, validate_name
 from .credentials import EncryptedFileStore
-from .gmail_scopes import SCOPES
+from .gmail_scopes import ORGANIZE_TOOLS, SCOPES, tool_enabled
 from .lock import Lock, digest_of
 from .mail_address import email_address
 from .passkey import Refused
@@ -48,8 +48,9 @@ CATALOG = {
                "tools": [("list_calendars", "calendars"), ("list_events", "events"), ("get_event", "event"), ("check_conflicts", "conflicts")],
                "probe": ("list_calendars", {})},
     "gmail": {"label": "Gmail (Google OAuth)", "fields": ["client_id", "gmail_access"], "secrets": ["client_secret", "refresh_token"],
-              "tools": [("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment"), ("send_message", "send")],
-              "writes": {"send_message"},
+              "tools": [("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment"), ("list_labels", "labels"),
+                        ("send_message", "send"), *ORGANIZE_TOOLS],
+              "writes": {"send_message", *(name for name, _ in ORGANIZE_TOOLS)},
               "probe": ("search_messages", {"query": "in:inbox", "limit": 1})},
     "reminders": {"label": "Reminders Mac helper / 提醒事项 Mac 辅助服务", "fields": ["url"], "secrets": ["token"],
                   "tools": [("reminders_lists", "lists"), ("reminders_list", "list"), ("reminders_get", "get")],
@@ -253,8 +254,8 @@ def tool_access(conn, tool):
 def catalog_tools(conn):
     kind = kind_of(conn)
     tools = CATALOG.get(kind, {}).get("tools", ())
-    if kind == "gmail" and conn.env.get("GMAIL_ACCESS") != "read_send":
-        return [tool for tool in tools if tool[0] != "send_message"]
+    if kind == "gmail":
+        return [tool for tool in tools if tool_enabled(tool[0], conn.env.get("GMAIL_ACCESS", "read"))]
     return tools
 
 
@@ -424,5 +425,5 @@ def make_connection(body, cfg, values, *, gmail_email=None):
     # Keep reviewed restrictions and names, and present newly bundled tools for
     # explicit review. No policy rule is added, so additions start denied.
     raw["tools"] = [t.model_dump(mode="json") for t in previous.tools
-                    if kind != "gmail" or t.upstream != "send_message" or access == "read_send"] if previous else []
+                    if kind != "gmail" or tool_enabled(t.upstream, raw["env"]["GMAIL_ACCESS"])] if previous else []
     return extend_catalog_tools(ConnectionCfg.model_validate(raw), cfg), fresh

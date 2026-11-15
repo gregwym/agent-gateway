@@ -416,8 +416,13 @@ Google 回调失败也会显示管理页面。iCloud Mail 登录用户名通常�
 
 在「连接器 → 添加连接器」选择 **Gmail (Google OAuth)**。首次 [在 Google Cloud](https://console.cloud.google.com/auth/clients)
 启用 Gmail API，创建 **Web 应用** OAuth 客户端，登记网关显示的重定向 URI，再导入 Google 下载的客户端 JSON。
-选择「只读」（`gmail.readonly`）或「读取和发送」（`gmail.readonly` + `gmail.send`），然后点「通过 Google 授权」。
-OAuth 只决定网关能对 Gmail 做什么；到「权限」为各 Agent 单独授权。切回只读会移除发送工具和已有发送授权。
+选好权限后点「通过 Google 授权」：
+- 只读：`gmail.readonly`。
+- 读取和发送：`gmail.readonly` + `gmail.send`。
+- 读取和整理／读取、整理和发送：`gmail.modify`。Gmail 的此 scope 也允许发信，网关仅在所选档位包含发送时开放发送工具。
+
+到「权限」为各 Agent 单独授权。取消某项能力会移除相应工具，也清除已有授权。
+Gmail 的移动在一封邮件上添加目标标签、移除来源标签，并保留其他标签；归档只移除 `INBOX`。
 刷新令牌由网关加密保存。手动录入和 Desktop OAuth CLI 仍可用于已有凭据。
 
 无法使用 OAuth 时，可选择「邮箱 (IMAP + SMTP) → Gmail」，填写完整邮箱和 [Google App 专用密码](https://support.google.com/mail/answer/185833)。

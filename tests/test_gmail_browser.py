@@ -6,7 +6,7 @@ import httpx2
 import pytest
 
 from agent_gateway.admin_oauth import PROFILE, TOKEN, GoogleConsent
-from agent_gateway.gmail_scopes import SCOPE, SEND_SCOPE
+from agent_gateway.gmail_scopes import SCOPES
 from test_admin_feedback_browser import admin_page, playwright
 
 pytestmark = [pytest.mark.anyio, pytest.mark.browser]
@@ -17,12 +17,15 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
     def t(en, zh):
         return zh if locale == 'zh-CN' else en
 
+    access = 'read_organize' if locale == 'zh-CN' else 'read_send'
+    requested = SCOPES[access]
+
     def google(request):
         if str(request.url) == TOKEN:
             assert parse_qs(request.content.decode())['client_secret'] == ['fake-client-secret']
             return httpx2.Response(200, json={'access_token': 'fake-access-token',
                                              'refresh_token': 'fake-refresh-token',
-                                             'scope': f'{SCOPE} {SEND_SCOPE}'})
+                                             'scope': ' '.join(requested)})
         assert str(request.url) == PROFILE
         return httpx2.Response(200, json={'emailAddress': 'fake@example.test'})
 
@@ -54,11 +57,13 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         await import_json({'web': {'client_id': 'test-web-client', 'client_secret': 'fake-client-secret',
                                    'token_uri': 'https://untrusted.invalid/token'}})
         await playwright.expect(box.get_by_role('status')).to_contain_text(t('OAuth client loaded', '已导入 OAuth 客户端'))
-        await scope.select_option('read_send')
+        await scope.select_option(access)
+        if access == 'read_organize':
+            await playwright.expect(box.locator('.gmail-scope-note')).to_contain_text('gmail.modify')
 
         async def consent(route):
             query = parse_qs(urlsplit(route.request.url).query)
-            assert set(query['scope'][0].split()) == {SCOPE, SEND_SCOPE}
+            assert set(query['scope'][0].split()) == set(requested)
             assert query['client_id'] == ['test-web-client']
             assert 'fake-client-secret' not in route.request.url
             callback = query['redirect_uri'][0] + '?' + urlencode({'state': query['state'][0], 'code': 'fake-code'})
@@ -71,4 +76,4 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         assert page.url == origin + '/admin/connections'
         assert 'fake-refresh-token' not in await page.locator('body').inner_text()
         await row.get_by_role('button', name=t('Edit settings', '编辑设置'), exact=True).click()
-        await playwright.expect(scope).to_have_value('read_send')
+        await playwright.expect(scope).to_have_value(access)

@@ -104,7 +104,7 @@ compatibility with every provider or physical authenticator.
 |---|---|---|
 | IMAP + SMTP | Search, paginated listing, message and attachment reads, batch reads, read/star flags, move/archive/trash, send | One connection per account; SMTP sending has no attachment support |
 | CalDAV | List calendars and events, read events, check conflicts | Read-only; event listing has a result limit and no continuation cursor |
-| Gmail | Search, message and attachment reads; optional sending with Google OAuth | No search continuation, batch reading, or mailbox state changes |
+| Gmail | Search and read; optional labels, read/star, move, archive, trash/restore, and sending | No search continuation, batch reading, or permanent deletion |
 | Apple Reminders | List reminder lists and reminders, read details | Experimental, read-only; requires a macOS helper and local authorization |
 
 IMAP reads use `EXAMINE` and `BODY.PEEK`, so reading does not mark mail as seen.
@@ -176,7 +176,7 @@ HTTPS, connector credentials, approvals and backups.
   who controls that host or runtime can access credentials and change policy.
 - A shared agent token provides one permission set for everyone using it. Tool
   arguments and prompts cannot establish an end-user identity.
-- Gmail OAuth defaults to provider-enforced read-only access. Sending requires the separate `gmail.send` scope and a Gateway grant. IMAP app passwords and
+- Gmail OAuth defaults to provider-enforced read-only access. Sending and organizing are opt-in. The Gmail `gmail.modify` scope also permits sending upstream; the Gateway exposes only the selected tools and still requires Agent grants. IMAP app passwords and
   EventKit permissions can permit writes even when the gateway grants only reads.
 - Tool results can contain prompt injection. The gateway enforces access boundaries
   but does not interpret content or control the agent's downstream data handling.

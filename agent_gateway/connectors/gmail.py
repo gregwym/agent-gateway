@@ -1,4 +1,4 @@
-"""Gmail REST connector. Read-only unless sending is explicitly authorized.
+"""Gmail REST connector. Organizing and sending are opt-in.
 
 Credentials are per mailbox. Access tokens stay in memory, and Google must
 report precisely the configured scope set on every refresh.
@@ -15,9 +15,9 @@ from urllib.parse import urlsplit
 
 import httpx2
 
-from ..gmail_scopes import SCOPES, scope_error
+from ..gmail_scopes import SCOPES, can_organize, can_send, scope_error
 from ..mail_address import email_address
-from . import _mail
+from . import _gmail_ops, _mail
 from ._base import ConnectorError, CredentialGate, Tool, integer, plain, result, serve, setting, string
 from ._smtp import address
 
@@ -39,9 +39,9 @@ class Gmail:
     def __init__(self, client_id: str, client_secret: str, refresh_token: str, api: str, token_url: str, access: str = "read") -> None:
         self._scope_code = scope_error(access)
         self._scope_message = (_TOO_BROAD if access == "read" else
-                               "Google granted a different scope from the configured read and send permissions. Reauthorize this Gmail connector.")
+                               "Google granted a different scope from the configured Gmail permissions. Reauthorize this Gmail connector.")
         self._scopes = set(SCOPES[access])
-        self.can_send = access == "read_send"
+        self.can_send, self.can_organize = can_send(access), can_organize(access)
         self._grant = {
             "grant_type": "refresh_token",
             "client_id": client_id,
@@ -84,13 +84,13 @@ class Gmail:
         self._access, self._expires = access, time.monotonic() + lifetime
         return access
 
-    def get(self, path: str, params: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+    def get(self, path: str, params: list[tuple[str, str]] | None = None, *, timeout: float = 30) -> dict[str, Any]:
         reply = None
         for attempt in (1, 2):
             token = self._token(fresh=attempt == 2)
             try:
                 reply = self._http.get(
-                    f"{self._api}/gmail/v1/users/me/{path}", params=params, headers={"Authorization": f"Bearer {token}"}
+                    f"{self._api}/gmail/v1/users/me/{path}", params=params, headers={"Authorization": f"Bearer {token}"}, timeout=timeout
                 )
             except httpx2.TransportError as exc:
                 from ..web_errors import connector_failure
@@ -99,7 +99,7 @@ class Gmail:
                 break
         assert reply is not None
         if reply.status_code == 404:
-            raise ConnectorError("No such message.")
+            raise ConnectorError("No such message.", "gmail_message_missing")
         if reply.status_code != 200:
             raise ConnectorError(_UNAVAILABLE)
         try:
@@ -109,6 +109,39 @@ class Gmail:
         if not isinstance(body, dict):
             raise ConnectorError(_UNAVAILABLE)
         return body
+
+    def change(self, message_id, op, body, added, removed):
+        if not self.can_organize:
+            raise ConnectorError("Organizing was not authorized for this Gmail connector.")
+        # Paths and body operations are constructed only by the fixed tools.
+        message_id = _message_id(message_id)
+        error = _gmail_ops.ChangeError
+        unknown = "Gmail did not confirm the change. Check the message state before retrying."
+        try:
+            token = self._token()
+        except ConnectorError as exc:
+            raise error(str(exc), exc.code or "gmail_authorization_rejected", outcome="not_attempted", stop=True) from None
+        try:
+            request = {"json": body} if body is not None else {}
+            reply = self._http.post(f"{self._api}/gmail/v1/users/me/messages/{message_id}/{op}",
+                                    headers={"Authorization": f"Bearer {token}"}, timeout=4, **request)
+        except httpx2.TransportError:
+            raise error(unknown, "gmail_change_unknown", outcome="unknown", stop=True) from None
+        if reply.status_code in (408, 429) or reply.status_code >= 500:
+            raise error(unknown, "gmail_change_unknown", outcome="unknown", stop=True)
+        if reply.status_code == 404:
+            raise error("No such Gmail message.", "gmail_message_missing")
+        if not reply.is_success:
+            raise error(f"Gmail rejected the change (HTTP {reply.status_code}).", "gmail_change_rejected",
+                        stop=reply.status_code in (401, 403))
+        try:
+            updated = reply.json()
+            labels = _gmail_ops.labels_of(updated)
+            if updated.get("id") != message_id or not added <= labels or removed & labels:
+                raise ValueError
+        except (AttributeError, ValueError, ConnectorError):
+            raise error(unknown, "gmail_change_unknown", outcome="unknown", stop=True) from None
+        return labels
 
     def send(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self.can_send:
@@ -158,7 +191,7 @@ def _about(message: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int, *, can_send: bool = False) -> list[Tool]:
+def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int, *, access: str = "read") -> list[Tool]:
     def search_messages(args: dict[str, Any]) -> Any:
         params = [("maxResults", str(args.get("limit", 10)))]
         if args.get("query"):
@@ -236,7 +269,8 @@ def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int,
         ),
     ]
 
-    if can_send:
+    tools.extend(_gmail_ops.tools(gmail, message_id, organize=can_organize(access)))
+    if can_send(access):
         addresses = {"type": "array", "items": string("Bare recipient email address.", 254),
                      "maxItems": 50, "uniqueItems": True}
         tools.append(Tool(
@@ -272,7 +306,7 @@ def _endpoint(name: str, default: str) -> str:
 def main() -> None:
     access = setting("GMAIL_ACCESS", "read")
     if access not in SCOPES:
-        sys.exit("connector: GMAIL_ACCESS must be read or read_send")
+        sys.exit("connector: unknown GMAIL_ACCESS setting")
     gmail = Gmail(
         client_id=setting("GMAIL_CLIENT_ID"),
         client_secret=setting("GMAIL_CLIENT_SECRET"),
@@ -288,7 +322,7 @@ def main() -> None:
             gmail,
             max_message_bytes=int(setting("GMAIL_MAX_MESSAGE_BYTES", "40000000")),
             max_attachment_bytes=int(setting("GMAIL_MAX_ATTACHMENT_BYTES", "5000000")),
-            can_send=gmail.can_send,
+            access=access,
         ),
     )
 

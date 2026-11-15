@@ -214,7 +214,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 | | 凭据本身能做什么 | Connector 实际发出什么 | 结论 |
 |---|---|---|---|
-| Gmail | 默认只读；可另授发送。读取和发送以外的 scope 会被拒绝 | Gmail API 搜索和读取；仅在开启发送时调用 `messages.send` | 每次刷新都校验 Google 报告的 scope 与配置完全一致 |
+| Gmail | 默认只读；整理和发送由配置单独控制 | Gmail API 搜索、读取、标签和废纸篓操作；仅在开启发送时调用 `messages.send` | 每次刷新都校验 Google 报告的 scope 与配置完全一致 |
 | iCloud Mail | App 专用密码**能收发邮件、删除邮件，也能访问日历和通讯录**。Apple 不提供只读的、或只限某一项服务的密码 | 读取工具用 `EXAMINE` 和 `BODY.PEEK`；0.5 起同一连接另有状态修改、移动及 SMTP 发信工具，由 Gateway 的 write 权限控制 | **工具白名单层只读。** write 可逐次审批或明确免审批；拿到密码或控制进程的人不受工具列表限制 |
 | iCloud 日历 | 同上，是同一种密码 | 只有 PROPFIND 和 REPORT | 同上 |
 | 提醒事项 | macOS 对提醒事项只有「完全访问」一种授权，没有只读；授权是给**应用**的，同一个应用名下启动的任何程序都有 | 只调用读取接口 | 同上，而且见 7.6 |
@@ -275,7 +275,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 业务理解与跨来源聚合由 Agent 或上游服务负责。
 
 远程 Streamable HTTP MCP 可在网页配置 URL、认证和工具；自定义 stdio 命令由主机配置。
-通用上游 OAuth 使用官方 MCP SDK 处理发现、PKCE 和授权，Gmail 使用独立授权流程，校验所选的只读或读取和发送 scope。
+通用上游 OAuth 使用官方 MCP SDK 处理发现、PKCE 和授权，Gmail 使用独立授权流程，校验所选 scope。整理使用 `gmail.modify`，其 Google 权限也可发送，网关仍按所选功能暴露工具。
 
 ## 8. 审批
 
@@ -349,7 +349,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 | 上游凭据层的只读 | 只有 Gmail 成立；iCloud 和提醒事项做不到（7.3） |
 | 审批不被主机上的人绕过 | **做不到**（8.5） |
 | 独立主机上的审批服务 | 没有；只有接口 |
-| 自带的写工具 | IMAP 状态/移动/归档/废纸篓、SMTP 发信已实现；Gmail 可选择发送；Calendar / Reminders 仍只读 |
+| 自带的写工具 | IMAP 状态/移动/归档/废纸篓、SMTP 发信已实现；Gmail 可选择整理和发送；Calendar / Reminders 仍只读 |
 | 扩展服务 connector | 尚未接入；通用 Proxy 的可用性不代表具体平台集成已完成 |
 | 通用远程 MCP 网页管理 / 上游 OAuth | 已实现；网页配置 HTTP 连接、工具选择与分类、OAuth 发现和刷新、Bearer / API Key |
 | 防内容中的 Prompt Injection | **不防**。只保证被误导的模型仍受其 Token 的权限约束；邮件正文、日历标题等原样返回（工具描述里提示了它们是数据） |

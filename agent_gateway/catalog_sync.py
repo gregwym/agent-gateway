@@ -47,8 +47,7 @@ def bundled_manifest(conn):
         tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000)]
     elif kind == "gmail":
         from .connectors.gmail import build_tools
-        tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000,
-                                                 can_send=conn.env.get("GMAIL_ACCESS") == "read_send")]
+        tools = [t.as_mcp() for t in build_tools(None, 40_000_000, 5_000_000, access=conn.env.get("GMAIL_ACCESS", "read"))]
     elif kind == "caldav":
         from .connectors.caldav_calendar import build_tools
         tools = [t.as_mcp() for t in build_tools(SimpleNamespace(zone=ZoneInfo(conn.env.get("CALDAV_TIMEZONE", "UTC"))))]

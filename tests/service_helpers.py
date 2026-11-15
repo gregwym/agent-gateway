@@ -229,6 +229,7 @@ class FakeGoogle:
 
     READONLY = "https://www.googleapis.com/auth/gmail.readonly"
     SEND = "https://www.googleapis.com/auth/gmail.send"
+    MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 
     def __init__(self) -> None:
         import uvicorn
@@ -241,6 +242,10 @@ class FakeGoogle:
         self.token_requests = 0
         self.sent: list[bytes] = []
         self.send_status = 200
+        self.change_status = 200
+        self.labels = [{"id": "INBOX", "name": "INBOX", "type": "system"},
+                       {"id": "Label_1", "name": "Receipts", "type": "user"},
+                       {"id": "Label_2", "name": "Keep", "type": "user"}]
         self.consenting: str | None = None  # the account whose owner is "at the browser"
         self.codes: dict[str, str] = {}  # authorisation code -> refresh token
         app = Starlette(
@@ -248,6 +253,8 @@ class FakeGoogle:
                 Route("/token", self._token, methods=["POST"]),
                 Route("/auth", self._consent, methods=["GET"]),
                 Route("/gmail/v1/users/me/profile", self._profile, methods=["GET"]),
+                Route("/gmail/v1/users/me/labels", self._labels, methods=["GET"]),
+                Route("/gmail/v1/users/me/messages/{message_id}/{operation}", self._change, methods=["POST"]),
                 Route("/gmail/v1/users/me/messages/send", self._send, methods=["POST"]),
                 Route("/gmail/v1/users/me/messages", self._list, methods=["GET"]),
                 Route("/gmail/v1/users/me/messages/{message_id}", self._get, methods=["GET"]),
@@ -337,11 +344,46 @@ class FakeGoogle:
         from starlette.responses import JSONResponse
 
         account = self._account(request)
-        if account is None or self.SEND not in account["scope"].split():
+        if account is None or not {self.SEND, self.MODIFY}.intersection(account["scope"].split()):
             return JSONResponse({}, 403)
         body = await request.json()
         self.sent.append(base64.urlsafe_b64decode(body["raw"]))
         return JSONResponse({"id": "18c0f1"}, self.send_status)
+
+    async def _labels(self, request):
+        from starlette.responses import JSONResponse
+
+        if self._account(request) is None:
+            return JSONResponse({}, 401)
+        return JSONResponse({"labels": self.labels})
+
+    async def _change(self, request):
+        from starlette.responses import JSONResponse
+
+        account = self._account(request)
+        if account is None or self.MODIFY not in account["scope"].split():
+            return JSONResponse({}, 403)
+        message_id = request.path_params["message_id"]
+        message = account["messages"].get(message_id)
+        if message is None:
+            return JSONResponse({}, 404)
+        labels = set(message["labels"])
+        operation = request.path_params["operation"]
+        if operation == "modify":
+            body = await request.json()
+            labels.update(body["addLabelIds"])
+            labels.difference_update(body["removeLabelIds"])
+        elif operation == "trash":
+            assert not await request.body()
+            labels.add("TRASH")
+            labels.discard("INBOX")
+        elif operation == "untrash":
+            assert not await request.body()
+            labels.discard("TRASH")
+        else:
+            return JSONResponse({}, 404)
+        message["labels"] = sorted(labels)
+        return JSONResponse({"id": message_id, "labelIds": message["labels"]}, self.change_status)
 
     async def _list(self, request):  # type: ignore[no-untyped-def]
         from starlette.responses import JSONResponse
