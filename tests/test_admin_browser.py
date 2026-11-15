@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_gateway import __version__
 from helpers import TOKEN_HOUSE
 from test_admin import rpc, web_gateway
 
@@ -33,19 +34,24 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await page.goto(link)
                 await page.get_by_role('button', name=t('Create administrator passkey','创建管理员通行密钥'), exact=True).click()
                 await playwright.expect(page.get_by_role('heading', name=t('One gateway. Clear boundaries.','一个网关，清晰的权限。'))).to_be_visible()
-                assert '#' not in page.url
+                version = page.locator('#gateway-version')
+                await playwright.expect(version).to_have_text(f'v{__version__}')
+                await playwright.expect(version).to_be_visible()
+                assert page.url == origin + '/admin/'
                 assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                 if directory := os.environ.get('AGW_TEST_ARTIFACTS'):
                     output = Path(directory); output.mkdir(parents=True, exist_ok=True)
                     await page.screenshot(path=str(output / f'admin-overview-{locale}.png'), full_page=True)
 
-                await page.get_by_role('button', name=t('Members','家庭成员'), exact=True).click()
+                await page.get_by_role('link', name=t('Members','家庭成员'), exact=True).click()
+                assert page.url == origin + '/admin/members'
                 await page.get_by_role('button', name=t('Add member','添加成员'), exact=True).click()
                 await page.get_by_label(t('Name','名字'), exact=True).fill('alex')
                 await page.get_by_role('button', name=t('Add','添加'), exact=True).click()
                 await playwright.expect(page.get_by_role('heading', name='alex', exact=True)).to_be_visible()
 
-                await page.get_by_role('button', name=t('Agents','Agent 接入'), exact=True).click()
+                await page.get_by_role('link', name=t('Agents','Agent 接入'), exact=True).click()
+                assert page.url == origin + '/admin/agents'
                 await page.get_by_role('button', name=t('Create agent token','创建 Agent Token'), exact=True).click()
                 await page.get_by_label(t('Agent name','Agent 名称'), exact=True).fill('browser-agent')
                 await page.get_by_label(t('Household','所属家庭'), exact=True).select_option('household')
@@ -61,18 +67,23 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await playwright.expect(page.get_by_role('row').filter(has_text='browser-agent')).to_have_count(0)
                 assert (await rpc(origin, token)).status_code == 401
 
-                await page.get_by_role('button', name=t('Connectors','连接器'), exact=True).click()
+                await page.get_by_role('link', name=t('Connectors','连接器'), exact=True).click()
                 await page.get_by_role('button', name=t('Add connector','添加连接器'), exact=True).click()
                 await page.get_by_label(t('Connector name','连接器名称'), exact=True).fill('browser-notes')
                 await page.get_by_role('button', name=t('Save connector','保存连接器'), exact=True).click()
-                connector = page.locator('.card').filter(has=page.get_by_role('heading', name='browser-notes', exact=True))
+                connector = page.locator('tr[data-connection=browser-notes]')
                 await playwright.expect(connector).to_be_visible()
-                await connector.get_by_role('button', name=t('Test connection','验证连接'), exact=True).click()
+                await connector.get_by_role('button', name=t('Details', '详情'), exact=True).click()
+                details = page.get_by_role('dialog', name='browser-notes')
+                await details.get_by_role('button', name=t('Test connection','验证连接'), exact=True).click()
+                await details.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
                 await playwright.expect(connector).to_contain_text(t('Read check passed','读取验证通过'))
 
-                await page.get_by_role('button', name=t('Permissions','权限'), exact=True).click()
+                await page.get_by_role('link', name=t('Permissions','权限'), exact=True).click()
+                assert page.url == origin + '/admin/permissions'
                 await page.get_by_label(t('Agent','Agent'), exact=True).select_option('shared-agent')
-                card = page.locator('.permission-card[data-connection=browser-notes]')
+                await page.locator('tr[data-connection=browser-notes]').get_by_role('button', name=t('Edit access', '编辑权限'), exact=True).click()
+                card = page.get_by_role('dialog', name=t('Permissions: browser-notes', '权限：browser-notes'), exact=True)
                 await card.locator('summary').click()
                 row = card.get_by_role('row').filter(has_text='browser_notes_list')
                 await row.get_by_label(t('Effect','权限效果'), exact=True).select_option('allow')
@@ -81,7 +92,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await row.get_by_role('button', name=t('Argument limits','参数限制'), exact=True).click()
                 await page.get_by_label(t('Fixed arguments (JSON object)','固定参数（JSON 对象）'), exact=True).fill('{"folder":"family"}')
                 await page.get_by_role('button', name=t('Save restrictions','保存限制'), exact=True).click()
-                await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+                await playwright.expect(page.get_by_role('dialog', name=t('Argument limits','参数限制'), exact=True)).to_have_count(0)
                 reply = (await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name':'browser_notes_list','arguments':{}})).json()
                 assert 'family note kept by person_a' in reply['result']['content'][0]['text']
                 assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
@@ -92,15 +103,31 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                         await page.screenshot(path=str(Path(directory) / 'admin-permissions-mobile-detail.png'))
                 bounds = await row.get_by_role('button', name=t('Save access','保存权限'), exact=True).bounding_box()
                 assert bounds['x'] >= 0 and bounds['x'] + bounds['width'] <= page.viewport_size['width']
-                await page.get_by_role('button', name=t('Connectors','连接器'), exact=True).click()
-                await connector.get_by_role('button', name=t('Rename','改名'), exact=True).click()
+                await card.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
+                await page.get_by_role('link', name=t('Connectors','连接器'), exact=True).click()
+                await connector.get_by_role('button', name=t('Details', '详情'), exact=True).click()
+                await details.get_by_role('button', name=t('Rename','改名'), exact=True).click()
                 await page.get_by_label(t('Connector name','连接器名称'), exact=True).fill('renamed-notes')
                 await page.get_by_role('button', name=t('Save name','保存名称'), exact=True).click()
-                await playwright.expect(page.get_by_role('heading', name='renamed-notes', exact=True)).to_be_visible()
+                await playwright.expect(page.locator('tr[data-connection=renamed-notes]')).to_be_visible()
                 await playwright.expect(connector).to_have_count(0)
+                renamed = page.locator('tr[data-connection=renamed-notes]')
+                assert page.url == origin + '/admin/connections'
+                await page.reload()
+                await playwright.expect(renamed).to_be_visible()
+                await playwright.expect(page.locator('nav a[aria-current=page]')).to_have_attribute('href', '/admin/connections')
+                await page.go_back()
+                assert page.url == origin + '/admin/permissions'
+                await playwright.expect(page.get_by_role('heading', name=t('Inspect permissions', '检查权限'))).to_be_visible()
+                await page.go_forward()
+                assert page.url == origin + '/admin/connections'
+                await playwright.expect(renamed).to_be_visible()
                 await page.get_by_role('button', name=t('Sign out','退出'), exact=True).click()
                 await page.get_by_role('button', name=t('Sign in with passkey','用通行密钥登录'), exact=True).click()
                 await playwright.expect(page.get_by_role('button', name=t('Sign out','退出'), exact=True)).to_be_visible()
+                assert page.url == origin + '/admin/connections'
+                await playwright.expect(renamed).to_be_visible()
+                await playwright.expect(version).to_be_visible()
                 assert not errors
             finally:
                 await browser.close()

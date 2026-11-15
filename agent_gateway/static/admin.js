@@ -4,14 +4,25 @@ const tr = (en, cn) => zh ? cn : en;
 document.documentElement.lang = zh ? 'zh-CN' : 'en';
 const app = document.getElementById('app');
 const dialogs = document.getElementById('dialogs');
-let csrf = '', state = null, tab = 'overview', subject = '', noticeTimer;
-const advancedConnections = new Set();
+const version = document.getElementById('gateway-version');
+const tabUrls = {overview: '/admin/', members: '/admin/members', agents: '/admin/agents',
+  connections: '/admin/connections', permissions: '/admin/permissions'};
+let csrf = '', state = null, subject = '', dismissNotice;
+const filters = {connections: "", permissions: ""};
 let setupCode = new URLSearchParams(location.hash.slice(1)).get('setup') || '';
 let gmailResult = new URLSearchParams(location.search).get('gmail');
 let mcpOAuthResult = new URLSearchParams(location.search).get('mcp_oauth');
 const navigationError = document.querySelector('meta[name="gateway-error"]');
 if (navigationError) history.replaceState(null, '', '/admin/');
-if (location.hash) history.replaceState(null, '', location.pathname);
+if (setupCode) history.replaceState(null, '', location.pathname + location.search);
+window.addEventListener('popstate', () => { dialogs.replaceChildren(); if (state) render(); });
+function navigate(key, replace = false) {
+  const url = tabUrls[key];
+  if (url === location.pathname + location.search + location.hash) return;
+  if (replace) history.replaceState(null, '', url);
+  else history.pushState(null, '', url);
+  render();
+}
 const messages = {
   registry_query_invalid: ['Enter a service name between 3 and 100 characters.', '请输入 3 到 100 字符的服务名称。'],
   registry_cursor_invalid: ['This results page is no longer available. Search again.', '此结果页已无法读取，请重新搜索。'],
@@ -183,10 +194,16 @@ function el(parent, tag, text, cls) {
   parent.append(node); return node;
 }
 function notify(text) {
+  dismissNotice?.();
   const box = [...dialogs.querySelectorAll('dialog[open]')].at(-1);
   const node = box ? box.querySelector('.dialog-notice') || el(box, 'p', '', 'hint dialog-notice') : document.getElementById('notice');
   node.setAttribute('role', 'status'); node.textContent = text; node.style.display = 'block';
-  clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { if (box) node.remove(); else node.style.display = 'none'; }, 5500);
+  dismissNotice = () => {
+    clearTimeout(timer);
+    if (box) node.remove(); else node.style.display = 'none';
+    dismissNotice = null;
+  };
+  const timer = setTimeout(dismissNotice, 5500);
 }
 function errorText(error) {
   const known = {NotAllowedError: ['Passkey operation cancelled or timed out.', '通行密钥操作已取消或超时。'],
@@ -273,7 +290,7 @@ function checkbox(parent, text, checked = false) {
   el(label, 'span', text); return input;
 }
 function modal(title) {
-  const box = el(dialogs, 'dialog'); el(box, 'h2', title);
+  const box = el(dialogs, 'dialog'); box.setAttribute('aria-label', title); el(box, 'h2', title);
   const close = button(box, '×', () => box.close(), 'close'); close.setAttribute('aria-label', tr('Close', '关闭'));
   box.addEventListener('close', () => box.remove()); box.showModal(); return box;
 }
@@ -320,6 +337,7 @@ async function authenticate(action, code = '') {
   csrf = result.csrf; setupCode = ''; await refresh(); await resumeGoogle();
 }
 async function welcome(initialized) {
+  version.hidden = true;
   app.replaceChildren(); document.getElementById('identity').replaceChildren();
   const welcome = el(app, 'section', undefined, 'welcome');
   el(welcome, 'p', tr('Your accounts. Your permissions.', '你的账号，由你决定权限。'), 'eyebrow');
@@ -384,14 +402,23 @@ function renameMember(member, kind = 'members') {
   }, 'primary');
 }
 function render() {
+  const tab = Object.keys(tabUrls).find(key => tabUrls[key] === location.pathname) || 'overview';
+  version.textContent = 'v' + state.version; version.hidden = false;
   app.replaceChildren(); const identity = document.getElementById('identity'); identity.replaceChildren();
   button(identity, nameOf(state.owner), () => renameMember(state.members.find(m => m.id === state.owner)), 'profile-name');
   button(identity, tr('Sign out', '退出'), async () => { await api('auth/logout', {}); csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); });
   const nav = el(app, 'nav'); nav.setAttribute('aria-label', tr('Administration', '管理导航'));
   const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '家庭成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')]];
-  for (const [key, label] of tabs) button(nav, label, () => { tab = key; render(); }, tab === key ? 'active' : '');
+  for (const [key, label] of tabs) {
+    const link = el(nav, 'a', label, tab === key ? 'button active' : 'button');
+    link.href = tabUrls[key];
+    if (tab === key) link.setAttribute('aria-current', 'page');
+    link.addEventListener('click', event => {
+      if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault(); navigate(key);
+    });
+  }
   ({overview, members, agents, connections, permissions})[tab]();
-  const foot = el(app, 'footer'); el(foot, 'span', tr('Access and connector changes apply after active calls finish and invalidate outstanding approvals.', '接入和权限配置在正在执行的调用结束后生效，并使未使用的审批失效。'));
 }
 function overview() {
   const hero = el(app, 'section', undefined, 'hero'); el(hero, 'p', tr('Ready when you are', '准备就绪'), 'eyebrow');
@@ -404,7 +431,7 @@ function overview() {
     ['connections', state.connections.length, tr('Account connectors', '账号连接器'), tr('Start with demo notes, or connect your accounts.', '可先用模拟笔记，也可连接你的账号。')],
     ['agents', state.clients.length, tr('Agent credentials', 'Agent 凭据'), tr('Each agent has its own tool permissions.', '每个 Agent 单独配置工具权限。')]]) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'p', String(count), 'count'); el(card, 'h3', title); el(card, 'p', hint, 'muted');
-    button(card, tr('Manage', '管理'), () => { tab = key; render(); });
+    button(card, tr('Manage', '管理'), () => navigate(key));
   }
   const card = el(app, 'section', undefined, 'card');
   el(card, 'h2', tr('Try the complete flow', '走一遍完整流程'));
@@ -475,7 +502,7 @@ function agents() {
     button(agent, tr('Rename', '改名'), () => renameAgent(client));
     const access = el(row, 'td'); el(access, 'div', nameOf(client.household));
     el(access, 'p', client.tool_count ? tr(`${client.tool_count} tool(s) granted`, `已授权 ${client.tool_count} 个工具`) : tr('No tools granted. Tool search will return no available tools.', '尚未授权工具，工具搜索将不会返回可用工具。'), 'muted');
-    button(access, tr('Configure permissions', '配置权限'), () => { subject = client.id; tab = 'permissions'; render(); });
+    button(access, tr('Configure permissions', '配置权限'), () => { subject = client.id; navigate('permissions'); });
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');
     el(actions, 'code', tr('Check code: ', '核对码：') + client.fingerprint, 'token-fingerprint');
     button(actions, tr('Check token', '核对 Token'), () => checkToken(client));
@@ -510,64 +537,137 @@ function connectorNameField(parent, value = '') {
   name.title = tr(...messages.invalid_connector_name);
   return name;
 }
-function renameConnector(conn) {
+function renameConnector(conn, details) {
   const revision = state.revision;
   const box = modal(tr('Rename connector', '修改连接器名称'));
   const name = connectorNameField(box, conn.id);
-  el(box, 'p', tr('Agents will find this connector under the new name. Update workflows that use the old name and request any unfinished approvals again.',
-    'Agent 会用新名称找到此连接器。请更新引用旧名称的工作流，并重新发起尚未完成的审批。'), 'hint');
+  el(box, 'p', tr('Update workflows that use this name. Pending approvals will expire.',
+    '请更新使用旧名称的工作流。待审批请求将失效。'), 'hint');
   button(box, tr('Save name', '保存名称'), async () => {
     name.value = name.value.trim();
     if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
     await mutate('connections/rename', {revision, id: conn.id, name: name.value});
     box.close();
-    notify(tr('Connector renamed.', '连接器已改名。'));
+    details.close(); notify(tr('Connector renamed.', '连接器已改名。'));
   }, 'primary');
   name.focus(); name.select();
 }
+function infoHeading(parent, tag, title, explanation) {
+  const head = el(parent, 'div', undefined, 'info-heading');
+  el(head, tag, title);
+  const hint = el(head, 'details', undefined, 'info-tip');
+  const icon = el(hint, 'summary', 'ⓘ');
+  icon.setAttribute('aria-label', tr('About ', '关于') + title);
+  el(hint, 'p', explanation);
+  return head;
+}
+function settingsTable(parent, key, label, headings, entries, searchText, addRow) {
+  const search = field(el(parent, 'div', undefined, 'table-search'), tr('Filter connectors', '筛选连接器'), 'filter_' + key, filters[key], 'search');
+  const table = el(el(parent, 'div', undefined, 'compact-table'), 'table');
+  table.setAttribute('aria-label', label);
+  const head = el(el(table, 'thead'), 'tr');
+  for (const title of headings) el(head, 'th', title).scope = 'col';
+  const body = el(table, 'tbody');
+  const rows = entries.map(entry => {
+    const row = el(body, 'tr'); row.dataset.connection = entry.id; addRow(row, entry);
+    return {row, terms: searchText(entry).toLowerCase()};
+  });
+  const empty = el(body, 'tr');
+  el(empty, 'td', tr('No matching connectors.', '没有匹配的连接器。'), 'empty').colSpan = headings.length;
+  function filter() {
+    const query = search.value.trim().toLowerCase();
+    filters[key] = search.value;
+    let found = false;
+    for (const {row, terms} of rows) {
+      row.hidden = !terms.includes(query);
+      if (!row.hidden) found = true;
+    }
+    empty.hidden = found;
+  }
+  search.addEventListener('input', filter); filter();
+}
+function serviceLabel(conn) { return state.catalog[conn.kind]?.label || tr('Custom connector', '自定义连接器'); }
+function connectionRowTitle(row, conn, showMailbox = false) {
+  const name = el(row, 'th'); name.scope = 'row';
+  el(name, 'strong', conn.id);
+  el(name, 'small', [serviceLabel(conn), nameOf(conn.owner)].join(' · '));
+  if (showMailbox && conn.mailbox?.email) el(name, 'small', conn.mailbox.email);
+}
+function connectionSearchText(conn) {
+  return [conn.id, serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email, ...(conn.mailbox?.aliases || [])].join(' ');
+}
+function connectionStatus(parent, conn) {
+  const remote = conn.kind === 'remote', failed = conn.test?.ok === false;
+  const [label, style] = failed ? [remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败'), 'bad'] :
+    conn.oauth?.error ? [tr('Authorization error', '授权异常'), 'bad'] :
+    conn.test?.ok ? [remote ? tr('MCP check passed', 'MCP 验证通过') : tr('Read check passed', '读取验证通过'), ''] :
+    conn.connected ? [tr('Not yet tested', '待验证'), 'warn'] : [tr('Connecting', '连接中'), 'warn'];
+  el(parent, 'span', label, ('badge ' + style).trim());
+  if (conn.available_tools?.length && parent.matches('td')) el(parent, 'small', tr('Tools to review', '有工具待审阅'));
+  const reason = (failed ? conn.test.reason : null) || conn.oauth?.error;
+  if (reason) el(parent, 'small', serverError({error: reason, incident: failed && conn.test.incident}, 422).message, 'status-error').setAttribute('role', 'alert');
+}
 function connections() {
-  const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Account connectors', '账号连接器'));
+  const title = tr('Account connectors', '账号连接器');
+  const head = el(app, 'div', undefined, 'row between page-heading');
+  infoHeading(head, 'h1', title, tr('Credentials are encrypted. Testing contacts the connected service without writing data.', '凭据加密保存。验证会连接对应服务，不会写入数据。'));
   button(head, tr('Add connector', '添加连接器'), () => connectorForm(), 'primary');
-  el(app, 'p', tr('Credentials stay encrypted on the gateway. Read checks contact the actual upstream; demo checks use synthetic notes.', '凭据在网关加密保存。只读验证会连接对应服务；模拟笔记验证使用测试数据。'), 'muted');
-  const grid = el(app, 'div', undefined, 'grid');
-  for (const conn of state.connections) {
-    const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', conn.id, 'connector-title'); el(card, 'p', identityLabel(conn.owner) + ' · ' + (state.catalog[conn.kind]?.label || tr('Custom YAML connector', 'YAML 自定义连接器')), 'muted');
-    if (conn.mailbox?.email) el(card, 'p', conn.mailbox.email, 'muted');
-    if (conn.mailbox?.aliases?.length) el(card, 'p', tr('Aliases', '邮箱别名') + ' · ' + conn.mailbox.aliases.join(', '), 'muted');
-    const failed = conn.test?.ok === false, remote = conn.kind === 'remote';
-    el(card, 'span', failed ? (remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败')) : conn.test?.ok ? (remote ? tr('MCP initialization and tools verified', 'MCP 初始化和工具验证通过') : tr('Read check passed', '读取验证通过')) : conn.connected ? (remote ? tr('MCP connected', 'MCP 已连接') : tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证')) : tr('Connecting tools', '正在连接工具'), failed ? 'badge bad' : 'badge');
-    if (failed) el(card, 'p', serverError({error: conn.test.reason, incident: conn.test.incident}, 422).message, 'error').setAttribute('role', 'alert');
-    if (conn.kind === 'demo') el(card, 'p', tr('Synthetic data. Notes reset when the connector restarts.', '模拟数据。连接器重启后笔记会重置。'), 'hint');
-    if (conn.kind === 'reminders') el(card, 'p', tr('Experimental. Requires a helper in the account owner’s Mac login session.', '实验性功能。需要在账号所有者的 Mac 登录会话中运行辅助服务。'), 'hint');
+  if (!state.connections.length) { el(app, 'p', tr('No connectors yet.', '还没有连接器。'), 'muted'); return; }
+  settingsTable(app, 'connections', title, [tr('Connector', '连接器'), tr('Status', '状态'), tr('Actions', '操作')], state.connections, connectionSearchText, (row, conn) => {
+    connectionRowTitle(row, conn, true);
+    connectionStatus(el(row, 'td'), conn);
+    const actions = el(el(row, 'td'), 'div', undefined, 'actions');
+    if (conn.kind && conn.kind !== 'demo') button(actions, tr('Edit settings', '编辑设置'), () => connectorForm(conn));
+    button(actions, tr('Details', '详情'), () => connectorDetails(conn.id));
+  });
+}
+function connectorDetails(id) {
+  const box = modal(id), content = el(box, 'div');
+  function populate() {
+    const conn = state?.connections.find(c => c.id === id);
+    if (!conn) { box.close(); return; }
+    const remote = conn.kind === 'remote';
+    content.replaceChildren();
+    el(content, 'p', [serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email].filter(Boolean).join(' · '), 'muted');
+    if (conn.mailbox?.aliases?.length) el(content, 'p', tr('Aliases: ', '邮箱别名：') + conn.mailbox.aliases.join(', '), 'muted');
+    connectionStatus(content, conn);
+    if (conn.kind === 'demo') el(content, 'p', tr('Demo notes reset on restart.', '模拟笔记在重启后清空。'), 'muted');
+    if (conn.kind === 'reminders') el(content, 'p', tr('Requires the Reminders helper on the owner’s Mac.', '需要账号所有者的 Mac 运行提醒事项助手。'), 'muted');
     if (conn.oauth) {
-      if (conn.oauth.error) el(card, 'p', serverError({error: conn.oauth.error}, 401).message, 'error');
-      if (conn.oauth.issuer) el(card, 'p', tr('Authorization server: ', '授权服务器：') + conn.oauth.issuer, 'hint');
-      if (conn.oauth.scope) el(card, 'p', tr('Granted scopes: ', '已授权范围：') + conn.oauth.scope, 'hint');
-      if (!conn.oauth.refreshable && !conn.oauth.error) el(card, 'p', tr('The provider did not issue a refresh token. Reauthorization will be needed when access expires.', '服务商未提供刷新令牌，访问权限过期后需要重新授权。'), 'hint');
+      const auth = el(content, 'details');
+      el(auth, 'summary', tr('OAuth details', 'OAuth 详情'));
+      if (conn.oauth.issuer) el(auth, 'p', tr('Issuer: ', '授权服务器：') + conn.oauth.issuer);
+      if (conn.oauth.scope) el(auth, 'p', tr('Scopes: ', '授权范围：') + conn.oauth.scope);
+      if (!conn.oauth.refreshable && !conn.oauth.error) el(auth, 'p', tr('Reauthorize when access expires.', '授权过期后需重新授权。'));
     }
-    toolUpdateNotice(card, conn);
-    const actions = el(card, 'div', undefined, 'actions');
-    if (conn.kind) {
-      button(actions, tr('Test connection', '验证连接'), async () => {
-        try { await api('connections/test', {id: conn.id}); }
-        catch (error) { if (state) await refresh(); throw error; }
-        await refresh(); notify(remote ? tr('MCP initialization and tool discovery passed. No tool was executed.', 'MCP 初始化和工具发现通过，未执行工具。') : tr('Read-only connection check passed.', '只读连接验证通过。'));
-      }, 'primary', tr('Testing connection…', '正在验证连接…'));
-      if (conn.kind !== 'demo') button(actions, tr('Edit settings', '编辑设置'), () => connectorForm(conn));
-    }
-    button(actions, tr('Rename', '改名'), () => renameConnector(conn));
-    if (conn.kind === 'remote') button(actions, tr('Review current tools', '审阅当前工具'), async () => {
-      showReview(await api('connections/review-tools', {id: conn.id, revision: state.revision}));
+    toolUpdateNotice(content, conn);
+    const actions = el(content, 'div', undefined, 'actions');
+    if (conn.kind) button(actions, tr('Test connection', '验证连接'), async () => {
+      try { await api('connections/test', {id}); }
+      catch (error) {
+        if (state) {
+          await refresh(); populate();
+          if (error.code !== state.connections.find(c => c.id === id)?.test?.reason || !error.code) showError(content, error);
+        }
+        return;
+      }
+      await refresh(); populate();
+      notify(remote ? tr('MCP check passed.', 'MCP 验证通过。') : tr('Read check passed.', '读取验证通过。'));
+    }, 'primary', tr('Testing connection…', '正在验证连接…'));
+    button(actions, tr('Rename', '改名'), () => renameConnector(conn, box));
+    if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
+      showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
     if (conn.oauth) {
-      button(actions, tr('Reauthorize', '重新授权'), () => connectorForm(conn, true));
-      button(actions, tr('Revoke authorization', '撤销授权'), () => confirmAction(tr('Revoke authorization?', '撤销授权？'), tr('The gateway will stop using these OAuth credentials. Reauthorize to connect again.', '网关将停止使用这些 OAuth 凭据，重新连接需要再次授权。'), async () => {
-        const result = await api('oauth/revoke', {id: conn.id, revision: state.revision}); await refresh();
+      button(actions, tr('Reauthorize', '重新授权'), () => { connectorForm(conn, true); box.close(); });
+      button(actions, tr('Revoke authorization', '撤销授权'), () => confirmAction(tr('Revoke authorization?', '撤销授权？'), tr('Reconnect to use this account again.', '需重新授权后才能继续使用此账号。'), async () => {
+        const result = await api('oauth/revoke', {id, revision: state.revision}); await refresh(); box.close();
         notify(result.provider === 'revoked' ? tr('Authorization revoked locally and at the provider.', '已在网关和服务商撤销授权。') : result.provider === 'unsupported' ? tr('Gateway tokens cleared. The provider has no revocation endpoint; remove the grant in its account settings if needed.', '网关 Token 已清除。服务商未提供撤销接口，需要时请在其账号设置中移除授权。') : tr('Gateway tokens cleared. The provider revocation request failed; remove the grant in its account settings.', '网关 Token 已清除。服务商撤销请求失败，请在其账号设置中移除授权。'));
       }), 'danger');
     }
-    button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permission rules will be removed.', '该连接器的工具和权限规则将一起移除。'), async () => mutate('connections/remove', {id: conn.id})), 'danger');
+    button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permissions will also be removed.', '工具和权限也会一并移除。'), async () => { await mutate('connections/remove', {id}); box.close(); }), 'danger');
   }
+  populate();
 }
 function registryPicker(onSelect) {
   const box = modal(tr('Search MCP Registry', '搜索 MCP Registry'));
@@ -683,22 +783,22 @@ function connectorForm(existing, reauthorize = false) {
       settings.auth.addEventListener('change', authFields); authFields();
       return;
     }
+    if (kind.value === 'imap') infoHeading(dynamic, 'h3', tr('Mail settings', '邮件设置'),
+      tr('iCloud requires an app-specific password. IMAP and SMTP share the password. Leave the SMTP server blank to disable sending.', 'iCloud 需要 App 专用密码。IMAP 和 SMTP 共用密码。SMTP 服务器留空会关闭发信。'));
     for (const key of spec.fields) {
       if (key === 'mailbox_email' || key === 'mailbox_aliases') continue;
       settings[key] = key === 'smtp_security' ? select(dynamic, labels[key], key, [['starttls', 'STARTTLS (587)'], ['tls', 'TLS (465)']], existing?.settings[key] ?? defaults[key]) : field(dynamic, labels[key], key, existing?.settings[key] ?? defaults[key] ?? '');
     }
     for (const key of spec.secrets) credentials[key] = field(dynamic, labels[key], key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
-    if (kind.value === 'demo') el(dynamic, 'p', tr('No real account needed. Includes read tools and a demo write that requires passkey approval.', '无需真实账号。包含只读工具，以及一个需要通行密钥审批的模拟写入工具。'), 'hint');
     if (kind.value === 'gmail') {
       el(dynamic, 'p', tr('Create a Google OAuth client of type Web application. Register this exact callback URL:', '创建 Google「Web 应用」类型的 OAuth 客户端，并登记此完整回调地址：'), 'hint');
       el(dynamic, 'code', location.origin + '/admin/oauth/google/callback', 'url');
-      el(dynamic, 'p', tr('Authorize read-only Gmail access below, or enter an existing refresh token above.', '点击下方按钮授予 Gmail 只读权限，也可在上方录入已有刷新令牌。'), 'muted');
       button(dynamic, tr('Authorize with Google', '通过 Google 授权'), async () => {
         const result = await api('oauth/start', values());
         location.assign(result.url);
       }, 'primary');
     }
-    if (kind.value === 'caldav') el(dynamic, 'p', tr('iCloud uses an app-specific password. The calendar connector exposes read operations only.', 'iCloud 使用 App 专用密码。日历连接器只提供读取操作。'), 'hint');
+    if (kind.value === 'caldav') el(dynamic, 'p', tr('iCloud requires an app-specific password. Read only.', 'iCloud 使用 App 专用密码。日历连接器只提供读取操作。'), 'hint');
     if (kind.value === 'imap') {
       const addresses = el(dynamic, 'details');
       el(addresses, 'summary', tr('Mailbox addresses', '邮箱地址与别名'));
@@ -706,8 +806,6 @@ function connectorForm(existing, reauthorize = false) {
         tr('Optional. Overrides the address inferred from the login name.', '可选。填写后会覆盖根据登录名推断的地址。'));
       settings.mailbox_aliases = field(addresses, tr('Email aliases', '邮箱别名'), 'mailbox_aliases', existing?.settings.mailbox_aliases || '', 'textarea',
         tr('One address per line. Authorized Agents can use these addresses to find this mailbox.', '每行一个地址。获授权的 Agent 可以用这些地址找到此邮箱。'));
-      el(dynamic, 'p', tr('One mail account: IMAP reads and organizes mail; SMTP sends it. Both use the same saved password. Enable write access and choose approval settings in Permissions. Test connection checks IMAP and configured SMTP authentication without sending mail.', '一个邮箱账号：IMAP 读取和整理邮件，SMTP 发信，两者共用已保存的密码。请在「权限」中启用写入并选择审批方式。「测试连接」会检查 IMAP 及已配置的 SMTP 登录，不会发出邮件。'), 'hint');
-      el(dynamic, 'p', tr('iCloud requires an app-specific password. SMTP uses the full email address; when the IMAP username has no domain, @icloud.com is added for SMTP. Other providers: enter their SMTP server or leave it blank.', 'iCloud 需要 App 专用密码。SMTP 使用完整邮箱地址；IMAP 用户名不带域名时，SMTP 自动补上 @icloud.com。其他服务商请填写对应的 SMTP 服务器，或留空关闭发信。'), 'muted');
     }
   }
   fields();
@@ -754,10 +852,10 @@ function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
   el(review, 'p', result.connection + ' · ' + identityLabel(result.owner), 'muted');
   if (result.google_account) el(review, 'p', tr('Authorized Google account: ', '已授权的 Google 账号：') + result.google_account, 'hint');
-  el(review, 'p', tr('These descriptions and schemas are what authorized agents will see. New connectors and newly added tools grant no access. After applying, choose the connection access and approval settings for each Agent in Permissions. Existing tool permissions are preserved.', '已获授权的 Agent 将看到这些描述和参数定义。新连接器和新增工具默认不开放访问。应用后，请在「权限」中为每个 Agent 选择连接权限及审批设置。原有工具权限会保留。'), 'hint');
+  el(review, 'p', tr('Grant Agent access to new tools under Permissions.', '新增工具默认不授权，请在「权限」中配置。'), 'hint');
   if (result.oauth?.issuer) el(review, 'p', tr('Authorization server: ', '授权服务器：') + result.oauth.issuer, 'hint');
   if (result.oauth?.scope) el(review, 'p', tr('Granted scopes: ', '已授权范围：') + result.oauth.scope, 'hint');
-  if (result.remote) el(review, 'p', tr('Gateway suggests Read for names like get, list, and search. Ambiguous tools default to Write. Confirm each category before applying. Unselected tools and read-to-write changes lose their existing grants.', '网关会将 get、list、search 等工具预选为读取，含义不明确的工具预选为写入。请核对后应用。取消选择的工具，以及从读取改为写入的工具，将撤销原有授权。'), 'hint');
+  if (result.remote) el(review, 'p', tr('Confirm each tool’s access. Deselecting a tool or changing it from Read to Write removes its existing grants.', '请核对工具类型。取消选择工具或将其从读取改为写入，会撤销已有授权。'), 'hint');
   const selections = [];
   for (const definition of result.definitions) {
     const row = el(review, 'div', undefined, 'row');
@@ -776,8 +874,7 @@ function showReview(result, form) {
 function toolUpdateNotice(parent, conn) {
   const sync = conn.catalog_sync;
   if (sync?.automatic) {
-    el(parent, 'p', tr('Bundled capabilities update automatically with the gateway. New tools start with no access; choose connection permissions to authorize them.', '内置连接器的能力随网关升级自动同步。新工具默认未授权，请选择连接权限来授权。'), 'muted');
-    if (sync.added.length) el(parent, 'p', tr(`${sync.added.length} new tools were registered automatically. Existing permissions were preserved.`, `已自动登记 ${sync.added.length} 个新工具，原有授权已保留。`), 'hint');
+    if (sync.added.length) el(parent, 'p', tr(`${sync.added.length} new tools were registered automatically. Review their access under Permissions.`, `已自动登记 ${sync.added.length} 个新工具，请到权限页为它们授权。`), 'hint');
     if (sync.revoked.length) el(parent, 'p', tr('Some tools changed from reading to writing. Their old grants were removed; choose write permissions before using them.', '部分工具从读取变为写入，已撤销这些工具的旧授权，请重新选择写入权限。'), 'hint');
   }
   for (const issue of sync?.issues || []) {
@@ -792,20 +889,20 @@ function toolUpdateNotice(parent, conn) {
   const additions = conn.available_tools || [];
   if (!additions.length) return;
   const writes = additions.filter(t => t.access === 'write').length;
-  el(parent, 'p', tr(`This connection still uses an older tool list. ${additions.length} new tools are available, including ${writes} write tools. Review them here to enable the new permission options. Existing access stays unchanged.`, `此连接仍使用旧工具列表，有 ${additions.length} 个新工具（含 ${writes} 个写入工具）待启用。可在这里审阅，启用后即可配置新权限。原有授权会保留。`), 'hint');
+  el(parent, 'p', tr(`${additions.length} new tools to review, including ${writes} write tools.`, `${additions.length} 个新工具待审阅，其中 ${writes} 个可写入。`), 'hint');
   button(parent, tr('Review new tools', '审阅新工具'), async () => {
     const result = await api('connections/review-tools', {id: conn.id, revision: state.revision});
-    showReview(result);
+    showReview(result, parent.closest('dialog'));
   }, 'primary', tr('Reading tool definitions…', '正在读取工具定义…'));
 }
 async function resumeGoogle() {
   if (!gmailResult && !mcpOAuthResult) return;
   const operation = mcpOAuthResult ? 'oauth/mcp/complete' : 'oauth/complete';
-  const id = mcpOAuthResult || gmailResult; gmailResult = null; mcpOAuthResult = null; history.replaceState(null, '', '/admin/');
+  const id = mcpOAuthResult || gmailResult; gmailResult = null; mcpOAuthResult = null; navigate('connections', true);
   try {
-    const result = await api(operation, {id}); tab = 'connections';
+    const result = await api(operation, {id});
     if (result.saved) { await refresh(); notify(tr('Connector saved.', '连接器已保存。')); }
-    else { render(); showReview(result); }
+    else showReview(result);
   }
   catch (error) {
     showError(app, error);
@@ -815,58 +912,88 @@ async function resumeGoogle() {
     }
   }
 }
+function accessProfile(conn, client) {
+  const current = conn.access[client];
+  const scope = current.startsWith('read_write') || current === 'read_approval_write_direct' ? 'read_write' :
+    current === 'read_approval' ? 'read' : current;
+  return {current, scope,
+    readApprovalRequired: ['read_approval', 'read_write_approval', 'read_approval_write_direct'].includes(current),
+    writeApprovalRequired: ['read_write', 'read_write_approval'].includes(current)};
+}
+function accessSummary(parent, conn, client) {
+  const {scope, readApprovalRequired, writeApprovalRequired} = accessProfile(conn, client);
+  const labels = {none: tr('No access', '禁止访问'), read: tr('Read only', '只读'), read_write: tr('Read and write', '读写'), custom: tr('Custom', '自定义')};
+  el(parent, 'span', labels[scope], 'badge');
+  if (scope === 'read' || scope === 'read_write') {
+    const approval = (required) => required ? tr('approval', '需审批') : tr('direct', '无需审批');
+    const read = tr('Read: ', '读取：') + approval(readApprovalRequired);
+    const write = tr('Write: ', '写入：') + approval(writeApprovalRequired);
+    const modes = el(parent, 'small', undefined, 'approval-summary');
+    el(modes, 'span', read);
+    if (scope === 'read_write') el(modes, 'span', write);
+  }
+  if (readApprovalRequired || writeApprovalRequired || (scope === 'custom' && conn.tools.some(tool => tool.permissions[client] === 'approval_required'))) {
+    const approver = conn.approver === conn.household ? tr('Any household member', '家庭内任意成员') : nameOf(conn.approver);
+    el(parent, 'small', tr('Approver: ', '审批人：') + approver);
+  }
+}
 function permissions() {
-  el(app, 'h1', tr('Inspect permissions', '检查权限'));
-  el(app, 'p', tr('Unlisted access is denied. Approval-required tools still need a separate passkey decision for each exact call.', '未授权的访问默认拒绝。需要审批的工具，每次调用仍须对具体内容进行通行密钥审批。'), 'muted');
+  const title = tr('Inspect permissions', '检查权限');
+  infoHeading(app, 'h1', title, tr('These permissions apply to everyone using the selected Agent. Each approval covers one operation. Changes expire pending approvals.', '权限适用于此 Agent 的所有使用者。每次审批只批准一次操作。权限变更会使待审批请求失效。')).classList.add('page-heading');
   if (!state.clients.length) {
-    el(app, 'p', tr('Create an Agent token first, then assign its tools here.', '请先创建 Agent Token，再在这里为它配置工具权限。'));
-    button(app, tr('Create agent token', '创建 Agent Token'), () => { tab = 'agents'; render(); }); return;
+    el(app, 'p', tr('Create an Agent token to set its permissions.', '创建 Agent Token 后即可配置权限。'));
+    button(app, tr('Create agent token', '创建 Agent Token'), () => navigate('agents')); return;
   }
   if (!state.clients.some(c => c.id === subject)) subject = state.clients[0].id;
   const agent = state.clients.find(c => c.id === subject);
-  const selected = select(app, tr('Agent', 'Agent'), 'inspect_agent', state.clients.map(c => [c.id, c.id]), subject);
+  const agentBar = el(app, 'div', undefined, 'agent-select');
+  const selected = select(agentBar, tr('Agent', 'Agent'), 'inspect_agent', state.clients.map(c => [c.id, c.id]), subject);
   selected.addEventListener('change', () => { subject = selected.value; render(); });
-  el(app, 'p', tr('Household: ', '所属家庭：') + nameOf(agent.household), 'muted');
-  el(app, 'p', tr('These permissions apply to every person using this Agent. An Agent token does not identify the person chatting with it.', '这些权限适用于所有通过此 Agent 发起的调用。Agent Token 不识别当前和它聊天的人。'), 'hint');
-  if (!state.connections.some(c => c.household === agent.household)) el(app, 'p', tr('This household has no connections yet. Add a connector first.', '此家庭尚无连接，请先添加连接器。'), 'muted');
-  for (const conn of state.connections.filter(c => c.household === agent.household)) {
-    const card = el(app, 'section', undefined, 'card permission-card'); card.dataset.connection = conn.id;
-    el(card, 'h2', conn.id);
-    if (conn.oauth) {
-      if (conn.oauth.error) el(card, 'p', serverError({error: conn.oauth.error}, 401).message, 'error');
-      if (conn.oauth.issuer) el(card, 'p', tr('Authorization server: ', '授权服务器：') + conn.oauth.issuer, 'hint');
-      if (conn.oauth.scope) el(card, 'p', tr('Granted scopes: ', '已授权范围：') + conn.oauth.scope, 'hint');
-      if (!conn.oauth.refreshable && !conn.oauth.error) el(card, 'p', tr('The provider did not issue a refresh token. Reauthorization will be needed when access expires.', '服务商未提供刷新令牌，访问权限过期后需要重新授权。'), 'hint');
-    }
+  el(agentBar, 'p', tr('Household: ', '所属家庭：') + nameOf(agent.household), 'muted');
+  const entries = state.connections.filter(c => c.household === agent.household);
+  if (!entries.length) { el(app, 'p', tr('No connectors in this household.', '此家庭还没有连接器。'), 'muted'); return; }
+  settingsTable(app, 'permissions', title, [tr('Connector', '连接器'), tr('Access', '访问权限'), tr('Actions', '操作')], entries, connectionSearchText, (row, conn) => {
+    connectionRowTitle(row, conn, true);
+    accessSummary(el(row, 'td'), conn, agent.id);
+    button(el(row, 'td'), tr('Edit access', '编辑权限'), () => permissionEditor(conn.id, agent.id));
+  });
+}
+function permissionEditor(id, client) {
+  const box = modal(tr('Permissions: ', '权限：') + id), content = el(box, 'div');
+  box.classList.add('permission-dialog');
+  function populate() {
+    const conn = state?.connections.find(c => c.id === id);
+    if (!conn) { box.close(); return; }
+    const advancedOpen = content.querySelector('.advanced-permissions')?.open || false;
+    content.replaceChildren();
+    const card = el(content, 'div'); card.dataset.connection = id;
+    el(card, 'p', [client, tr('Account owner: ', '账号归属：') + nameOf(conn.owner)].join(' · '), 'muted');
     toolUpdateNotice(card, conn);
-    el(card, 'p', tr('Account owner: ', '账号归属：') + nameOf(conn.owner), 'muted');
     const reads = conn.tools.filter(t => t.access === 'read').length, writes = conn.tools.length - reads;
-    const current = conn.access[subject];
-    const scope = current.startsWith('read_write') || current === 'read_approval_write_direct' ? 'read_write' : current === 'read_approval' ? 'read' : current;
+    const {current, scope, readApprovalRequired, writeApprovalRequired} = accessProfile(conn, client);
     const options = [['none', tr('No access', '禁止访问')], ['read', tr('Read only', '只读')]];
     if (writes) options.push(['read_write', tr('Read and write', '读写')]);
     if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
     const mode = select(card, tr('Connection access', '连接权限'), 'connection_access', options, scope);
     if (!writes && !(conn.available_tools || []).some(t => t.access === 'write')) el(card, 'p', tr('This connector only provides read operations.', '此连接器只提供读取操作，不支持写入。'), 'muted');
-    el(card, 'p', tr(`${reads} read tool(s) · ${writes} write or unclassified tool(s)`, `${reads} 个读取工具 · ${writes} 个写入或未分类工具`), 'muted');
     const approvalFields = el(card, 'div', undefined, 'form-grid');
     const readSettings = el(approvalFields, 'div'), writeSettings = el(approvalFields, 'div');
     const choices = [['allow', tr('No approval', '无需审批')], ['approval_required', tr('Approve every operation', '每次操作都审批')]];
     const readApproval = select(readSettings, tr('Read approval', '读取审批'), 'read_approval', choices,
-      ['read_approval', 'read_write_approval', 'read_approval_write_direct'].includes(current) ? 'approval_required' : 'allow');
+      readApprovalRequired ? 'approval_required' : 'allow');
     const writeApproval = select(writeSettings, tr('Write approval', '写入审批'), 'write_approval', choices,
-      ['read_write_direct', 'read_approval_write_direct'].includes(current) ? 'allow' : 'approval_required');
+      scope === 'read_write' && !writeApprovalRequired ? 'allow' : 'approval_required');
     const approval = el(card, 'div');
     const members = state.members.filter(m => m.household === conn.household);
     const approver = select(approval, tr('Who can approve?', '由谁审批？'), 'connection_approver',
       [...members.map(m => [m.id, m.name]), [conn.household, tr('Any household member', '家庭内任意成员')]], conn.approver);
-    el(approval, 'p', tr('Operations requiring approval show their exact contents for a one-use passkey decision. This approver setting applies to this connection for all Agents.', '需要审批的操作会展示具体内容，并通过通行密钥单独批准一次。此审批人设置适用于该连接的所有 Agent。'), 'hint');
+    el(approval, 'small', tr('Applies to all Agents using this connector.', '适用于使用此连接器的所有 Agent。'), 'muted');
     const enrollment = el(approval, 'p', '', 'muted');
     function feedback() {
       readSettings.hidden = !['read', 'read_write'].includes(mode.value);
       writeSettings.hidden = mode.value !== 'read_write';
       const required = (!readSettings.hidden && readApproval.value === 'approval_required') || (!writeSettings.hidden && writeApproval.value === 'approval_required');
-      approval.hidden = !required && !(mode.value === 'custom' && conn.tools.some(t => t.permissions[subject] === 'approval_required'));
+      approval.hidden = !required && !(mode.value === 'custom' && conn.tools.some(t => t.permissions[client] === 'approval_required'));
       const eligible = approver.value === conn.household ? members : members.filter(m => m.id === approver.value);
       enrollment.textContent = eligible.some(m => m.passkeys) ? '' : tr('No selected approver has a passkey yet. Register one under Members before approving requests.', '所选审批人尚未注册通行密钥，请先在家庭成员中注册，再处理审批。');
     }
@@ -882,34 +1009,41 @@ function permissions() {
       const disabled = controls.map(control => control.disabled);
       controls.forEach(control => { control.disabled = true; });
       try {
-        await mutate('permissions/connection', {client: subject, connection: conn.id, access,
+        await mutate('permissions/connection', {client, connection: conn.id, access,
           ...(!approval.hidden ? {approver: approver.value} : {})});
-        notify(tr('Connection permissions updated.', '连接权限已更新。'));
+        populate(); notify(tr('Connection permissions updated.', '连接权限已更新。'));
       } finally { controls.forEach((control, index) => { control.disabled = disabled[index]; }); }
     }, 'primary');
-    const details = el(card, 'details'); details.open = advancedConnections.has(conn.id);
+    const details = el(card, 'details', undefined, 'advanced-permissions'); details.open = advancedOpen;
     el(details, 'summary', tr('Advanced: individual tools and argument limits', '高级设置：逐工具权限与参数限制'));
-    details.addEventListener('toggle', () => { if (details.open) advancedConnections.add(conn.id); else advancedConnections.delete(conn.id); });
-    advancedPermissions(details, conn);
+    const tools = el(details, 'div');
+    function loadTools() {
+      if (details.open && !tools.hasChildNodes()) advancedPermissions(tools, conn, client, populate);
+    }
+    details.addEventListener('toggle', loadTools); loadTools();
   }
+  populate();
 }
-function advancedPermissions(parent, conn) {
-  el(parent, 'p', tr('Changing individual tools may produce a custom connection setting. Unclassified tools are treated as writes.', '逐工具修改后，连接权限可能显示为自定义。未分类工具按写入处理。'), 'muted');
+function advancedPermissions(parent, conn, client, populate) {
+  infoHeading(parent, 'h3', tr('Tool permissions', '工具权限'), tr('Unclassified tools count as writes. Argument limits apply to every Agent.', '未分类工具按写入处理。参数限制适用于所有 Agent。'));
   const table = el(el(parent, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
   for (const label of [tr('Tool / owner', '工具 / 所有者'), tr('Access', '访问权限'), tr('Changes', '修改')]) el(heading, 'th', label);
   const body = el(table, 'tbody');
   for (const tool of conn.tools) {
-    const row = el(body, 'tr'); const info = el(row, 'td'); el(info, 'strong', tool.name); el(info, 'div', identityLabel(conn.owner) + ' · ' + conn.id, 'muted');
+    const row = el(body, 'tr'); const info = el(row, 'td'); el(info, 'strong', tool.name);
     if (tool.problem) el(info, 'span', tr('Disabled: ', '已停用：') + tool.problem, 'badge bad');
     if (Object.keys(tool.pin).length) el(info, 'pre', JSON.stringify(tool.pin));
     const settings = el(row, 'td');
     const choices = [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow without approval', '允许，无需审批')], ['approval_required', tr('Require approval', '需要审批')]];
-    const effect = select(settings, tr('Effect', '权限效果'), 'effect', choices, tool.permissions[subject]);
+    const effect = select(settings, tr('Effect', '权限效果'), 'effect', choices, tool.permissions[client]);
     el(info, 'span', tool.access === 'read' ? tr('Read', '读取') : tr('Write / unclassified', '写入 / 未分类'), 'badge');
-    el(settings, 'p', tr('If approval is required: ', '需要审批时由以下成员批准：') + conn.approvers.map(nameOf).join(tr(' or ', ' 或 ')), 'hint');
-    if (!conn.approvers.some(id => state.members.find(m => m.id === id)?.passkeys)) el(settings, 'p', tr('No approver has a passkey yet. Register one before using approval-required tools.', '审批人尚未注册通行密钥，需要审批的工具暂时无法执行。'), 'hint');
+    if (!conn.approvers.some(id => state.members.find(m => m.id === id)?.passkeys)) {
+      const warning = el(settings, 'small', tr('No approver has a passkey.', '审批人尚未注册通行密钥。'), 'status-error');
+      const showWarning = () => { warning.hidden = effect.value !== 'approval_required'; };
+      showWarning(); effect.addEventListener('change', showWarning);
+    }
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');
-    button(actions, tr('Save access', '保存权限'), async () => { await mutate('permissions/save', {client: subject, connection: conn.id, tool: tool.name, effect: effect.value}); notify(tr('Permissions updated.', '权限已更新。')); });
+    button(actions, tr('Save access', '保存权限'), async () => { await mutate('permissions/save', {client, connection: conn.id, tool: tool.name, effect: effect.value}); populate(); notify(tr('Permissions updated.', '权限已更新。')); });
     button(actions, tr('Argument limits', '参数限制'), () => {
       const box = modal(tr('Argument limits', '参数限制')); el(box, 'p', tr('These restrictions apply to everyone using this exposed tool. Fixed arguments are hidden from agents. Changes invalidate pending approvals.', '这些限制适用于所有调用此工具的身份。固定参数对 Agent 隐藏。修改会使未使用的审批失效。'), 'muted');
       const pin = field(box, tr('Fixed arguments (JSON object)', '固定参数（JSON 对象）'), 'pin', JSON.stringify(tool.pin, null, 2), 'textarea');
@@ -918,7 +1052,7 @@ function advancedPermissions(parent, conn) {
         let fixed, allowed;
         try { fixed = JSON.parse(pin.value); } catch { throw new Error(tr('Fixed arguments: invalid JSON. Check quotes and commas.', '固定参数：JSON 格式错误，请检查引号和逗号。')); }
         try { allowed = JSON.parse(allow.value); } catch { throw new Error(tr('Allowed values: invalid JSON. Check quotes and commas.', '允许值：JSON 格式错误，请检查引号和逗号。')); }
-        await mutate('tools/restrict', {connection: conn.id, tool: tool.name, pin: fixed, allow_values: allowed}); box.close();
+        await mutate('tools/restrict', {connection: conn.id, tool: tool.name, pin: fixed, allow_values: allowed}); box.close(); populate();
       }, 'primary');
     });
   }

@@ -37,6 +37,12 @@ async def admin_page(tmp_path, locale, **gateway_options):
                 await browser.close()
 
 
+async def open_permission(page, connection, t):
+    row = page.locator(f'tr[data-connection="{connection}"]')
+    await row.get_by_role('button', name=t('Edit access', '编辑权限'), exact=True).click()
+    return page.get_by_role('dialog', name=t('Permissions: ', '权限：') + connection, exact=True)
+
+
 @pytest.mark.parametrize('locale', ['en-US', 'zh-CN'])
 async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, locale):
     def t(en, zh):
@@ -61,7 +67,7 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         await playwright.expect(page.locator('dl')).to_contain_text(label)
         assert await page.locator('dl b').count() == 0
         await page.goto(origin + '/admin/')
-        await page.get_by_role('button', name=t('Connectors', '连接器'), exact=True).click()
+        await page.get_by_role('link', name=t('Connectors', '连接器'), exact=True).click()
         await page.get_by_role('button', name=t('Add connector', '添加连接器'), exact=True).click()
         box = page.get_by_role('dialog')
         await page.get_by_label(t('Service', '服务'), exact=True).select_option('imap')
@@ -69,7 +75,9 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         assert await box.locator('input[type=password]').count() == 1
         await playwright.expect(box.locator('input[name=smtp_host]')).to_have_value('smtp.mail.me.com')
         await playwright.expect(box.locator('input[name=smtp_port]')).to_have_value('587')
-        await playwright.expect(box.locator('select[name=smtp_security]')).to_have_value('starttls')
+        security = box.locator('select[name=smtp_security]')
+        await playwright.expect(security).to_have_value('starttls')
+        assert (await security.bounding_box())['height'] == (await box.locator('input[name=smtp_host]').bounding_box())['height']
         name = page.get_by_label(t('Connector name', '连接器名称'), exact=True)
         await name.fill('iCloud Mail')
         preview = page.get_by_role('button', name=t('Save connector', '保存连接器'), exact=True)
@@ -104,11 +112,25 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
             await playwright.expect(loading).to_be_disabled()
         finally:
             release.set()
-        card = page.locator('.card').filter(has=page.get_by_role('heading', name='icloud-mail', exact=True))
+        card = page.locator('tr[data-connection=icloud-mail]')
         await playwright.expect(card).to_be_visible()
         await card.get_by_role('button', name=t('Edit settings', '编辑设置'), exact=True).click()
         await page.get_by_text(t('Mailbox addresses', '邮箱地址与别名'), exact=True).click()
         await page.get_by_label(t('Email aliases', '邮箱别名'), exact=True).fill('alias@example.test')
         await preview.click()
-        await playwright.expect(card).to_contain_text('alias@example.test')
         await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        info = page.locator('main .info-tip')
+        explanation = info.get_by_text(t('Credentials are encrypted.', '凭据加密保存。'), exact=False)
+        await playwright.expect(explanation).to_be_hidden()
+        await info.locator('summary').click()
+        await playwright.expect(explanation).to_be_visible()
+        await info.locator('summary').click()
+        search = page.get_by_role('searchbox', name=t('Filter connectors', '筛选连接器'))
+        await search.fill('no-matching-connector')
+        await playwright.expect(card).to_be_hidden()
+        await playwright.expect(page.get_by_text(t('No matching connectors.', '没有匹配的连接器。'))).to_be_visible()
+        await search.fill('alias@example.test')
+        await playwright.expect(page.locator('tbody tr:visible')).to_have_count(1)
+        await card.get_by_role('button', name=t('Details', '详情'), exact=True).click()
+        details = page.get_by_role('dialog', name='icloud-mail')
+        await playwright.expect(details).to_contain_text('alias@example.test')

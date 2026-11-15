@@ -13,7 +13,7 @@ import anyio
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
-from . import registry
+from . import __version__, registry
 from .admin_auth import AdminAuth, COOKIE
 from .admin_config import (
     CATALOG, CONNECTION_ACCESS, CONNECTOR_NAME, ManagedStore, catalog_additions, connection_access,
@@ -159,7 +159,7 @@ class AdminController:
                                 "available_tools": [{**t, "access": tool_access(conn, ToolCfg.model_validate(t))} for t in catalog_additions(conn, gw.cfg)],
                                 "connected": gw.upstreams[conn.id]._client is not None,
                                 "test": self.tests.get(conn.id)})
-        return {"revision": self.store.state["revision"], "owner": self.auth.owner,
+        return {"version": __version__, "revision": self.store.state["revision"], "owner": self.auth.owner,
                 "mcp_url": gw.cfg.approvals.origin + "/mcp",
                 "households": [{"id": h.id, "name": self.store.name_of(h.id)} for h in gw.cfg.households],
                 "members": [{"id": m.id, "name": self.store.name_of(m.id), "household": m.household,
@@ -697,6 +697,7 @@ class AdminController:
             return HTMLResponse(page, status_code=error.status_code, headers=_PAGE_HEADERS)
 
         return [Route("/", page), Route("/admin", page), Route("/admin/", page),
+                *(Route(f"/admin/{section}", page) for section in ("members", "agents", "connections", "permissions")),
                 Route("/admin/oauth/google/callback", oauth_callback),
                 Route("/admin/oauth/mcp/callback", oauth_callback),
                 Route("/admin/assets/{name}", asset),

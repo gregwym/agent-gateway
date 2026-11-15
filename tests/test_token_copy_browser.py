@@ -15,7 +15,7 @@ async def test_copy_check_and_rotate_token_with_clipboard_failure(tmp_path, loca
         return zh if locale == 'zh-CN' else en
     async with admin_page(tmp_path, locale) as (page, origin):
         await page.evaluate("Object.defineProperty(navigator, 'clipboard', {configurable:true, value:{writeText:async value => { window.copiedToken=value; }}})")
-        await page.get_by_role('button', name=t('Agents', 'Agent 接入'), exact=True).click()
+        await page.get_by_role('link', name=t('Agents', 'Agent 接入'), exact=True).click()
         await page.get_by_role('button', name=t('Create agent token', '创建 Agent Token'), exact=True).click()
         await page.get_by_label(t('Agent name', 'Agent 名称'), exact=True).fill('copy-test')
         await page.get_by_role('button', name=t('Create token', '创建 Token'), exact=True).click()

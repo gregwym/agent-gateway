@@ -7,7 +7,7 @@ from helpers import SECRETS, TOKEN_A, prepare
 from passkey_helpers import approval_config
 from service_helpers import free_port
 from test_admin import rpc
-from test_admin_feedback_browser import admin_page, playwright
+from test_admin_feedback_browser import admin_page, open_permission, playwright
 
 pytestmark = [pytest.mark.anyio, pytest.mark.browser]
 
@@ -29,8 +29,8 @@ async def test_legacy_mail_gains_write_controls_without_a_review_or_data_edit(tm
     raw['policy'].append({'principals': ['person_a'], 'connection': 'mail', 'tools': ['mail_' + n for n in old], 'effect': 'allow'})
     path = await prepare(tmp_path, raw, secrets={**SECRETS, 'mail_password': 'fake-password'})
     async with admin_page(tmp_path, locale, path=path, port=port) as (page, origin):
-        await page.get_by_role('button', name=t('Permissions', '权限'), exact=True).click()
-        card = page.locator('.permission-card[data-connection=mail]')
+        await page.get_by_role('link', name=t('Permissions', '权限'), exact=True).click()
+        card = await open_permission(page, 'mail', t)
         await playwright.expect(card).to_contain_text(t('registered automatically', '自动登记'))
         await playwright.expect(card).not_to_contain_text(t('only provides read operations', '不支持写入'))
         assert await card.locator('select[name=connection_access] option[value=read_write]').count() == 1
@@ -45,6 +45,6 @@ async def test_legacy_mail_gains_write_controls_without_a_review_or_data_edit(tm
         tools = (await rpc(origin, TOKEN_A)).json()['result']['tools']
         assert 'mail_send' in {tool['name'] for tool in tools}
         await page.reload()
-        await page.get_by_role('button', name=t('Permissions', '权限'), exact=True).click()
+        card = await open_permission(page, 'mail', t)
         await playwright.expect(card.get_by_label(t('Connection access', '连接权限'), exact=True)).to_have_value('read_write')
         await playwright.expect(card.get_by_label(t('Write approval', '写入审批'), exact=True)).to_have_value('approval_required')

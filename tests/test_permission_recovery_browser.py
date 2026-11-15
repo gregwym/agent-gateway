@@ -1,7 +1,7 @@
 """A committed save with a lost HTTP response is reconciled, never replayed."""
 import pytest
 
-from test_admin_feedback_browser import admin_page, playwright
+from test_admin_feedback_browser import admin_page, open_permission, playwright
 
 pytestmark = [pytest.mark.anyio, pytest.mark.browser]
 
@@ -9,8 +9,8 @@ pytestmark = [pytest.mark.anyio, pytest.mark.browser]
 @pytest.mark.parametrize('failure', ['lost_response', 'refresh_failed', 'not_sent'])
 async def test_permission_save_reports_actual_status_without_repeating_post(tmp_path, failure):
     async with admin_page(tmp_path, 'zh-CN') as (page, origin):
-        await page.get_by_role('button', name='权限', exact=True).click()
-        card = page.locator('.permission-card[data-connection=notes-a]')
+        await page.get_by_role('link', name='权限', exact=True).click()
+        card = await open_permission(page, 'notes-a', lambda _, zh: zh)
         before = await page.evaluate('state.revision')
         await page.evaluate('''failure => {
           const original = window.fetch;
@@ -35,7 +35,7 @@ async def test_permission_save_reports_actual_status_without_repeating_post(tmp_
         await card.get_by_label('连接权限', exact=True).select_option('read')
         await card.get_by_role('button', name='保存连接权限', exact=True).click()
         if failure == 'lost_response':
-            await playwright.expect(page.locator('#notice')).to_contain_text('连接权限已更新')
+            await playwright.expect(card.get_by_role('status')).to_contain_text('连接权限已更新')
             assert await page.evaluate('state.revision') == before + 1
             await playwright.expect(card.get_by_label('连接权限', exact=True)).to_have_value('read')
         elif failure == 'refresh_failed':
