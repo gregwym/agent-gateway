@@ -285,12 +285,12 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 1. Agent 调用需要审批的工具。Gateway 校验身份、权限和参数后保存原请求。
 2. 审批人在浏览器查看账号、工具和完整参数，用 Passkey 批准或拒绝。
 3. Gateway 领取已批准的请求，重新核对现有权限、凭据和工具定义，在联系上游前原子标记为「已使用」，然后执行一次。
-4. 支持 MCP Tasks 和 URL elicitation 的客户端通过原调用跟踪任务。其他客户端收到审批链接和请求编号，
-   再用 `gateway_call_tool` 传入 `request_id` 查询。审批链接可由客户端显示或 Agent 转告；只有网页上的
-   Passkey 验证能批准执行。
+4. 支持 MCP Tasks 和 URL elicitation 的客户端通过原调用跟踪任务。Agent 也可调用
+   `gateway_call_tool`，只传最初提交的 `idempotency_key` 查询状态。只有网页上的 Passkey 能批准执行。
 
-只有发起请求的 Agent Token 能查询。状态持久化，原始结果短期保存在内存。若进程在领取后、记录结果前中断，
-结果标记为未知，不重放。Agent 也可在 `gateway_call_tool` 传入 `background: true` 排队，遵循相同的权限检查和查询方式。
+每次提交由 Agent 生成独立的 key。Gateway 在同一个事务中保存 key、参数指纹和请求；相同 key 与参数会复用，
+不同参数会被拒绝。只有发起请求的 Agent Token 能查询。状态持久化，原始结果短期保存在内存。
+若进程在领取后、记录结果前中断，结果标记为未知，不重放。免审批的后台调用也用同一个 key 查询。
 
 ### 8.2 批准绑定什么
 

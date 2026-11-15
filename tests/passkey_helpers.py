@@ -124,4 +124,4 @@ class Page:
 
 
 async def wait_for_approval(client, request_id, seconds=10):
-    return await client.call_tool("gateway_call_tool", {"request_id": request_id, "wait_seconds": seconds})
+    return await client.call_tool("gateway_call_tool", {"idempotency_key": request_id, "wait_seconds": seconds})

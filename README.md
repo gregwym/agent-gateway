@@ -68,7 +68,8 @@ Example `tools/call` parameters using the demo configuration:
 ```json
 {"name":"gateway_search_tools","arguments":{"query":"notes"}}
 {"name":"gateway_search_connections","arguments":{"tool":"notes_add_note"}}
-{"name":"gateway_call_tool","arguments":{"tool":"notes_add_note","connection":"notes-a","arguments":{"folder":"inbox","text":"Example note"}}}
+{"name":"gateway_call_tool","arguments":{"idempotency_key":"340a7ed1-5d9f-4238-935d-23f3c87ccbb8","tool":"notes_add_note","connection":"notes-a","arguments":{"folder":"inbox","text":"Example note"}}}
+{"name":"gateway_call_tool","arguments":{"idempotency_key":"340a7ed1-5d9f-4238-935d-23f3c87ccbb8"}}
 ```
 
 Searches operate on metadata, not account contents. Both support `query`, `offset`
@@ -86,24 +87,26 @@ Use **Rename** on a connector to change its connection ID. Credentials and
 permissions carry over. Update workflows that pass the old connection ID and
 request unfinished approvals again.
 
-Gateway saves calls that need approval and executes them once after Passkey
-approval, after rechecking permissions. Clients that support
+Each `gateway_call_tool` submission requires an `idempotency_key`. Generate a
+fresh UUID for each intended operation. If the response is lost, retry with the
+same key and inputs, or call `gateway_call_tool` with only that key to check the
+status and result. A key cannot be reused for different inputs.
+
+If an operation needs approval, share the returned `approval_url` with the
+approver. Gateway checks permissions again and executes it once after Passkey
+approval. Clients that support
 [MCP Tasks](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)
-and URL elicitation can follow approval and execution on the original call.
-Other clients receive an `approval_url` and `request_id`. Share the link with
-the approver, then call `gateway_call_tool` with just `request_id` to check status
-and get the output. Do not resubmit the original action. Gateway never
-automatically replays an interrupted execution with an unknown outcome.
+and URL elicitation can also follow the original call through the protocol.
 
 Use **Members → Add member** to add someone and create a private Passkey link.
 For an existing member, use **Get passkey link**. The link works once for 15 minutes.
 The recipient registers on their own device; the key is active immediately.
 
-With approvals configured, pass `background: true` to `gateway_call_tool` to
-queue a call. Clients with MCP Tasks follow it through the protocol; other
-clients check the returned request ID through the same tool. Refresh the MCP
-tool list once after upgrading to pick up the updated schema.
-`server.tool_discovery: all` restores the full listing of connector tools.
+Set `background: true` to return as soon as a call is queued. Gateway retains the
+key and execution status across restarts according to the configured retention
+period. Original results stay in memory for up to 10 minutes. If a connector may
+already have executed a call, Gateway reports the uncertain result and does not
+replay it. Refresh the MCP tool list after upgrading to pick up the new schema.
 
 ## Current status
 

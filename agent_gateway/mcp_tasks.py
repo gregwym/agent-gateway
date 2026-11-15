@@ -70,7 +70,7 @@ def _missing_result(message):
 
 def register(server, dispatcher):
     server.extensions[EXTENSION] = {}
-    approver = dispatcher.approver
+    approver = dispatcher.store
 
     async def get(ctx, params):
         gw, row = _require(ctx, params, dispatcher)

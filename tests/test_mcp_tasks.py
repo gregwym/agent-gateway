@@ -95,6 +95,7 @@ async def test_native_cancel_and_compatibility_use_the_same_saved_requests(tmp_p
             args = {"tool": "notes_add_note", "connection": "notes-a",
                     "arguments": {"folder": "family", "text": "must not execute"}}
             for ending in ("cancel", "decline"):
+                args["idempotency_key"] = ending
                 task_id = (await call(http, BROKER, args))["taskId"]
                 params = {"taskId": task_id}
                 if ending == "cancel":
@@ -107,20 +108,22 @@ async def test_native_cancel_and_compatibility_use_the_same_saved_requests(tmp_p
                 args["arguments"]["text"] += " again"
 
             # Tasks without URL elicitation, and clients without Tasks, get a normal result and a link.
-            for caps in (TASKS, {}):
+            for index, caps in enumerate((TASKS, {})):
+                args["idempotency_key"] = f"fallback-{index}"
                 pending = await call(http, BROKER, args, caps=caps)
                 assert pending["resultType"] == "complete"
                 request = pending["structuredContent"]
-                task_id = request["request_id"]
-                assert request["approval_url"].endswith(f"/{task_id}")
-                check = {"request_id": task_id, "wait_seconds": 0}
-                assert (await call(http, BROKER, check, caps=caps))["structuredContent"]["status"] == "pending"
-                assert (await call(http, "gateway_watch", check, caps=caps))["structuredContent"]["status"] == "pending"
-                assert (await rpc(http, "tools/call", {"name": BROKER, "arguments": {**check, **args}},
-                                  caps=caps))["error"]["code"] == -32602
+                assert request["idempotency_key"] == args["idempotency_key"]
+                check = {"idempotency_key": args["idempotency_key"], "wait_seconds": 0}
+                found = (await call(http, BROKER, check, caps=caps))["structuredContent"]
+                assert found == request and found["status"] == "pending" and "request_id" not in found
+                for name, params in ((BROKER, {"request_id": request["approval_url"].rsplit("/", 1)[-1]}),
+                                     ("gateway_watch", check)):
+                    assert (await rpc(http, "tools/call", {"name": name, "arguments": params},
+                                      caps=caps))["error"]["code"] == -32602
                 args["arguments"]["text"] += " again"
 
-            background = await call(http, BROKER, {"tool": "notes_list_notes", "connection": "notes-a",
+            background = await call(http, BROKER, {"idempotency_key": "bg-list", "tool": "notes_list_notes", "connection": "notes-a",
                                                   "arguments": {"folder": "family"}, "background": True}, caps=TASKS)
             assert background["resultType"] == "task"
             result = await completed(http, background["taskId"])
@@ -129,7 +132,7 @@ async def test_native_cancel_and_compatibility_use_the_same_saved_requests(tmp_p
 
 
             # A connector crash can leave the side effect unknown. Preserve its original error and explain the ambiguity.
-            crashed = await call(http, BROKER, {"tool": "notes_crash", "connection": "notes-a",
+            crashed = await call(http, BROKER, {"idempotency_key": "crash", "tool": "notes_crash", "connection": "notes-a",
                                                "arguments": {}, "background": True})
             result = await completed(http, crashed["taskId"])
             assert result["status"] == "completed" and result["result"]["isError"]

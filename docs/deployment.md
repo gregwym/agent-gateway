@@ -219,10 +219,11 @@ docker compose run --rm admin approval enroll person_a
 （AirDrop、当面、端到端加密的私聊）交给本人，不要贴进任何 Agent 读得到的对话。打开后按浏览器提示创建 Passkey
 （需要生物识别或设备密码）。
 
-**一次审批**：审批人核对参数并用 Passkey 批准后，Gateway 自动执行一次。支持 MCP Tasks 和 URL elicitation
-的客户端会跟踪原调用；其他客户端收到 `approval_url` 和 `request_id`，用 `gateway_call_tool` 传入
-`request_id` 获取状态和结果。默认等 20 秒，`wait_seconds: 0` 可立即查询。等待中继续查同一个编号；
-不要重发原操作。结果留在内存最多 10 分钟；重启后仍可查询执行状态。若结果显示未知，先确认上游是否已经执行。
+**一次审批**：调用 `gateway_call_tool` 时，为这次操作生成一个 `idempotency_key`（如 UUID）。审批人核对
+`approval_url` 中的参数并用 Passkey 批准，Gateway 自动执行一次。用同一个 key 查询状态和结果。
+`wait_seconds: 0` 可立即查询；默认最多等 20 秒。原始结果最多在内存中保留 10 分钟，状态可跨重启查询。
+支持 MCP Tasks 和 URL elicitation 的客户端也可以跟踪原调用。遇到响应超时，继续使用原 key；
+如果执行状态未知，先核对上游。
 
 连接的 `approver` 可选同群组的一位成员或群组内任意成员；未设置时默认 owner。选择群组时，其中任意成员可批准，
 无需全员批准；owner 本身不授予其他 Agent 工具权限。
@@ -324,7 +325,7 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 call "$A" gateway_search_tools '{"query":"mail"}'
 call "$A" gateway_search_connections '{"tool":"mail_list_messages"}'
 # connection 使用上一步实际返回的 ID；参数采用它的 inputSchema。
-call "$A" gateway_call_tool '{"tool":"mail_list_messages","connection":"my_mail","arguments":{"limit":25}}'
+call "$A" gateway_call_tool '{"idempotency_key":"af1bcf8c-22af-4721-bf2e-90dcd82d6f3e","tool":"mail_list_messages","connection":"my_mail","arguments":{"limit":25}}'
 ```
 
 工具搜索支持 connection 筛选，连接搜索支持 tool 筛选；两者都支持 query、offset、limit，跟随 next_offset 完整遍历。
@@ -360,9 +361,9 @@ call "$A" gateway_call_tool '{"tool":"mail_list_messages","connection":"my_mail"
 | # | 怎么验 | 预期 |
 |---|---|---|
 | 1 | `approval enroll person_a`，在手机或电脑上打开链接 | 浏览器要求创建 Passkey；同一个链接第二次打开无效 |
-| 2 | `call $A a_notes_add '{"folder":"inbox","text":"hello"}'` | 没有执行；回答里有审批链接 |
+| 2 | 通过 `gateway_call_tool` 调用已配置的写工具，传入新 `idempotency_key` | 没有执行；回答里有审批链接 |
 | 3 | 打开链接，核对页面上的 client、账号、工具、参数，批准 | 要求生物识别或设备密码 |
-| 4 | 调用 `gateway_call_tool`，只传第 2 步的 `request_id` | 网关自动执行一次；返回状态和工具结果 |
+| 4 | 调用 `gateway_call_tool`，只传原操作的 `idempotency_key` | 网关自动执行一次；返回状态和工具结果 |
 | 5 | 发起请求，批准后把参数改一个字再调用 | 不执行，生成新的请求 |
 | 6 | 发起请求，在页面上拒绝；再原样调用 | 回答已被拒绝，不生成新请求（默认 10 分钟内） |
 | 7 | 用 B 的设备打开 A 的请求链接 | 看得到内容，但 B 的 Passkey 批不了 A 账号的请求 |

@@ -22,11 +22,9 @@ const TEXT = {
   title_execution_unknown: ['Execution outcome unknown', '执行结果待核实'],
   hint_running: ['The gateway is executing the approved request.', '网关正在执行已批准的请求。'],
   hint_unknown: ['The operation may have run. Check the upstream before trying again.', '操作可能已执行，请先检查服务端结果。'],
-  hint_previous_version: ['This request belongs to a previous gateway version. Ask the Agent to submit it again.', '此请求来自旧版网关，请让 Agent 重新发起。'],
   title_expired: ['Expired', '已过期'],
   hint_pending: ['Read it carefully. The gateway will run this exact request once after approval.', '请仔细核对。批准后，网关会自动按下面的内容执行一次。'],
   hint_approved: ['The approved request is queued and will run automatically.', '已批准，网关将自动执行。'],
-  hint_used: ['This approval has been used and cannot be used again.', '这次批准已经用掉，不能再次使用。'],
   hint_gone: ['Nothing will be executed for this request.', '这个请求不会被执行。'],
   requested_by: ['Requested by', '请求方'],
   account: ['Account', '账号'],
@@ -171,18 +169,17 @@ function showRequest(request) {
   };
   app.replaceChildren();
   const open = request.status === 'pending' || request.status === 'approved';
-  const status = request.automatic && request.status === 'used'
+  const status = request.status === 'used'
     ? (!request.outcome ? 'running' : request.outcome === 'ok' ? 'succeeded'
       : request.outcome === 'execution_unknown' ? 'execution_unknown' : request.outcome === 'configuration_changed' ? 'cancelled' : 'failed')
     : request.status;
   el(app, 'h1', t('title_' + status));
-  const hint = request.outcome === 'previous_version' ? 'hint_previous_version'
-    : status === 'pending' ? 'hint_pending'
+  const hint = status === 'pending' ? 'hint_pending'
     : status === 'approved' ? 'hint_approved'
     : status === 'running' ? 'hint_running' : status === 'execution_unknown' ? 'hint_unknown'
-    : status === 'used' ? 'hint_used' : ['succeeded', 'failed'].includes(status) ? null : 'hint_gone';
+    : ['succeeded', 'failed'].includes(status) ? null : 'hint_gone';
   if (hint) el(app, 'p', t(hint), 'muted');
-  if (request.automatic && ['approved', 'running'].includes(status)) {
+  if (['approved', 'running'].includes(status)) {
     requestTimer = setTimeout(async () => {
       try { showRequest(await api('request/' + encodeURIComponent(request.id))); }
       catch { /* A temporary network failure can be checked by reloading. */ }
@@ -203,7 +200,6 @@ function showRequest(request) {
     upstream_unavailable: ['The upstream service was unavailable.', '服务端暂不可用。'],
     upstream_rejected: ['The upstream service rejected the request.', '服务端拒绝了请求。'],
     execution_unknown: ['The upstream did not confirm an outcome.', '服务端未确认执行结果。'],
-    previous_version: ['This request predates the current gateway version.', '此请求来自旧版本。'],
     configuration_changed: ['The connection, authorization or tool changed.', '连接、权限或工具已变化。'],
     approver_key_revoked: ['The approving passkey was revoked.', '批准此请求的通行密钥已被撤销。'],
     registration_flow_removed: ['Ask the administrator for a new registration link.', '请向管理员索取新的注册链接。'],

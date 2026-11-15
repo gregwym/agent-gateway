@@ -11,7 +11,7 @@ pytestmark = pytest.mark.anyio
 
 
 async def wait(origin, token, request_id):
-    reply = await rpc(origin, token, 'tools/call', {'name': 'gateway_call_tool', 'arguments': {'request_id': request_id}})
+    reply = await rpc(origin, token, 'tools/call', {'name': 'gateway_call_tool', 'arguments': {'idempotency_key': request_id}})
     return reply.json()['result']['structuredContent']
 
 
@@ -157,7 +157,7 @@ async def test_changing_authority_invalidates_a_grant_even_without_web_revision(
         await enroll(http, origin, 'person_b')
         args = {'folder': 'inbox', 'text': 'authority must still match'}
         call = {'name': 'a_add_note', 'arguments': args}
-        first = (await rpc(origin, TOKEN_A, 'tools/call', call)).json()['result']['structuredContent']['request_id']
+        first = (await rpc(origin, TOKEN_A, 'tools/call', call)).json()['result']['structuredContent']['idempotency_key']
         page = Page(origin, origin)
         assert (await page.decide('approve', first, owner, origin=origin))[0] == 200
         # Simulate a host-side approval authority change without a web revision.
@@ -165,7 +165,7 @@ async def test_changing_authority_invalidates_a_grant_even_without_web_revision(
         monkeypatch.setattr(type(live.cfg), "approvers_of", lambda self, conn: ("person_b",))
         start.set()
         assert (await wait(origin, TOKEN_A, first))['status'] == 'cancelled'
-        second = (await rpc(origin, TOKEN_A, 'tools/call', call)).json()['result']['structuredContent']['request_id']
+        second = (await rpc(origin, TOKEN_A, 'tools/call', call)).json()['result']['structuredContent']['idempotency_key']
         assert second != first
         assert (await page.view(second))[1]['approvers'] == ['person_b']
         notes = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'a_list_notes', 'arguments': {'folder': 'inbox'}})).json()

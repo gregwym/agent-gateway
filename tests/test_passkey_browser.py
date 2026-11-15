@@ -80,7 +80,7 @@ async def test_browser_enrollment_approval_exact_arguments_and_one_use(tmp_path,
         approved = await wait_for_approval(client, request_id)
         assert approved.structured_content["status"] == "succeeded" and approved.content[1].text == "added"
         replay = await client.call_tool("a_add_note", note)
-        assert replay.is_error and replay.structured_content["request_id"] == request_id
+        assert replay.structured_content["status"] == "succeeded" and replay.structured_content["idempotency_key"] == request_id
         assert text_of(await client.call_tool("a_list_notes", {"folder": "family"})).count(note["text"]) == 1
         await page.reload()
         await playwright.expect(page.locator("pre")).to_have_text(

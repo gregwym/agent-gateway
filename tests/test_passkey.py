@@ -40,7 +40,7 @@ async def test_a_call_runs_once_after_its_owner_approves_it(tmp_path):
             assert first.is_error and text_of(first).startswith(NOT_EXECUTED)
             assert "person_a" in text_of(first) and "Do not resubmit" in text_of(first)
             request_id = request_id_in(text_of(first))
-            assert first.structured_content == {"status": "pending", "request_id": request_id,
+            assert first.structured_content == {"status": "pending", "idempotency_key": request_id,
                                                 "approval_url": f"{ORIGIN}/approvals/r/{request_id}"}
             assert (await wait_for_approval(a, request_id, 0)).structured_content["status"] == "pending"
             # Asking again does not create a second request and does not run anything.
@@ -64,7 +64,7 @@ async def test_a_call_runs_once_after_its_owner_approves_it(tmp_path):
             assert result.structured_content["status"] == "succeeded" and result.content[1].text == "added"
             # Retrying an identical action finds the existing request, without submitting another write.
             replay = await a.call_tool("a_add_note", NOTE)
-            assert replay.is_error and replay.structured_content["request_id"] == request_id
+            assert replay.structured_content["status"] == "succeeded" and replay.structured_content["idempotency_key"] == request_id
             assert (await notes(a)).count("buy milk") == 1
 
         status, shown = await page.view(request_id)
@@ -102,7 +102,7 @@ async def test_an_approval_is_only_for_the_exact_arguments_and_the_client_that_a
             # Another client of the same person cannot spend it either.
             other = await a2.call_tool("a_add_note", NOTE)
             assert other.is_error and request_id_in(text_of(other)) != request_id
-            with pytest.raises(MCPError, match="Unknown request ID"):
+            with pytest.raises(MCPError, match="Unknown idempotency_key"):
                 await wait_for_approval(a2, request_id, 0)
             assert (await wait_for_approval(a, request_id)).content[1].text == "added"
             assert (await notes(a)).count("buy milk") == 1 and "wire" not in await notes(a)
@@ -329,7 +329,7 @@ async def test_an_approval_is_spent_even_when_the_upstream_fails(tmp_path):
             # No automatic retry of something that may have happened.
             await gw.connected("notes-a")
             again = await a.call_tool("a_crash", {})
-            assert again.is_error and again.structured_content["request_id"] == request_id
+            assert again.is_error and again.structured_content["idempotency_key"] == request_id
 
 
 async def test_nothing_waits_when_nobody_could_decide_and_requests_are_bounded(tmp_path):

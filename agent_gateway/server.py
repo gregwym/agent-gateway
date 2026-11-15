@@ -215,7 +215,7 @@ class Gateway:
         ]
         return types.ListToolsResult(tools=tools)
 
-    async def call_tool(self, ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult | dict:
+    async def call_tool(self, ctx: Any, params: types.CallToolRequestParams, dispatcher):
         started = time.monotonic()
         who = caller_of(ctx.request, self.cfg.clients)
         if who is None:
@@ -224,12 +224,12 @@ class Gateway:
         route = self.routes.get(name)
         arguments = params.arguments or {}
         background = False
-        from . import discovery, mcp_tasks
-        from .passkey import PasskeyApprover
+        from . import discovery
+        from .request_store import IdempotencyConflict, SubmissionKey
 
-        has_dispatch = isinstance(self.approver, PasskeyApprover)
-        if name in discovery.BY_NAME and (self.cfg.server.tool_discovery == "search"
-                                          or (has_dispatch and name == discovery.CALL_TOOL)):
+        key = None
+        key_value = None
+        if name in discovery.BY_NAME and (self.cfg.server.tool_discovery == "search" or name == discovery.CALL_TOOL):
             def discovery_audit(decision, reason):
                 self.audit.write("tool_call", client=who.client_id, principal=who.principal, tool=name,
                                  remote=ctx.request.client.host if ctx.request.client else None,
@@ -249,6 +249,11 @@ class Gateway:
                     return _error("Discovery result is too large. Narrow the query or use a smaller limit.")
                 discovery_audit("allow", "discovery")
                 return types.CallToolResult(content=[types.TextContent(type="text", text=payload)])
+            key_value = arguments["idempotency_key"]
+            key = SubmissionKey.from_call(arguments)
+            background = arguments.get("background", False)
+            if existing := dispatcher.existing_key(ctx.request, key):
+                return dispatcher.submission(ctx, existing, key_value, background=background)
             choices = discovery.candidates(self, who, arguments)
             if not choices:
                 discovery_audit("deny", "unknown_tool")
@@ -265,7 +270,6 @@ class Gateway:
                     discovery_audit("deny", "ambiguous_variant")
                     return _error("This connection has multiple permitted parameter variants. Select a variant from gateway_search_connections.")
                 choices = valid
-            background = arguments.get("background", False)
             route, arguments = choices[0], arguments["arguments"]
             name = route.tool.name
         peer = ctx.request.client
@@ -296,9 +300,10 @@ class Gateway:
             raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
 
         try:
-            native_tasks = has_dispatch and mcp_tasks.enabled(ctx)
-            return await self._call(who, route, effect, arguments, done, background=background,
-                                    native_task=native_tasks and (effect != "approval_required" or mcp_tasks.url_enabled(ctx)))
+            return await self._call(ctx, dispatcher, who, route, effect, arguments, done,
+                                    background=background, key=key, key_value=key_value)
+        except IdempotencyConflict:
+            raise MCPError(types.INVALID_PARAMS, "This idempotency_key is already bound to another operation.") from None
         except MCPError:
             raise
         except Exception as exc:  # never let an internal error message reach an agent
@@ -357,50 +362,42 @@ class Gateway:
             }),
         )
 
-    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any, *, background=False, native_task=False) -> types.CallToolResult | dict:
+    async def _call(self, ctx, dispatcher, who, route, effect, arguments, done, *, background=False, key=None, key_value=None):
         prepared = self._prepare_call(who.client_id, route, arguments, done)
         if isinstance(prepared, types.CallToolResult):
             return prepared
         final_arguments, upstream_arguments = prepared
-        if effect != "approval_required" and not background:
+        if effect != "approval_required" and key is None:
             return await self._run(route, upstream_arguments, done, "ok")
 
-        from .approval_dispatch import response
-        from .mcp_tasks import created
-        from .passkey import PasskeyApprover, Refused
+        from .passkey import PasskeyApprover
+        from .request_store import QueueFull
+
         client = next(c for c in self.cfg.clients if c.id == who.client_id)
         if effect != "approval_required":
-            if not isinstance(self.approver, PasskeyApprover):
-                done("deny", "background_unavailable")
-                return _error("Background calls are unavailable on this Gateway.")
             request = self._approval_request(client, route, final_arguments, requires_approval=False)
             try:
-                job = self.approver.enqueue(request)
-            except Refused:
+                job = dispatcher.store.enqueue(request, key)
+            except QueueFull:
                 done("deny", "too_many_queued")
-                return _error("Too many background requests. Watch the existing requests before starting more.")
-            done("queued", "background", request_id=job)
-            if native_task and (task := created(self.approver, job)) is not None:
-                return task
-            return response({"status": "queued", "request_id": job},
-                            f"Request queued. Call gateway_call_tool with only request_id {job}. Do not resubmit the action.")
+                return _error("Too many queued operations. Check existing keys before starting more.")
+            dispatcher.notify()
+            done("queued", "submission", request_id=job)
+            return dispatcher.submission(ctx, job, key_value, background=background)
 
         request = self._approval_request(client, route, final_arguments)
-        decision = await self.approver.authorize(request)
+        if isinstance(self.approver, PasskeyApprover):
+            decision = await self.approver.authorize(request, key=key)
+        elif key is not None:
+            done("deny", "approval:unavailable")
+            return _error(NOT_EXECUTED)
+        else:
+            decision = await self.approver.authorize(request)
         approval = decision.approval_id
         if not decision.approved:
             done("deny", f"approval:{decision.reason}", approval=approval)
-            # The approver's own wording (where the request waits); it is gateway code, not upstream text.
-            if approval:
-                if isinstance(self.approver, PasskeyApprover):
-                    if native_task and (task := created(self.approver, approval)) is not None:
-                        return task
-                    status = "pending" if decision.reason in ("pending", "requested") else decision.reason
-                    data = {"status": status, "request_id": approval}
-                    if status == "pending":
-                        data["approval_url"] = self.approver._url(approval)
-                    message = decision.message or f"Action already submitted. Call gateway_call_tool with only request_id {approval}. Do not resubmit the action."
-                    return response(data, message, error=True)
+            if approval and isinstance(self.approver, PasskeyApprover):
+                return dispatcher.submission(ctx, approval, key_value or approval, message=decision.message)
             return _error(decision.message or NOT_EXECUTED)
         # From here the approval is spent, whatever happens. Tell the approver how it ended.
         outcome = "internal_error"
@@ -516,24 +513,31 @@ def build_app(gateway: Gateway) -> Starlette:
     gateway = runtime.gateway
     cfg = gateway.cfg
     from . import discovery, mcp_tasks
-    from .approval_dispatch import ApprovalDispatcher, WATCH_TOOL
+    from .approval_dispatch import ApprovalDispatcher, SUBMIT_FIELDS, WaitForResult
     from .passkey import PasskeyApprover
-    dispatcher = ApprovalDispatcher(runtime) if isinstance(gateway.approver, PasskeyApprover) else None
+    from .request_store import RequestStore
+
+    passkeys = isinstance(gateway.approver, PasskeyApprover)
+    store = gateway.approver if passkeys else RequestStore(
+        cfg.audit.path.with_suffix(".requests.sqlite"), gateway.audit, cfg.audit.retention_days)
+    dispatcher = ApprovalDispatcher(runtime, store)
 
     async def list_tools(ctx, params):
         async with runtime.lease() as current:
             result = await current.list_tools(ctx, params)
-            if dispatcher and current.cfg.server.tool_discovery == "all":
+            if passkeys and current.cfg.server.tool_discovery == "all":
                 return types.ListToolsResult(tools=[*result.tools, discovery.BY_NAME[discovery.CALL_TOOL]])
             return result
 
     async def call_tool(ctx, params):
-        if dispatcher and (params.name == WATCH_TOOL or
-                           (params.name == discovery.CALL_TOOL and "request_id" in (params.arguments or {}))):
-            # Watching a request must not hold the runtime lease or block permission changes.
-            return await dispatcher.watch(ctx.request, params.arguments or {})
+        args = params.arguments or {}
+        if params.name == discovery.CALL_TOOL and not SUBMIT_FIELDS.intersection(args):
+            return await dispatcher.watch(ctx.request, args)
         async with runtime.lease() as current:
-            return await current.call_tool(ctx, params)
+            result = await current.call_tool(ctx, params, dispatcher)
+        if isinstance(result, WaitForResult):
+            return await dispatcher.watch(ctx.request, {"idempotency_key": result.key}, raw=True)
+        return result
     server: Server[Any] = Server(
         "agent-gateway",
         version=__version__,
@@ -542,8 +546,7 @@ def build_app(gateway: Gateway) -> Starlette:
         # Called before the caller is known, so it must not reveal anything: no schema, no validation.
         get_tool_input_schema=lambda name: None,
     )
-    if dispatcher:
-        mcp_tasks.register(server, dispatcher)
+    mcp_tasks.register(server, dispatcher)
     server.middleware.clear()  # the SDK's default is a telemetry hook; the gateway emits none
 
     hosts = list(cfg.server.allowed_hosts)
@@ -579,8 +582,7 @@ def build_app(gateway: Gateway) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with manager.run(), runtime.run():
-            if dispatcher:
-                runtime.tasks.start_soon(dispatcher.run)
+            runtime.tasks.start_soon(dispatcher.run)
             if admin:
                 runtime.tasks.start_soon(admin.sweep)
             yield
@@ -590,7 +592,7 @@ def build_app(gateway: Gateway) -> Starlette:
 
     # The approval page, if there is one. It is reached by people, not by agents: it takes no
     # bearer token, and nothing on it changes anything without a passkey.
-    approval_routes = gateway.approver.http_routes(dispatcher.notify) if dispatcher else []
+    approval_routes = gateway.approver.http_routes(dispatcher.notify) if passkeys else []
 
     app = Starlette(
         routes=[

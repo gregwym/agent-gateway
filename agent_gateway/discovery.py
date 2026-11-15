@@ -7,7 +7,7 @@ import re
 import mcp_types as types
 
 from .admin_config import kind_of, mailbox_metadata
-from .approval_dispatch import WATCH_PROPERTIES
+from .approval_dispatch import KEY_PROPERTY, WAIT_PROPERTY
 
 SEARCH_TOOLS = "gateway_search_tools"
 SEARCH_CONNECTIONS = "gateway_search_connections"
@@ -32,23 +32,22 @@ TOOLS = [
                input_schema=schema({**PAGING, "tool": text("Optional shared tool name from gateway_search_tools.", 128)}), annotations=types.ToolAnnotations(read_only_hint=True)),
     types.Tool(
         name=CALL_TOOL,
-        description="Execute a permitted tool: pass tool, connection and arguments, and a variant if needed. "
-                    "Set background=true to queue a call. If the result contains an approval_url, share it with "
-                    "the approver. The gateway runs the action automatically after Passkey approval. "
-                    "If a request_id is returned, call this same tool with only request_id and optional wait_seconds "
-                    "to get the status and result. Do not resubmit the action.",
+        description="Execute a permitted tool: generate a new idempotency_key for each intended operation and pass "
+                    "tool, connection and arguments. Reuse the same key if a response is lost. "
+                    "Set background=true to return immediately. Share any approval_url with the approver; "
+                    "the Gateway runs the action after Passkey approval. To get status and results, call this "
+                    "same tool with only the original idempotency_key and optional wait_seconds.",
         input_schema={
             **schema({"tool": text("Shared tool name from gateway_search_tools.", 128),
                       "connection": text("Connection ID from gateway_search_connections.", 48),
                       "arguments": {"type": "object", "description": "Parameters for the selected tool and connection."},
                       "background": {"type": "boolean", "default": False, "description": "Queue the call. Approval requirements still apply."},
                       "variant": text("Optional variant ID from gateway_search_connections.", 64),
-                      **WATCH_PROPERTIES}),
+                      "idempotency_key": KEY_PROPERTY,
+                      "wait_seconds": WAIT_PROPERTY}, ("idempotency_key",)),
             "oneOf": [
-                {"required": ["tool", "connection", "arguments"],
-                 "not": {"anyOf": [{"required": [key]} for key in WATCH_PROPERTIES]}},
-                {"required": ["request_id"],
-                 "not": {"anyOf": [{"required": [key]} for key in ("tool", "connection", "arguments", "background", "variant")]}},
+                {"required": ["tool", "connection", "arguments"], "not": {"required": ["wait_seconds"]}},
+                {"not": {"anyOf": [{"required": [key]} for key in ("tool", "connection", "arguments", "background", "variant")]}},
             ],
         },
         annotations=types.ToolAnnotations(read_only_hint=False),

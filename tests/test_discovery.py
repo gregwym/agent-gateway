@@ -1,5 +1,6 @@
 """Fixed discovery entry points, actual MCP clients, isolated account processes."""
 import json
+import uuid
 
 import pytest
 from mcp import MCPError
@@ -20,6 +21,7 @@ async def search(client, name, **args):
 
 
 async def execute(client, tool, connection, arguments, **extra):
+    extra.setdefault("idempotency_key", uuid.uuid4().hex)
     return await client.call_tool('gateway_call_tool', dict(tool=tool, connection=connection, arguments=arguments, **extra))
 
 
@@ -163,16 +165,16 @@ async def test_discovery_updates_without_reloading_and_approvals_bind_connection
             assert len(found['tools']) == 1 and found['tools'][0]['connection_count'] == 2
             assert all(c['variants'][0]['approval_required'] for c in (await search(client, 'connections', tool='notes_add_note'))['connections'])
             args = {'folder': 'inbox', 'text': 'one exact approved operation'}
-            request = await execute(client, 'notes_add_note', 'notes-a', args)
+            request = await execute(client, 'notes_add_note', 'notes-a', args, idempotency_key='approved-note')
             first = request_id_in(text_of(request))
             assert (await Page(origin, origin).decide('approve', first, key, origin=origin))[0] == 200
             other = await execute(client, 'notes_add_note', 'notes-house', args)
             assert other.is_error and request_id_in(text_of(other)) != first
             changed = await execute(client, 'notes_add_note', 'notes-a', {**args, 'text': 'different content'})
             assert changed.is_error and request_id_in(text_of(changed)) != first
-            result = await wait_for_approval(client, first)
+            result = await wait_for_approval(client, 'approved-note')
             assert result.structured_content['status'] == 'succeeded' and result.content[1].text == 'added'
-            assert (await execute(client, 'notes_add_note', 'notes-a', args)).is_error
+            assert (await execute(client, 'notes_add_note', 'notes-a', args, idempotency_key='approved-note')).structured_content['status'] == 'succeeded'
             for conn in ['notes-a', 'notes-house']:
                 assert (await change(http, 'permissions/connection', client='discovery-agent', connection=conn, access='none')).status_code == 200
             assert (await search(client, 'tools'))['total'] == 0
@@ -195,7 +197,7 @@ async def test_watch_works_for_direct_calls_and_keeps_them_private(tmp_path, mon
             reply = await execute(client, 'notes_list_notes', 'notes-a', {'folder': 'inbox'}, background=True)
             info = reply.structured_content
             assert not reply.is_error and info['status'] == 'queued' and 'approval_url' not in info
-            request_id = info['request_id']
+            request_id = info['idempotency_key']
             assert (await wait_for_approval(client, request_id, 0)).structured_content['status'] == 'queued'
             assert (await Page(origin, origin).view(request_id))[0] == 404
             with pytest.raises(MCPError):
@@ -228,6 +230,6 @@ async def test_background_call_is_cancelled_if_grant_changes_before_dispatch(tmp
             removed = await change(http, 'permissions/connection', client='agent-a', connection='notes-a', access='none')
             assert removed.status_code == 200, removed.text
             resume.set()
-            finished = await wait_for_approval(client, queued.structured_content['request_id'])
+            finished = await wait_for_approval(client, queued.structured_content['idempotency_key'])
             assert finished.structured_content['status'] == 'cancelled'
             assert len(finished.content) == 1

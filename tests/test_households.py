@@ -85,7 +85,7 @@ async def test_agents_in_one_household_never_inherit_each_others_grants(tmp_path
         assert view['client'] == 'one' and view['owner'] == 'person_a' and view['approvers'] == ['person_a']
         assert (await page.decide('approve', request_id, key, origin=origin))[0] == 200
         result = (await rpc(origin, tokens['one'], 'tools/call', {'name': 'gateway_call_tool',
-                                                               'arguments': {'request_id': request_id}})).json()
+                                                               'arguments': {'idempotency_key': request_id}})).json()
         assert result['result']['structuredContent']['status'] == 'succeeded'
         assert (await change(http, 'clients/revoke', id='one')).status_code == 200
         assert (await rpc(origin, tokens['one'])).status_code == 401

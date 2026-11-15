@@ -127,7 +127,7 @@ p=Path('/state/write-probe'); p.write_text('test'); p.unlink()
                 variants = restricted['connections'][0]['variants']
                 assert len(variants) == 1 and variants[0]['id'] == 'a_family_notes'
                 assert 'folder' not in variants[0]['inputSchema']['properties']
-                assert (await other.call_tool('gateway_call_tool', {'tool': 'notes_list_notes', 'connection': 'notes-a', 'arguments': {'folder': 'inbox'}})).is_error
+                assert (await other.call_tool('gateway_call_tool', {'idempotency_key': 'list-notes', 'tool': 'notes_list_notes', 'connection': 'notes-a', 'arguments': {'folder': 'inbox'}})).is_error
             with pytest.raises(MCPError):
                 await b.call_tool("a_notes_list", {})
             assert not (await a.call_tool("a_notes_list", {"folder": "inbox"})).is_error
@@ -159,7 +159,7 @@ p=Path('/state/write-probe'); p.write_text('test'); p.unlink()
             recovered = await wait_for_approval(a, request_id)
             assert recovered.structured_content["status"] == "succeeded"
             assert "no longer available" in text_of(recovered)
-            assert (await a.call_tool("a_notes_add", note)).structured_content["request_id"] == request_id
+            assert (await a.call_tool("a_notes_add", note)).structured_content["idempotency_key"] == request_id
             assert note["text"] not in text_of(await a.call_tool("a_notes_list", {"folder": "inbox"}))
             kill = """
 import os, signal
@@ -226,7 +226,7 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
             assert token not in saved.text
         async with agent(base + '/mcp', token, Host='localhost') as client:
             assert 'notes_list_notes' in text_of(await client.call_tool('gateway_search_tools', {}))
-            result = await client.call_tool('gateway_call_tool', {'tool': 'notes_list_notes', 'connection': 'web-notes', 'arguments': {'folder':'inbox'}})
+            result = await client.call_tool('gateway_call_tool', {'idempotency_key': 'list-web-notes', 'tool': 'notes_list_notes', 'connection': 'web-notes', 'arguments': {'folder':'inbox'}})
             assert not result.is_error and 'person_a' in text_of(result)
         check = "from pathlib import Path; assert not Path('/state/admin-setup-link').exists(); assert Path('/state/admin.enc').stat().st_mode & 0o777 == 0o600"
         docker('exec', name, 'python', '-c', check)

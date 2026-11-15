@@ -10,9 +10,8 @@ How one call goes:
      (user verification required) over a challenge derived from that request
      and that decision, so the signature is about this request and nothing
      else. There is no login session to reuse.
-  3. The agent calls the tool again with the same arguments. `authorize` finds
-     the approval, marks it *used* in the same transaction, and the call runs.
-     A second call finds nothing and starts over at step 1.
+  3. The dispatcher atomically claims the approved request and executes it.
+     The Agent tracks the saved request without resubmitting the operation.
 
 What a decision is bound to: the client and principal that asked, the
 connection, account and upstream tool, and the SHA-256 of the exact arguments
@@ -35,8 +34,6 @@ import json
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -56,30 +53,13 @@ from starlette.routing import BaseRoute, Route
 from .approval import NOT_EXECUTED, ApprovalDecision, ApprovalRequest, canonical
 from .audit import Audit
 from .config import ApprovalsCfg
+from .request_store import RequestStore
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS credentials (
     id BLOB PRIMARY KEY, principal TEXT NOT NULL, data BLOB NOT NULL, counter INTEGER NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS enrollments (
     code_sha256 TEXT PRIMARY KEY, principal TEXT NOT NULL, expires INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS requests (
-    id TEXT PRIMARY KEY, binding TEXT NOT NULL, status TEXT NOT NULL,
-    client TEXT NOT NULL, principal TEXT NOT NULL, tool TEXT NOT NULL, connection TEXT NOT NULL,
-    service TEXT NOT NULL, account TEXT NOT NULL, owner TEXT NOT NULL, upstream_tool TEXT NOT NULL,
-    approvers TEXT NOT NULL, arguments TEXT,
-    created INTEGER NOT NULL, expires INTEGER NOT NULL,
-    decided INTEGER, decided_by TEXT, credential TEXT, used INTEGER, outcome TEXT);
-CREATE INDEX IF NOT EXISTS requests_binding ON requests (binding, created);
-CREATE INDEX IF NOT EXISTS requests_queued ON requests (status, expires) WHERE status IN ('approved','queued');
-CREATE TABLE IF NOT EXISTS dispatch (
-    id TEXT PRIMARY KEY, revision TEXT NOT NULL, client_token_sha256 TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS task_state (
-    id TEXT PRIMARY KEY, link_accepted INTEGER, finished INTEGER);
--- Legacy registration data. Kept so upgrade/rollback can read the same store.
-CREATE TABLE IF NOT EXISTS enrollment_requests (
-    code_sha256 TEXT PRIMARY KEY, client TEXT NOT NULL, client_token_sha256 TEXT NOT NULL, administrator TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS pending_credentials (
-    request_id TEXT PRIMARY KEY, id BLOB NOT NULL UNIQUE, data BLOB NOT NULL, counter INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS ceremonies (
     id TEXT PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, binding TEXT NOT NULL,
     state TEXT NOT NULL, expires INTEGER NOT NULL);
@@ -127,59 +107,25 @@ def _now() -> int:
     return int(time.time())
 
 
-class PasskeyApprover:
+class PasskeyApprover(RequestStore):
     def __init__(self, cfg: ApprovalsCfg, audit: Audit, retention_days: int = 90) -> None:
         self.cfg = cfg
-        self.audit = audit
-        self._retention = retention_days * 86_400
+        super().__init__(cfg.store, audit, retention_days, cfg.request_ttl_seconds, extra_schema=_SCHEMA)
         self._server = Fido2Server(
             {"id": cfg.rp_id, "name": "Agent Gateway"}, verify_origin=lambda origin: origin == cfg.origin
         )
         self._server.timeout = _CEREMONY_TTL * 1000
-        cfg.store.parent.mkdir(parents=True, exist_ok=True)
-        setup = sqlite3.connect(cfg.store, timeout=10)
-        try:
-            setup.executescript(_SCHEMA)
-        finally:
-            setup.close()
-        # Agent-issued links must not turn into administrator-issued links on upgrade.
-        with self._db() as db:
-            if (db.execute("SELECT 1 FROM enrollment_requests LIMIT 1").fetchone()
-                    or db.execute("SELECT 1 FROM pending_credentials LIMIT 1").fetchone()):
-                db.execute("DELETE FROM enrollments WHERE code_sha256 IN (SELECT code_sha256 FROM enrollment_requests)")
-                db.execute("DELETE FROM enrollment_requests")
-                db.execute("DELETE FROM pending_credentials")
-            db.execute("UPDATE requests SET status='cancelled', outcome='registration_flow_removed', arguments=NULL"
-                       " WHERE status IN ('pending','approved') AND tool='gateway_approve_passkey'"
-                       " AND service='passkey' AND connection='passkeys' AND upstream_tool='register'")
 
     # -- storage ----------------------------------------------------------------
 
-    @contextmanager
-    def _db(self, *, write=True) -> Iterator[sqlite3.Connection]:
-        """One short transaction. IMMEDIATE, so check-then-update sequences cannot interleave."""
-        db = sqlite3.connect(self.cfg.store, timeout=10, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield db
-            db.execute("COMMIT")
-        except BaseException:
-            db.execute("ROLLBACK")
-            raise
-        finally:
-            db.close()
+    @staticmethod
+    def _clock():
+        return _now()
 
-    def _sweep(self, db: sqlite3.Connection, now: int) -> None:
-        db.execute(
-            "UPDATE requests SET status='expired', arguments=NULL WHERE status IN ('pending','approved','queued') AND expires<=?",
-            (now,),
-        )
-        db.execute("DELETE FROM requests WHERE status NOT IN ('pending','approved','queued') AND created<?", (now - self._retention,))
+    def _sweep(self, db, now):
+        super()._sweep(db, now)
         db.execute("DELETE FROM ceremonies WHERE expires<=?", (now,))
         db.execute("DELETE FROM enrollments WHERE expires<=?", (now,))
-        db.execute("DELETE FROM dispatch WHERE id NOT IN (SELECT id FROM requests)")
-        db.execute("DELETE FROM task_state WHERE id NOT IN (SELECT id FROM dispatch)")
 
     def _url(self, request_id: str) -> str:
         return f"{self.cfg.origin}/approvals/r/{request_id}"
@@ -192,13 +138,16 @@ class PasskeyApprover:
 
     # -- the Approver interface ---------------------------------------------------
 
-    async def authorize(self, request: ApprovalRequest) -> ApprovalDecision:
+    async def authorize(self, request: ApprovalRequest, key=None) -> ApprovalDecision:
         now = _now()
         with self._db() as db:
             self._sweep(db, now)
-            row = db.execute(
-                "SELECT * FROM requests WHERE binding=? ORDER BY created DESC, rowid DESC LIMIT 1", (request.binding,)
-            ).fetchone()
+            if key and (existing := self._matching_key(db, request.client_id, request.client_token_sha256, key)):
+                return ApprovalDecision(False, "submitted", approval_id=existing)
+            row = None if key else db.execute(
+                "SELECT r.* FROM requests r JOIN request_keys k ON r.id=k.request_id"
+                " WHERE r.binding=? AND k.input_hash='' ORDER BY r.created DESC, r.rowid DESC LIMIT 1",
+                (request.binding,)).fetchone()
             # Host-file edits do not have a web revision. Re-check the current
             # approval authority before reusing either a pending request or grant.
             if row is not None and set(json.loads(row["approvers"])) != set(request.approvers):
@@ -227,7 +176,7 @@ class PasskeyApprover:
             request_id = secrets.token_urlsafe(24)
             approvers = json.dumps(sorted(request.approvers))
             expires = now + self.cfg.request_ttl_seconds
-            self._insert_request(db, request_id, request, now, expires)
+            self._insert_request(db, request_id, request, now, expires, key=key)
         self.audit.write(
             "approval_requested", approval=request_id, client=request.client_id, principal=request.principal,
             tool=request.tool, connection=request.connection, service=request.service, account=request.account,
@@ -235,92 +184,8 @@ class PasskeyApprover:
         )  # fmt: skip
         return ApprovalDecision(False, "requested", self._waiting(request_id, approvers, expires, now), request_id)
 
-    def enqueue(self, request: ApprovalRequest) -> str:
-        """Schedule a permitted background call without creating a public approval."""
-        now = _now()
-        with self._db() as db:
-            self._sweep(db, now)
-            if db.execute("SELECT count(*) FROM requests WHERE client=? AND status='queued'", (request.client_id,)).fetchone()[0] >= _MAX_PENDING_PER_CLIENT:
-                raise Refused("rate_limited", 429)
-            request_id = secrets.token_urlsafe(24)
-            self._insert_request(db, request_id, request, now, now + self.cfg.request_ttl_seconds, status="queued")
-        return request_id
-
-    @staticmethod
-    def _insert_request(db, request_id, request, now, expires, *, status="pending"):
-        db.execute(
-            "INSERT INTO requests (id, binding, status, client, principal, tool, connection, service, account, owner,"
-            " upstream_tool, approvers, arguments, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (request_id, request.binding, status, request.client_id, request.principal, request.tool,
-             request.connection, request.service, request.account, request.owner, request.upstream_tool,
-             json.dumps(sorted(request.approvers)), canonical(request.arguments).decode("utf-8"), now, expires),
-        )
-        db.execute("INSERT INTO dispatch VALUES (?,?,?)",
-                   (request_id, request.configuration_revision, request.client_token_sha256))
-
-    def dispatch_queue(self, limit):
-        with self._db(write=False) as db:
-            return [r["id"] for r in db.execute(
-                "SELECT r.id FROM requests r JOIN dispatch d ON r.id=d.id WHERE r.status IN ('approved','queued') AND r.expires>? ORDER BY coalesce(r.decided, r.created), r.rowid LIMIT ?", (_now(), limit))]
-
-    def recover_dispatch(self):
-        # A process that disappeared after claiming an operation may already have
-        # changed the upstream. Never replay an execution whose outcome is unknown.
-        with self._db() as db:
-            db.execute("UPDATE requests SET outcome='execution_unknown' WHERE status='used' AND outcome IS NULL AND id IN (SELECT id FROM dispatch)")
-
-    def claim_dispatch(self, request_id):
-        now = _now()
-        with self._db() as db:
-            row = self._dispatch_row(db, request_id)
-            if not row or row["status"] not in ("approved", "queued") or row["expires"] <= now:
-                return None
-            if row["status"] == "approved" and not any(bytes(key["id"]).hex() == row["credential"] for key in self._credentials(db, [row["decided_by"]])):
-                db.execute("UPDATE requests SET status='cancelled', outcome='approver_key_revoked', arguments=NULL WHERE id=?", (request_id,))
-                return None
-            db.execute("UPDATE requests SET status='used', used=?, arguments=NULL WHERE id=?", (now, request_id))
-            return dict(row)
-
-    @staticmethod
-    def _dispatch_row(db, request_id):
-        return db.execute("SELECT r.*, d.revision, d.client_token_sha256 FROM requests r JOIN dispatch d ON r.id=d.id WHERE r.id=?", (request_id,)).fetchone()
-
-    def dispatch_status(self, request_id):
-        with self._db(write=False) as db:
-            row = db.execute(
-                "SELECT r.status, r.client, r.outcome, r.created, r.expires, r.decided, r.used,"
-                " d.revision, d.client_token_sha256, t.link_accepted, t.finished"
-                " FROM requests r JOIN dispatch d ON r.id=d.id LEFT JOIN task_state t ON r.id=t.id WHERE r.id=?",
-                (request_id,)).fetchone()
-            if not row:
-                return None
-            row = dict(row)
-            if row["status"] in (*_OPEN, "queued") and row["expires"] <= _now():
-                row["status"] = "expired"
-            return row
-
-    @property
-    def task_retention_ms(self):
-        return self._retention * 1000
-
-    def task_control(self, request_id, action, *, reply=False):
-        now = _now()
-        with self._db() as db:
-            row = self._dispatch_row(db, request_id)
-            if not row or row["expires"] <= now:
-                return
-            if reply and (row["status"] != "pending" or db.execute(
-                    "SELECT 1 FROM task_state WHERE id=? AND link_accepted IS NOT NULL", (request_id,)).fetchone()):
-                return
-            if action == "accept":
-                db.execute("INSERT INTO task_state (id, link_accepted) VALUES (?,?)"
-                           " ON CONFLICT(id) DO UPDATE SET link_accepted=excluded.link_accepted", (request_id, now))
-                return
-            if row["status"] not in ("pending", "approved", "queued"):
-                return
-            db.execute("UPDATE requests SET status='cancelled', decided=?, arguments=NULL WHERE id=?",
-                       (now, request_id))
-        self.audit.write("approval_cancelled", approval=request_id, client=row["client"], reason="client_cancelled")
+    def _approved_key_is_active(self, db, row):
+        return any(bytes(key["id"]).hex() == row["credential"] for key in self._credentials(db, [row["decided_by"]]))
 
     def _waiting(self, request_id: str, approvers: str, expires: int, now: int) -> str:
         people = " or ".join(self.identity_label(p) for p in json.loads(approvers))
@@ -328,16 +193,8 @@ class PasskeyApprover:
         return (
             f"{NOT_EXECUTED} It is waiting at {self._url(request_id)} . Ask {people} to open that page and approve it "
             f"with their passkey within {minutes} minutes. The gateway executes the approved action automatically. "
-            f"Call gateway_call_tool with only request_id {request_id} for its status and result. Do not resubmit the action."
+            "Do not resubmit the action with a new key."
         )
-
-    async def finished(self, approval_id: str, outcome: str) -> None:
-        with self._db() as db:
-            updated = db.execute("UPDATE requests SET outcome=? WHERE id=? AND status='used' AND outcome IS NULL",
-                                 (outcome[:64], approval_id))
-            if updated.rowcount:
-                db.execute("INSERT INTO task_state (id, finished) VALUES (?,?)"
-                           " ON CONFLICT(id) DO UPDATE SET finished=excluded.finished", (approval_id, _now()))
 
     # -- administration (the `agw approval` commands) -------------------------------
 
@@ -387,14 +244,12 @@ class PasskeyApprover:
     def view(self, request_id: str) -> dict[str, Any]:
         with self._db() as db:
             self._sweep(db, _now())
-            row = db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+            row = self._dispatch_row(db, request_id)
         if row is None or row["approvers"] == "[]":
             # Background calls without an approval are private to the Agent.
             raise Refused("not_found", 404)
-        shown = {key: row[key] for key in row.keys() if key not in ("binding", "credential", "arguments", "approvers")}
-        shown["automatic"] = self.dispatch_status(request_id) is not None
-        if not shown["automatic"] and row["status"] in _OPEN:
-            shown.update(status="cancelled", outcome="previous_version")
+        private = {"binding", "credential", "arguments", "approvers", "revision", "client_token_sha256"}
+        shown = {key: row[key] for key in row.keys() if key not in private}
         shown["approvers"] = json.loads(row["approvers"])
         shown["arguments"] = json.loads(row["arguments"]) if shown["status"] in _OPEN and row["arguments"] is not None else None
         people = {row["principal"], row["owner"], *shown["approvers"]}
