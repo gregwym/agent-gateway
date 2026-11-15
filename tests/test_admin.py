@@ -157,7 +157,7 @@ async def test_live_tokens_permissions_and_restart_persistence(tmp_path):
         assert reply.status_code == 200, reply.text
         token = reply.json()['token']
         visible = (await rpc(origin, token)).json()['result']['tools']
-        assert {t["name"] for t in visible} == {"gateway_wait_for_approval", "gateway_request_passkey"}
+        assert {t["name"] for t in visible} == {"gateway_watch"}
         assert token not in json.dumps(await state(http)) and token not in gw.audit_text()
         assert token.encode() not in (tmp_path / 'admin.enc').read_bytes()
         invalid = await change(http, 'permissions/save', principal='person_b', connection='notes-a', tool='a_list_notes', effect='allow')

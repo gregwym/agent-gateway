@@ -102,7 +102,7 @@ async def test_an_approval_is_only_for_the_exact_arguments_and_the_client_that_a
             # Another client of the same person cannot spend it either.
             other = await a2.call_tool("a_add_note", NOTE)
             assert other.is_error and request_id_in(text_of(other)) != request_id
-            with pytest.raises(MCPError, match="Unknown approval request"):
+            with pytest.raises(MCPError, match="Unknown request ID"):
                 await wait_for_approval(a2, request_id, 0)
             assert (await wait_for_approval(a, request_id)).content[1].text == "added"
             assert (await notes(a)).count("buy milk") == 1 and "wire" not in await notes(a)

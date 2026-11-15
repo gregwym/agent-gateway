@@ -120,7 +120,7 @@ p=Path('/state/write-probe'); p.write_text('test'); p.unlink()
             assert (await http.post(f"{base}/mcp", json={})).status_code == 401
         url = f"{base}/mcp"
         async with agent(url, TOKEN_A) as a, agent(url, TOKEN_B) as b, agent(url, TOKEN_HOUSE) as shared:
-            assert await tool_names(a) == await tool_names(b) == await tool_names(shared) == {'gateway_search_tools', 'gateway_search_connections', 'gateway_call_tool', 'gateway_wait_for_approval'}
+            assert await tool_names(a) == await tool_names(b) == await tool_names(shared) == {'gateway_search_tools', 'gateway_search_connections', 'gateway_call_tool', 'gateway_watch'}
             assert 'notes_list_notes' in text_of(await a.call_tool('gateway_search_tools', {}))
             for other in (b, shared):
                 restricted = json.loads(text_of(await other.call_tool('gateway_search_connections', {'tool': 'notes_list_notes', 'query': 'notes-a'})))
@@ -207,7 +207,7 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
             applied = await admin_post(http, 'connections/apply', json={'revision':1,'draft':preview.json()['draft'],'reviewed':True})
             assert applied.status_code == 200, applied.text
             async with agent(base + '/mcp', token, Host='localhost') as client:
-                assert await tool_names(client) == {"gateway_search_tools", "gateway_search_connections", "gateway_call_tool", "gateway_wait_for_approval", "gateway_request_passkey"}
+                assert await tool_names(client) == {"gateway_search_tools", "gateway_search_connections", "gateway_call_tool", "gateway_watch"}
                 assert json.loads(text_of(await client.call_tool('gateway_search_tools', {})))['total'] == 0
             granted = await admin_post(http, 'permissions/save', json={'revision':2,'client':'web-agent',
                 'connection':'web-notes','tool':'web_notes_list','effect':'allow'})

@@ -342,7 +342,7 @@ function modal(title) {
 }
 function secretResult(title, value, isLink = false, fingerprint = '') {
   const box = modal(title);
-  el(box, 'p', isLink ? tr('This private link expires in 15 minutes and works once.', '此私密链接 15 分钟后过期，只能使用一次。')
+  el(box, 'p', isLink ? tr('Share this link privately. It expires in 15 minutes and works once.', '请私下转发此链接。链接 15 分钟后过期，只能使用一次。')
     : tr('Shown only now. Save it for this agent before closing.', '仅在此时显示。关闭前请保存到这个 Agent 的配置中。'), 'muted');
   const input = field(box, isLink ? tr('Registration link', '注册链接') : tr('Agent token', 'Agent Token'), 'secret', value, 'text'); input.readOnly = true; input.className = 'token';
   input.addEventListener('click', () => input.select());
@@ -358,8 +358,7 @@ function secretResult(title, value, isLink = false, fingerprint = '') {
     }
     notify(tr('Copied', '已复制') + (fingerprint ? ' · ' + fingerprint : ''));
   });
-  if (isLink) { const link = el(actions, 'a', tr('Open registration', '打开注册页面'), 'button primary'); link.href = value; link.target = '_blank'; link.rel = 'noopener noreferrer'; }
-  else { el(box, 'p', tr('Streamable HTTP endpoint', 'Streamable HTTP 地址'), 'muted'); el(box, 'code', state.mcp_url, 'url');
+  if (!isLink) { el(box, 'p', tr('Streamable HTTP endpoint', 'Streamable HTTP 地址'), 'muted'); el(box, 'code', state.mcp_url, 'url');
     el(box, 'p', tr('Use the token as the Authorization: Bearer header. Each agent gets its own token.', '通过 Authorization: Bearer 请求头发送 Token。每个 Agent 使用独立 Token。'), 'muted'); }
 }
 async function confirmAction(title, explanation, action) {
@@ -496,6 +495,11 @@ function overview() {
     tr('Run its read-only connection check.', '运行只读连接验证。'), tr('Grant specific tools to your agent.', '为 Agent 授予所需工具的权限。'),
     tr('Create an agent token and connect it to the MCP endpoint above.', '创建 Agent Token，并连接上面的 MCP 地址。')]) el(steps, 'li', text);
 }
+async function showMemberPasskeyLink(id, beforeShowing = () => {}) {
+  const result = await api('members/enroll', {id});
+  beforeShowing();
+  secretResult(tr('Passkey link for ', '通行密钥注册链接：') + nameOf(id), result.url, true);
+}
 function members() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Group members', '群组成员'));
   for (const household of state.households) {
@@ -506,7 +510,14 @@ function members() {
     const box = modal(tr('Add member', '添加成员')); const name = field(box, tr('Name', '名字'), 'member_name');
     name.required = true; name.maxLength = 80;
     const household = select(box, tr('Group', '所属群组'), 'household', householdOptions());
-    button(box, tr('Add', '添加'), async () => { if (!name.reportValidity()) return; await mutate('members/add', {name: name.value, household: household.value}); box.close(); }, 'primary');
+    button(box, tr('Add', '添加'), async () => {
+      if (!name.reportValidity()) return;
+      const result = await mutate('members/add', {name: name.value, household: household.value});
+      box.close();
+      const next = modal(tr('Member added: ', '已添加成员：') + nameOf(result.id));
+      el(next, 'p', tr('Send a registration link so they can add a passkey on their own device.', '把注册链接发给成员，他们即可在自己的设备上添加通行密钥。'), 'muted');
+      button(next, tr('Create passkey link', '生成通行密钥链接'), () => showMemberPasskeyLink(result.id, () => next.close()), 'primary');
+    }, 'primary');
   }, 'primary');
   const grid = el(app, 'div', undefined, 'grid');
   for (const member of state.members) {
@@ -516,20 +527,8 @@ function members() {
     el(card, 'p', tr(`${member.passkeys} passkey(s) registered`, `已注册 ${member.passkeys} 个通行密钥`), 'muted');
     const actions = el(card, 'div', undefined, 'actions');
     button(actions, tr('Edit name', '修改名称'), () => renameMember(member));
-    button(actions, tr('Register a passkey', '注册通行密钥'), async () => {
-      const result = await api('members/enroll', {id: member.id}); secretResult(tr('Private registration link', '私密注册链接'), result.url, true);
-    });
+    button(actions, tr('Get passkey link', '获取通行密钥链接'), () => showMemberPasskeyLink(member.id));
     if (member.id !== state.owner) button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove member?', '移除此成员？'), identityLabel(member.id), async () => mutate('members/remove', {id: member.id})), 'danger');
-  }
-  if (state.passkey_reviews?.length) {
-    const pending = el(app, 'section', undefined, 'card');
-    el(pending, 'h2', tr('Passkeys awaiting approval', '等待批准的通行密钥'));
-    for (const request of state.passkey_reviews) {
-      const row = el(pending, 'div', undefined, 'row between');
-      el(row, 'span', identityLabel(request.member) + ' · ' + request.agent);
-      const link = el(row, 'a', tr('Review registration', '审阅登记'));
-      link.href = request.url;
-    }
   }
   const card = el(app, 'section', undefined, 'card'); el(card, 'h2', tr('Registered passkeys', '已注册的通行密钥'));
   for (const key of state.passkeys) {

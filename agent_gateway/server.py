@@ -223,6 +223,7 @@ class Gateway:
         name = params.name
         route = self.routes.get(name)
         arguments = params.arguments or {}
+        background = False
         if self.cfg.server.tool_discovery == "search":
             from . import discovery
             if name in discovery.BY_NAME:
@@ -261,6 +262,7 @@ class Gateway:
                         discovery_audit("deny", "ambiguous_variant")
                         return _error("This connection has multiple permitted parameter variants. Select a variant from gateway_search_connections.")
                     choices = valid
+                background = arguments.get("background", False)
                 route, arguments = choices[0], arguments["arguments"]
                 name = route.tool.name
         peer = ctx.request.client
@@ -291,7 +293,7 @@ class Gateway:
             raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
 
         try:
-            return await self._call(who, route, effect, arguments, done)
+            return await self._call(who, route, effect, arguments, done, background=background)
         except MCPError:
             raise
         except Exception as exc:  # never let an internal error message reach an agent
@@ -336,13 +338,13 @@ class Gateway:
 
         return final_arguments, upstream_arguments
 
-    def _approval_request(self, client, route, final_arguments):
+    def _approval_request(self, client, route, final_arguments, *, requires_approval=True):
         return ApprovalRequest(
             principal=client.subject, client_id=client.id, tool=route.tool.name, connection=route.conn.id,
             service=route.conn.service, account=route.conn.account, upstream_tool=route.tool.upstream,
             arguments_sha256=arguments_digest(final_arguments), arguments=final_arguments, owner=route.conn.owner,
-            approvers=self.cfg.approvers_of(route.conn), configuration_revision=self.configuration_revision,
-            client_token_sha256=client.token_sha256,
+            approvers=self.cfg.approvers_of(route.conn) if requires_approval else (), configuration_revision=self.configuration_revision,
+            client_token_sha256=client.token_sha256, background=not requires_approval,
             target_sha256=arguments_digest({
                 "connection": route.conn.model_dump(mode="json", exclude={"tools", "mailbox_email", "mailbox_aliases"}),
                 "tool": route.tool.model_dump(mode="json"),
@@ -350,15 +352,31 @@ class Gateway:
             }),
         )
 
-    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any) -> types.CallToolResult:
+    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any, *, background=False) -> types.CallToolResult:
         prepared = self._prepare_call(who.client_id, route, arguments, done)
         if isinstance(prepared, types.CallToolResult):
             return prepared
         final_arguments, upstream_arguments = prepared
-        if effect != "approval_required":
+        if effect != "approval_required" and not background:
             return await self._run(route, upstream_arguments, done, "ok")
 
+        from .approval_dispatch import response
+        from .passkey import PasskeyApprover, Refused
         client = next(c for c in self.cfg.clients if c.id == who.client_id)
+        if effect != "approval_required":
+            if not isinstance(self.approver, PasskeyApprover):
+                done("deny", "background_unavailable")
+                return _error("Background calls are unavailable on this Gateway.")
+            request = self._approval_request(client, route, final_arguments, requires_approval=False)
+            try:
+                job = self.approver.enqueue(request)
+            except Refused:
+                done("deny", "too_many_queued")
+                return _error("Too many background requests. Watch the existing requests before starting more.")
+            done("queued", "background", request_id=job)
+            return response({"status": "queued", "request_id": job},
+                            f"Request queued. Call gateway_watch with request_id {job}. Do not resubmit the action.")
+
         request = self._approval_request(client, route, final_arguments)
         decision = await self.approver.authorize(request)
         approval = decision.approval_id
@@ -366,14 +384,12 @@ class Gateway:
             done("deny", f"approval:{decision.reason}", approval=approval)
             # The approver's own wording (where the request waits); it is gateway code, not upstream text.
             if approval:
-                from .approval_dispatch import response
-                from .passkey import PasskeyApprover
                 if isinstance(self.approver, PasskeyApprover):
                     status = "pending" if decision.reason in ("pending", "requested") else decision.reason
                     data = {"status": status, "request_id": approval}
                     if status == "pending":
                         data["approval_url"] = self.approver._url(approval)
-                    message = decision.message or f"Action already submitted. Call gateway_wait_for_approval with request_id {approval}. Do not resubmit the action."
+                    message = decision.message or f"Action already submitted. Call gateway_watch with request_id {approval}. Do not resubmit the action."
                     return response(data, message, error=True)
             return _error(decision.message or NOT_EXECUTED)
         # From here the approval is spent, whatever happens. Tell the approver how it ended.
@@ -391,12 +407,13 @@ class Gateway:
                 with anyio.CancelScope(shield=True):
                     await self.approver.finished(approval, outcome)
 
-    async def run_approved(self, row):
-        """Recheck the approved call against the leased, current policy before sending it."""
+    async def run_dispatched(self, row):
+        """Recheck the saved call against the leased, current policy before sending it."""
         client = next((c for c in self.cfg.clients if c.id == row["client"] and c.token_sha256 == row["client_token_sha256"]), None)
         route = self.routes.get(row["tool"])
         started = time.monotonic()
         outcome = "configuration_changed"
+        approval_required = row["status"] == "approved"
 
         def done(decision, reason, **extra):
             nonlocal outcome
@@ -407,13 +424,13 @@ class Gateway:
                            reason in ("upstream_timeout", "upstream_invalid_reply", "result_too_large") else reason)
             self.audit.write("tool_call", client=row["client"], principal=row["principal"], tool=row["tool"],
                              connection=row["connection"], service=row["service"], account=row["account"],
-                             upstream_tool=row["upstream_tool"], approval=row["id"], decision=decision,
+                             upstream_tool=row["upstream_tool"], **({"approval": row["id"]} if approval_required else {"request_id": row["id"]}), decision=decision,
                              reason=reason, duration_ms=int((time.monotonic() - started) * 1000), **extra)
 
         if (not client or client.subject != row["principal"] or not route
                 or row["revision"] != self.configuration_revision
-                or self.policy.effect(client.subject, route.tool.name, client.id) != "approval_required"
-                or set(self.cfg.approvers_of(route.conn)) != set(json.loads(row["approvers"]))):
+                or self.policy.effect(client.subject, route.tool.name, client.id) != ("approval_required" if approval_required else "allow")
+                or (approval_required and set(self.cfg.approvers_of(route.conn)) != set(json.loads(row["approvers"])))):
             done("deny", "configuration_changed")
             return None, outcome
         arguments = json.loads(row["arguments"])
@@ -421,10 +438,10 @@ class Gateway:
         if isinstance(prepared, types.CallToolResult):
             return None, outcome
         final_arguments, upstream_arguments = prepared
-        if self._approval_request(client, route, final_arguments).binding != row["binding"]:
+        if self._approval_request(client, route, final_arguments, requires_approval=approval_required).binding != row["binding"]:
             done("deny", "configuration_changed")
             return None, outcome
-        result = await self._run(route, upstream_arguments, done, "approved")
+        result = await self._run(route, upstream_arguments, done, "approved" if approval_required else "background_completed")
         return result, outcome
 
     async def _run(self, route: ToolRoute, final_arguments: dict[str, Any], done: Any, ok_reason: str) -> types.CallToolResult:
@@ -488,7 +505,7 @@ def build_app(gateway: Gateway) -> Starlette:
         runtime.gateway.configuration_revision = catalog_revision(synced, lock)
     gateway = runtime.gateway
     cfg = gateway.cfg
-    from .approval_dispatch import ApprovalDispatcher, REGISTER_TOOL, WAIT_TOOL
+    from .approval_dispatch import ApprovalDispatcher, WATCH, WATCH_TOOL
     from .passkey import PasskeyApprover
     dispatcher = ApprovalDispatcher(runtime) if isinstance(gateway.approver, PasskeyApprover) else None
 
@@ -496,16 +513,13 @@ def build_app(gateway: Gateway) -> Starlette:
         async with runtime.lease() as current:
             result = await current.list_tools(ctx, params)
             if dispatcher:
-                who = caller_of(ctx.request, current.cfg.clients)
-                if who:
-                    special = dispatcher.tools(who)
-                    result = types.ListToolsResult(tools=[t for t in result.tools if t.name not in (WAIT_TOOL, REGISTER_TOOL)] + special)
+                return types.ListToolsResult(tools=[t for t in result.tools if t.name != WATCH_TOOL] + [WATCH])
             return result
 
     async def call_tool(ctx, params):
-        if dispatcher and params.name in (WAIT_TOOL, REGISTER_TOOL):
-            # Waiting for a person must not hold a runtime lease or block permission changes.
-            return await dispatcher.call(ctx.request, params.name, params.arguments or {})
+        if dispatcher and params.name == WATCH_TOOL:
+            # Watching a request must not hold the runtime lease or block permission changes.
+            return await dispatcher.watch(ctx.request, params.arguments or {})
         async with runtime.lease() as current:
             return await current.call_tool(ctx, params)
     server: Server[Any] = Server(

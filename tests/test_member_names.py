@@ -41,7 +41,7 @@ async def test_rename_preserves_identity_sessions_open_approval_and_restart(tmp_
         decision = await http.post('/approvals/api/finish', json={
             'ceremony_id': ceremony['ceremony_id'], 'response': key.response(ceremony, origin=origin)})
         assert decision.status_code == 200, decision.text
-        result = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'gateway_wait_for_approval', 'arguments': {'request_id': request_id}})).json()
+        result = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'gateway_watch', 'arguments': {'request_id': request_id}})).json()
         assert result['result']['structuredContent']['status'] == 'succeeded'
         assert 'Greg 林' not in gw.audit_text()
         assert 'Greg 林'.encode() not in (tmp_path / 'admin.enc').read_bytes()

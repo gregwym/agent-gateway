@@ -88,17 +88,18 @@ request unfinished approvals again.
 
 A call requiring approval returns an `approval_url` and `request_id` without
 executing. After approval, Gateway rechecks the permissions and runs the saved
-operation once. Agents use `gateway_wait_for_approval` with the request ID to
+operation once. Agents use `gateway_watch` with the request ID to
 get its status and output. If still pending or running, wait again with that ID.
 Do not resubmit the original action. An interrupted execution with an unknown
 outcome is never replayed automatically.
 
-With web administration enabled, an Agent can use `gateway_request_passkey`
-to give an existing non-admin group member a private registration link. The
-member registers on their own device. The key activates only after the
-administrator uses their own passkey to approve it.
+Use **Members → Add member** to add someone and create a private Passkey link.
+For an existing member, use **Get passkey link**. The link works once for 15 minutes.
+The recipient registers on their own device; the key is active immediately.
 
-Refresh the MCP tool list after upgrading to discover the approval and registration tools. Subsequent
+To watch a call that does not require approval, pass `background: true` to
+`gateway_call_tool` on a Gateway with approvals configured, then watch the returned request ID.
+Refresh the MCP tool list after upgrading to discover `gateway_watch`. Subsequent
 permission changes are visible through search. Legacy tool names remain callable
 under the same checks; `server.tool_discovery: all` restores the full listing.
 

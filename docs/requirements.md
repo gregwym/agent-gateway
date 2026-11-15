@@ -78,7 +78,7 @@ Agent Gateway 是一个自托管的 MCP Proxy。它让多个 Agent 通过统一�
 | Website | 只读操作由站点配置定义；每个连接独立加密保存并轮换 Cookie |
 | 网页管理 | 内置连接器及通用远程 MCP、成员、Agent、Token、权限与连接检查已实现 |
 | 工具发现 | 默认三个入口：`gateway_search_tools`、`gateway_search_connections`、`gateway_call_tool` |
-| Passkey 审批 | 批准后自动执行；Agent 可等待结果。成员可通过 Agent 发起 Passkey 登记，由管理员批准激活 |
+| Passkey 审批 | 批准后自动执行；Agent 可等待结果。管理员确认后签发一次性链接，成员在自己设备登记 |
 | IMAP + SMTP | 同一连接提供邮件读写、分页、批量操作和发送；按 IMAP 文件夹限制 Agent 访问；SMTP 暂不支持附件发送 |
 | CalDAV | 只读日历、事件与冲突检查；列表有数量限制，无续页 |
 | Gmail | 共用系统 OAuth 客户端；每个账号单独授权并可按标签限制 Agent 访问。默认只读；可选发送和邮件整理，包括已读、星标、标签、移动、归档和废纸篓；无搜索续页、批量读取或永久删除 |

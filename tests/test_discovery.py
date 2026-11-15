@@ -153,7 +153,7 @@ async def test_discovery_updates_without_reloading_and_approvals_bind_connection
         token = (await change(http, 'clients/create', id='discovery-agent', household='household')).json()['token']
         async with agent(origin + '/mcp', token) as client:
             cached_list = await tool_names(client)
-            assert cached_list == CORE | {'gateway_wait_for_approval', 'gateway_request_passkey'}
+            assert cached_list == CORE | {'gateway_watch'}
             assert (await search(client, 'tools'))['total'] == (await search(client, 'connections'))['total'] == 0
             for conn in ['notes-a', 'notes-house']:
                 reply = await change(http, 'permissions/connection', client='discovery-agent', connection=conn, access='read_write', approver='person_a')
@@ -178,3 +178,56 @@ async def test_discovery_updates_without_reloading_and_approvals_bind_connection
             assert (await search(client, 'tools'))['total'] == 0
             with pytest.raises(MCPError):
                 await execute(client, 'notes_list_notes', 'notes-a', {'folder': 'inbox'})
+
+
+async def test_watch_works_for_direct_calls_and_keeps_them_private(tmp_path, monkeypatch):
+    from test_passkey import defer_dispatch
+
+    resume = defer_dispatch(monkeypatch)
+    port = free_port()
+    origin = f'http://localhost:{port}'
+    raw = approval_config(origin=origin)
+    raw['server']['tool_discovery'] = 'search'
+    raw['admin'] = {'owner': 'person_a', 'state': 'admin.enc'}
+    async with web_gateway(tmp_path, path=await prepare(tmp_path, raw), port=port) as (_gw, http, origin, path):
+        await setup(http, origin, path)
+        async with agent(origin + '/mcp', TOKEN_A) as client, agent(origin + '/mcp', TOKEN_B) as other:
+            reply = await execute(client, 'notes_list_notes', 'notes-a', {'folder': 'inbox'}, background=True)
+            info = reply.structured_content
+            assert not reply.is_error and info['status'] == 'queued' and 'approval_url' not in info
+            request_id = info['request_id']
+            assert (await wait_for_approval(client, request_id, 0)).structured_content['status'] == 'queued'
+            assert (await Page(origin, origin).view(request_id))[0] == 404
+            with pytest.raises(MCPError):
+                await wait_for_approval(other, request_id, 0)
+            needs_approval = await execute(client, 'notes_add_note', 'notes-a',
+                                           {'folder': 'inbox', 'text': 'approval cannot be bypassed'}, background=True)
+            assert needs_approval.structured_content['status'] == 'pending'
+            assert 'approval_url' in needs_approval.structured_content
+            resume.set()
+            watched = await wait_for_approval(client, request_id)
+            assert watched.structured_content['status'] == 'succeeded'
+            assert 'private inbox note of person_a' in watched.content[1].text
+            assert 'approval cannot be bypassed' not in watched.content[1].text
+
+
+async def test_background_call_is_cancelled_if_grant_changes_before_dispatch(tmp_path, monkeypatch):
+    from test_passkey import defer_dispatch
+
+    resume = defer_dispatch(monkeypatch)
+    port = free_port()
+    origin = f'http://localhost:{port}'
+    raw = approval_config(origin=origin)
+    raw['server']['tool_discovery'] = 'search'
+    raw['admin'] = {'owner': 'person_a', 'state': 'admin.enc'}
+    async with web_gateway(tmp_path, path=await prepare(tmp_path, raw), port=port) as (_gw, http, origin, path):
+        await setup(http, origin, path)
+        async with agent(origin + '/mcp', TOKEN_A) as client:
+            queued = await execute(client, 'notes_list_notes', 'notes-a', {'folder': 'inbox'}, background=True)
+            assert queued.structured_content['status'] == 'queued'
+            removed = await change(http, 'permissions/connection', client='agent-a', connection='notes-a', access='none')
+            assert removed.status_code == 200, removed.text
+            resume.set()
+            finished = await wait_for_approval(client, queued.structured_content['request_id'])
+            assert finished.structured_content['status'] == 'cancelled'
+            assert len(finished.content) == 1

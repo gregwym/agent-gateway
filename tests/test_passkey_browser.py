@@ -134,33 +134,39 @@ async def test_browser_does_not_claim_execution_when_upstream_failed(tmp_path):
         await playwright.expect(page.locator("pre")).to_have_text("(no longer stored)")
 
 
-async def test_family_registers_in_separate_browser_session(tmp_path):
-    from passkey_helpers import Page
-    from test_admin import setup, web_gateway
-    async with web_gateway(tmp_path) as (gw, http, origin, path):
-        key, _ = await setup(http, origin, path)
-        async with agent(origin + "/mcp", TOKEN_A) as client, playwright.async_playwright() as driver:
-            browser = await driver.chromium.launch()
-            try:
-                context = await browser.new_context(locale="en-US")
-                page = await context.new_page()
-                cdp = await context.new_cdp_session(page)
-                await cdp.send("WebAuthn.enable")
-                await cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
-                    "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
-                    "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})
-                requested = await client.call_tool("gateway_request_passkey", {"member": "person_b"})
-                await page.goto(requested.structured_content["enrollment_url"])
-                await page.get_by_role("button", name="Register passkey").click()
-                await playwright.expect(page.locator(".notice.ok")).to_contain_text("active after administrator approval")
-                review = await page.get_by_role("link", name="Administrator review link").get_attribute("href")
-                await page.goto(review)
-                await playwright.expect(page.locator("h1")).to_have_text("Approve a member’s passkey")
-                assert (await page.request.get(origin + "/admin/api/state")).status == 401
-                request_id = review.rsplit("/", 1)[-1]
-                assert (await Page(origin, origin).decide("approve", request_id, key, origin=origin))[0] == 200
-                assert (await wait_for_approval(client, request_id)).structured_content["status"] == "succeeded"
-                await page.reload()
-                await playwright.expect(page.locator("h1")).to_have_text("Completed")
-            finally:
-                await browser.close()
+@pytest.mark.parametrize("locale", ["en-US", "zh-CN"])
+async def test_admin_copies_new_member_registration_link(tmp_path, locale):
+    from test_admin_feedback_browser import admin_page
+
+    def t(en, zh):
+        return zh if locale == "zh-CN" else en
+
+    async with admin_page(tmp_path, locale) as (admin, origin):
+        await admin.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
+        await admin.get_by_role("link", name=t("Members", "群组成员"), exact=True).click()
+        await admin.get_by_role("button", name=t("Add member", "添加成员"), exact=True).click()
+        await admin.get_by_label(t("Name", "名字"), exact=True).fill("Alex 林")
+        await admin.get_by_role("button", name=t("Add", "添加"), exact=True).click()
+        await admin.get_by_role("button", name=t("Create passkey link", "生成通行密钥链接"), exact=True).click()
+        link = await admin.get_by_label(t("Registration link", "注册链接"), exact=True).input_value()
+        assert link.startswith(origin + "/approvals/enroll#")
+        await admin.get_by_role("button", name=t("Copy", "复制"), exact=True).click()
+        assert await admin.evaluate("navigator.clipboard.readText()") == link
+
+        member_context = await admin.context.browser.new_context(locale=locale)
+        try:
+            member = await member_context.new_page()
+            cdp = await member_context.new_cdp_session(member)
+            await cdp.send("WebAuthn.enable")
+            await cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+                "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
+                "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})
+            assert (await member.request.get(origin + "/admin/api/state")).status == 401
+            await member.goto(link)
+            await member.get_by_role("button", name=t("Register passkey", "注册通行密钥"), exact=True).click()
+            await playwright.expect(member.locator(".notice.ok")).to_contain_text(t("Passkey registered.", "通行密钥已注册"))
+            await admin.reload()
+            card = admin.locator(".card").filter(has=admin.get_by_role("heading", name="Alex 林", exact=True))
+            await playwright.expect(card).to_contain_text(t("1 passkey(s) registered", "已注册 1 个通行密钥"))
+        finally:
+            await member_context.close()

@@ -50,6 +50,8 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await page.get_by_role('button', name=t('Add member','添加成员'), exact=True).click()
                 await page.get_by_label(t('Name','名字'), exact=True).fill('alex')
                 await page.get_by_role('button', name=t('Add','添加'), exact=True).click()
+                next_step = page.get_by_role('dialog', name=t('Member added: alex', '已添加成员：alex'), exact=True)
+                await next_step.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
                 await playwright.expect(page.get_by_role('heading', name='alex', exact=True)).to_be_visible()
 
                 await page.get_by_role('link', name=t('Agents','Agent 接入'), exact=True).click()
@@ -61,7 +63,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 token = await page.get_by_label(t('Agent token','Agent Token'), exact=True).input_value()
                 assert token.startswith('agw_')
                 names = {tool['name'] for tool in (await rpc(origin, token)).json()['result']['tools']}
-                assert names == {'gateway_wait_for_approval', 'gateway_request_passkey'}
+                assert names == {'gateway_watch'}
                 await page.get_by_role('button', name=t('Close','关闭'), exact=True).click()
                 assert token not in await page.locator('body').inner_text()
                 await page.get_by_role('row').filter(has_text='browser-agent').get_by_role('button', name=t('Revoke','撤销'), exact=True).click()

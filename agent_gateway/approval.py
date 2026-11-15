@@ -54,6 +54,7 @@ class ApprovalRequest:
     configuration_revision: str = ""
     client_token_sha256: str = field(default="", repr=False)
     target_sha256: str = ""
+    background: bool = False
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     created_at: float = field(default_factory=time.time)
     ttl_seconds: int = 300
@@ -76,6 +77,7 @@ class ApprovalRequest:
                     "account": self.account,
                     "upstream_tool": self.upstream_tool,
                     "arguments_sha256": self.arguments_sha256,
+                    **({"background": True} if self.background else {}),
                     **({"target_sha256": self.target_sha256} if self.target_sha256 else {}),
                     **({"client_token_sha256": self.client_token_sha256} if self.client_token_sha256 else {}),
                     **({"configuration_revision": self.configuration_revision} if self.configuration_revision else {}),
