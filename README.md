@@ -86,22 +86,24 @@ Use **Rename** on a connector to change its connection ID. Credentials and
 permissions carry over. Update workflows that pass the old connection ID and
 request unfinished approvals again.
 
-A call requiring approval returns an `approval_url` and `request_id` without
-executing. After approval, Gateway rechecks the permissions and runs the saved
-operation once. Agents use `gateway_watch` with the request ID to
-get its status and output. If still pending or running, wait again with that ID.
-Do not resubmit the original action. An interrupted execution with an unknown
-outcome is never replayed automatically.
+Gateway saves calls that need approval and executes them once after Passkey
+approval, after rechecking permissions. Clients that support
+[MCP Tasks](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)
+and URL elicitation can follow approval and execution on the original call.
+Other clients receive an `approval_url` and `request_id`. Share the link with
+the approver, then call `gateway_call_tool` with just `request_id` to check status
+and get the output. Do not resubmit the original action. Gateway never
+automatically replays an interrupted execution with an unknown outcome.
 
 Use **Members → Add member** to add someone and create a private Passkey link.
 For an existing member, use **Get passkey link**. The link works once for 15 minutes.
 The recipient registers on their own device; the key is active immediately.
 
-To watch a call that does not require approval, pass `background: true` to
-`gateway_call_tool` on a Gateway with approvals configured, then watch the returned request ID.
-Refresh the MCP tool list after upgrading to discover `gateway_watch`. Subsequent
-permission changes are visible through search. Legacy tool names remain callable
-under the same checks; `server.tool_discovery: all` restores the full listing.
+With approvals configured, pass `background: true` to `gateway_call_tool` to
+queue a call. Clients with MCP Tasks follow it through the protocol; other
+clients check the returned request ID through the same tool. Refresh the MCP
+tool list once after upgrading to pick up the updated schema.
+`server.tool_discovery: all` restores the full listing of connector tools.
 
 ## Current status
 

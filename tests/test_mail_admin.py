@@ -99,7 +99,7 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 assert approved == 200, detail
                 different = await send({**args, 'to': ['different@example.test']})
                 assert request_id_in(different['content'][0]['text']) != request_id
-                sent = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'gateway_watch',
+                sent = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'gateway_call_tool',
                                   'arguments': {'request_id': request_id}})).json()['result']
                 assert sent['structuredContent']['status'] == 'succeeded'
                 outcome = json.loads(sent['content'][1]['text'])

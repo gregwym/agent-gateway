@@ -219,11 +219,10 @@ docker compose run --rm admin approval enroll person_a
 （AirDrop、当面、端到端加密的私聊）交给本人，不要贴进任何 Agent 读得到的对话。打开后按浏览器提示创建 Passkey
 （需要生物识别或设备密码）。
 
-**一次审批**：需要审批的工具调用返回 `approval_url` 和 `request_id`。审批人核对原始参数并批准，
-Gateway 自动执行一次。Agent 调用 `gateway_watch` 获取状态和结果；默认等 20 秒，
-`wait_seconds: 0` 可立即查询。等待中就用同一编号继续查，不要重发原操作。
-结果留在内存最多 10 分钟；重启后仍可查询执行状态。若结果显示未知，先确认上游是否已经执行。
-从 v0.10.0 及更早版本升级时，旧审批需要重新发起。v0.11.0 的工具调用可直接用新 watch 跟踪。
+**一次审批**：审批人核对参数并用 Passkey 批准后，Gateway 自动执行一次。支持 MCP Tasks 和 URL elicitation
+的客户端会跟踪原调用；其他客户端收到 `approval_url` 和 `request_id`，用 `gateway_call_tool` 传入
+`request_id` 获取状态和结果。默认等 20 秒，`wait_seconds: 0` 可立即查询。等待中继续查同一个编号；
+不要重发原操作。结果留在内存最多 10 分钟；重启后仍可查询执行状态。若结果显示未知，先确认上游是否已经执行。
 
 连接的 `approver` 可选同群组的一位成员或群组内任意成员；未设置时默认 owner。选择群组时，其中任意成员可批准，
 无需全员批准；owner 本身不授予其他 Agent 工具权限。
@@ -363,7 +362,7 @@ call "$A" gateway_call_tool '{"tool":"mail_list_messages","connection":"my_mail"
 | 1 | `approval enroll person_a`，在手机或电脑上打开链接 | 浏览器要求创建 Passkey；同一个链接第二次打开无效 |
 | 2 | `call $A a_notes_add '{"folder":"inbox","text":"hello"}'` | 没有执行；回答里有审批链接 |
 | 3 | 打开链接，核对页面上的 client、账号、工具、参数，批准 | 要求生物识别或设备密码 |
-| 4 | 调用 `gateway_watch`，传入第 2 步的 `request_id` | 网关自动执行一次；返回状态和工具结果 |
+| 4 | 调用 `gateway_call_tool`，只传第 2 步的 `request_id` | 网关自动执行一次；返回状态和工具结果 |
 | 5 | 发起请求，批准后把参数改一个字再调用 | 不执行，生成新的请求 |
 | 6 | 发起请求，在页面上拒绝；再原样调用 | 回答已被拒绝，不生成新请求（默认 10 分钟内） |
 | 7 | 用 B 的设备打开 A 的请求链接 | 看得到内容，但 B 的 Passkey 批不了 A 账号的请求 |

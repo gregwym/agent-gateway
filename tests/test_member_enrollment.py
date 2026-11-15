@@ -30,7 +30,7 @@ async def test_admin_link_is_one_time_and_members_can_approve_without_an_admin_s
         assert await page.decide("enroll", code, Authenticator(), origin=origin) == (403, {"error": "invalid_enrollment_code"})
         assert any(k["principal"] == member for k in (await state(http))["passkeys"])
         async with agent(origin + "/mcp", TOKEN_HOUSE) as shared:
-            assert "gateway_watch" in await tool_names(shared)
+            assert "gateway_call_tool" in await tool_names(shared)
             for name, args in {
                 "gateway_request_passkey": {"member": member},
                 "gateway_wait_for_approval": {"request_id": "a" * 32},

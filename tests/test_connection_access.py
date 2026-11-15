@@ -11,7 +11,7 @@ pytestmark = pytest.mark.anyio
 
 
 async def wait(origin, token, request_id):
-    reply = await rpc(origin, token, 'tools/call', {'name': 'gateway_watch', 'arguments': {'request_id': request_id}})
+    reply = await rpc(origin, token, 'tools/call', {'name': 'gateway_call_tool', 'arguments': {'request_id': request_id}})
     return reply.json()['result']['structuredContent']
 
 

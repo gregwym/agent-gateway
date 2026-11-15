@@ -68,11 +68,11 @@ async def test_agents_in_one_household_never_inherit_each_others_grants(tmp_path
             response = await change(http, 'clients/create', id=name, household='household')
             assert response.status_code == 200, response.text
             tokens[name] = response.json()['token']
-            assert {t['name'] for t in (await rpc(origin, tokens[name])).json()['result']['tools']} == {'gateway_watch'}
+            assert {t['name'] for t in (await rpc(origin, tokens[name])).json()['result']['tools']} == {'gateway_call_tool'}
         grant = await change(http, 'permissions/save', client='one', connection='notes-a', tool='a_list_notes', effect='allow')
         assert grant.status_code == 200, grant.text
-        assert {t['name'] for t in (await rpc(origin, tokens['one'])).json()['result']['tools']} == {'a_list_notes', 'gateway_watch'}
-        assert {t['name'] for t in (await rpc(origin, tokens['two'])).json()['result']['tools']} == {'gateway_watch'}
+        assert {t['name'] for t in (await rpc(origin, tokens['one'])).json()['result']['tools']} == {'a_list_notes', 'gateway_call_tool'}
+        assert {t['name'] for t in (await rpc(origin, tokens['two'])).json()['result']['tools']} == {'gateway_call_tool'}
         denied = (await rpc(origin, tokens['two'], 'tools/call', {'name': 'a_list_notes', 'arguments': {}})).json()
         assert denied['error']['code'] == -32602
         # A household Agent can request a personal tool, but only its owner approves.
@@ -84,13 +84,13 @@ async def test_agents_in_one_household_never_inherit_each_others_grants(tmp_path
         view = (await page.view(request_id))[1]
         assert view['client'] == 'one' and view['owner'] == 'person_a' and view['approvers'] == ['person_a']
         assert (await page.decide('approve', request_id, key, origin=origin))[0] == 200
-        result = (await rpc(origin, tokens['one'], 'tools/call', {'name': 'gateway_watch',
+        result = (await rpc(origin, tokens['one'], 'tools/call', {'name': 'gateway_call_tool',
                                                                'arguments': {'request_id': request_id}})).json()
         assert result['result']['structuredContent']['status'] == 'succeeded'
         assert (await change(http, 'clients/revoke', id='one')).status_code == 200
         assert (await rpc(origin, tokens['one'])).status_code == 401
         recreated = await change(http, 'clients/create', id='one', household='household')
-        assert {t['name'] for t in (await rpc(origin, recreated.json()['token'])).json()['result']['tools']} == {'gateway_watch'}
+        assert {t['name'] for t in (await rpc(origin, recreated.json()['token'])).json()['result']['tools']} == {'gateway_call_tool'}
         # A real name can contain spaces/Unicode; IDs never appear as another name.
         response = await change(http, 'members/add', name='Alex 林', household='household')
         assert response.status_code == 200

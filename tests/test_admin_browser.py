@@ -63,7 +63,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 token = await page.get_by_label(t('Agent token','Agent Token'), exact=True).input_value()
                 assert token.startswith('agw_')
                 names = {tool['name'] for tool in (await rpc(origin, token)).json()['result']['tools']}
-                assert names == {'gateway_watch'}
+                assert names == {'gateway_call_tool'}
                 await page.get_by_role('button', name=t('Close','关闭'), exact=True).click()
                 assert token not in await page.locator('body').inner_text()
                 await page.get_by_role('row').filter(has_text='browser-agent').get_by_role('button', name=t('Revoke','撤销'), exact=True).click()

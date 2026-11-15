@@ -11,16 +11,15 @@ from mcp import MCPError
 from .auth import caller_of
 
 WATCH_TOOL = "gateway_watch"
-WATCH = types.Tool(
-    name=WATCH_TOOL,
-    description="Watch an existing Gateway request until it finishes. Use the request_id returned by a tool call. If queued, pending, approved or running, watch again with the same ID. Completion returns the original tool output if available. This never submits, replays or cancels a request.",
-    input_schema={"type": "object", "properties": {
-        "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{32}$", "description": "Request ID returned by the original tool call."},
-        "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 25, "default": 20,
-                         "description": "Maximum time to watch in this call. Use 0 to check immediately."},
-    }, "required": ["request_id"], "additionalProperties": False},
-    annotations=types.ToolAnnotations(read_only_hint=True),
-)
+WATCH_PROPERTIES = {
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{32}$",
+                   "description": "Request ID returned by the original call. Use this to check its status and result."},
+    "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 25, "default": 20,
+                     "description": "Maximum time to wait for an existing request. Use 0 to check immediately."},
+}
+WATCH_VALIDATOR = Draft202012Validator({
+    "type": "object", "properties": WATCH_PROPERTIES, "required": ["request_id"], "additionalProperties": False,
+})
 RESULT_TTL = 600
 RESULT_LIMIT = 16 * 1024 * 1024
 
@@ -106,20 +105,29 @@ class ApprovalDispatcher:
             self.inflight.discard(request_id)
             self.notify()
 
+    def lookup(self, request, request_id):
+        gw = self.runtime.gateway
+        caller = caller_of(request, gw.cfg.clients)
+        if not caller:
+            raise MCPError(types.INVALID_REQUEST, "Not authenticated")
+        client = next(c for c in gw.cfg.clients if c.id == caller.client_id)
+        row = self.approver.dispatch_status(request_id)
+        if not row or row["client"] != client.id or row["client_token_sha256"] != client.token_sha256:
+            raise MCPError(types.INVALID_PARAMS, "Unknown request ID")
+        return gw, row
+
+    def result_for(self, gw, request_id, row):
+        self._trim()
+        result = self.results.get(request_id) if row["revision"] == gw.configuration_revision else None
+        return result[2] if result else None
+
     async def watch(self, request, args):
-        if not Draft202012Validator(WATCH.input_schema).is_valid(args):
-            raise MCPError(types.INVALID_PARAMS, "Invalid watch arguments")
+        if not WATCH_VALIDATOR.is_valid(args):
+            raise MCPError(types.INVALID_PARAMS, "To check a request, pass only request_id and optional wait_seconds")
         deadline = time.monotonic() + args.get("wait_seconds", 20)
         request_id = args["request_id"]
         while True:
-            gw = self.runtime.gateway
-            caller = caller_of(request, gw.cfg.clients)
-            if not caller:
-                raise MCPError(types.INVALID_REQUEST, "Not authenticated")
-            client = next(c for c in gw.cfg.clients if c.id == caller.client_id)
-            row = self.approver.dispatch_status(request_id)
-            if not row or row["client"] != client.id or row["client_token_sha256"] != client.token_sha256:
-                raise MCPError(types.INVALID_PARAMS, "Unknown request ID")
+            gw, row = self.lookup(request, request_id)
             status, outcome = row["status"], row["outcome"]
             if status == "used":
                 status = ("running" if outcome is None else "succeeded" if outcome == "ok" else
@@ -129,12 +137,11 @@ class ApprovalDispatcher:
                 data = {"request_id": request_id, "status": status, **({"outcome": outcome} if outcome else {})}
                 message = f"Request {request_id}: {status}."
                 if status in ("queued", "pending", "approved", "running"):
-                    return response(data, message + " Call gateway_watch again with this request_id.")
+                    return response(data, message + " Call gateway_call_tool again with only this request_id.")
                 if status == "execution_unknown":
                     message += " The operation may already have run. Verify the upstream state before taking any further action."
-                self._trim()
-                result = self.results.get(request_id) if row["revision"] == gw.configuration_revision else None
+                result = self.result_for(gw, request_id, row)
                 if result is None and status in ("succeeded", "failed"):
                     message += " The original output is no longer available."
-                return response(data, message, result[2] if result else None)
+                return response(data, message, result)
             await anyio.sleep(min(.25, max(0, deadline - time.monotonic())))

@@ -73,6 +73,8 @@ CREATE INDEX IF NOT EXISTS requests_binding ON requests (binding, created);
 CREATE INDEX IF NOT EXISTS requests_queued ON requests (status, expires) WHERE status IN ('approved','queued');
 CREATE TABLE IF NOT EXISTS dispatch (
     id TEXT PRIMARY KEY, revision TEXT NOT NULL, client_token_sha256 TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS task_state (
+    id TEXT PRIMARY KEY, link_accepted INTEGER, finished INTEGER);
 -- Legacy registration data. Kept so upgrade/rollback can read the same store.
 CREATE TABLE IF NOT EXISTS enrollment_requests (
     code_sha256 TEXT PRIMARY KEY, client TEXT NOT NULL, client_token_sha256 TEXT NOT NULL, administrator TEXT NOT NULL);
@@ -177,6 +179,7 @@ class PasskeyApprover:
         db.execute("DELETE FROM ceremonies WHERE expires<=?", (now,))
         db.execute("DELETE FROM enrollments WHERE expires<=?", (now,))
         db.execute("DELETE FROM dispatch WHERE id NOT IN (SELECT id FROM requests)")
+        db.execute("DELETE FROM task_state WHERE id NOT IN (SELECT id FROM dispatch)")
 
     def _url(self, request_id: str) -> str:
         return f"{self.cfg.origin}/approvals/r/{request_id}"
@@ -284,8 +287,11 @@ class PasskeyApprover:
 
     def dispatch_status(self, request_id):
         with self._db(write=False) as db:
-            row = db.execute("SELECT r.status, r.client, r.outcome, r.expires, d.revision, d.client_token_sha256"
-                             " FROM requests r JOIN dispatch d ON r.id=d.id WHERE r.id=?", (request_id,)).fetchone()
+            row = db.execute(
+                "SELECT r.status, r.client, r.outcome, r.created, r.expires, r.decided, r.used,"
+                " d.revision, d.client_token_sha256, t.link_accepted, t.finished"
+                " FROM requests r JOIN dispatch d ON r.id=d.id LEFT JOIN task_state t ON r.id=t.id WHERE r.id=?",
+                (request_id,)).fetchone()
             if not row:
                 return None
             row = dict(row)
@@ -293,18 +299,45 @@ class PasskeyApprover:
                 row["status"] = "expired"
             return row
 
+    @property
+    def task_retention_ms(self):
+        return self._retention * 1000
+
+    def task_control(self, request_id, action, *, reply=False):
+        now = _now()
+        with self._db() as db:
+            row = self._dispatch_row(db, request_id)
+            if not row or row["expires"] <= now:
+                return
+            if reply and (row["status"] != "pending" or db.execute(
+                    "SELECT 1 FROM task_state WHERE id=? AND link_accepted IS NOT NULL", (request_id,)).fetchone()):
+                return
+            if action == "accept":
+                db.execute("INSERT INTO task_state (id, link_accepted) VALUES (?,?)"
+                           " ON CONFLICT(id) DO UPDATE SET link_accepted=excluded.link_accepted", (request_id, now))
+                return
+            if row["status"] not in ("pending", "approved", "queued"):
+                return
+            db.execute("UPDATE requests SET status='cancelled', decided=?, arguments=NULL WHERE id=?",
+                       (now, request_id))
+        self.audit.write("approval_cancelled", approval=request_id, client=row["client"], reason="client_cancelled")
+
     def _waiting(self, request_id: str, approvers: str, expires: int, now: int) -> str:
         people = " or ".join(self.identity_label(p) for p in json.loads(approvers))
         minutes = max(1, (expires - now + 59) // 60)
         return (
             f"{NOT_EXECUTED} It is waiting at {self._url(request_id)} . Ask {people} to open that page and approve it "
             f"with their passkey within {minutes} minutes. The gateway executes the approved action automatically. "
-            f"Call gateway_watch with request_id {request_id} for its status and result. Do not resubmit the action."
+            f"Call gateway_call_tool with only request_id {request_id} for its status and result. Do not resubmit the action."
         )
 
     async def finished(self, approval_id: str, outcome: str) -> None:
         with self._db() as db:
-            db.execute("UPDATE requests SET outcome=? WHERE id=? AND status='used' AND outcome IS NULL", (outcome[:64], approval_id))
+            updated = db.execute("UPDATE requests SET outcome=? WHERE id=? AND status='used' AND outcome IS NULL",
+                                 (outcome[:64], approval_id))
+            if updated.rowcount:
+                db.execute("INSERT INTO task_state (id, finished) VALUES (?,?)"
+                           " ON CONFLICT(id) DO UPDATE SET finished=excluded.finished", (approval_id, _now()))
 
     # -- administration (the `agw approval` commands) -------------------------------
 

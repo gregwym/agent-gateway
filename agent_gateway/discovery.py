@@ -7,6 +7,7 @@ import re
 import mcp_types as types
 
 from .admin_config import kind_of, mailbox_metadata
+from .approval_dispatch import WATCH_PROPERTIES
 
 SEARCH_TOOLS = "gateway_search_tools"
 SEARCH_CONNECTIONS = "gateway_search_connections"
@@ -29,13 +30,29 @@ TOOLS = [
                input_schema=schema({**PAGING, "connection": text("Optional connection ID to search within.", 48)}), annotations=types.ToolAnnotations(read_only_hint=True)),
     types.Tool(name=SEARCH_CONNECTIONS, description="Search connections this Agent may access by name, service, owner, or known mailbox address and aliases. Mail aliases share the same connection ID. Optionally specify a tool from gateway_search_tools to see its permitted parameter variants and approval requirements on each connection. Hidden or denied connections are never returned.",
                input_schema=schema({**PAGING, "tool": text("Optional shared tool name from gateway_search_tools.", 128)}), annotations=types.ToolAnnotations(read_only_hint=True)),
-    types.Tool(name=CALL_TOOL, description="Execute a discovered tool on a permitted connection. Pass tool, connection and arguments. Permissions, fixed arguments and one-use approvals are enforced again at execution. If several parameter variants match, select a variant from gateway_search_connections. Use background=true to queue the call and follow its progress with gateway_watch. When approval is required, share the returned approval_url with the person deciding; the gateway runs the action automatically after approval. Use gateway_watch with the returned request_id; do not resubmit the action.",
-               input_schema=schema({"tool": text("Shared tool name from gateway_search_tools.", 128),
-                                    "connection": text("Connection ID from gateway_search_connections.", 48),
-                                    "arguments": {"type": "object", "description": "Parameters for the selected tool and connection."},
-                                    "background": {"type": "boolean", "default": False, "description": "Return a request ID immediately. Follow it with gateway_watch. Approval requirements still apply."},
-                                    "variant": text("Optional variant ID from gateway_search_connections when a connection exposes multiple restricted bindings.", 64)},
-                                   ("tool", "connection", "arguments")), annotations=types.ToolAnnotations(read_only_hint=False)),
+    types.Tool(
+        name=CALL_TOOL,
+        description="Execute a permitted tool: pass tool, connection and arguments, and a variant if needed. "
+                    "Set background=true to queue a call. If the result contains an approval_url, share it with "
+                    "the approver. The gateway runs the action automatically after Passkey approval. "
+                    "If a request_id is returned, call this same tool with only request_id and optional wait_seconds "
+                    "to get the status and result. Do not resubmit the action.",
+        input_schema={
+            **schema({"tool": text("Shared tool name from gateway_search_tools.", 128),
+                      "connection": text("Connection ID from gateway_search_connections.", 48),
+                      "arguments": {"type": "object", "description": "Parameters for the selected tool and connection."},
+                      "background": {"type": "boolean", "default": False, "description": "Queue the call. Approval requirements still apply."},
+                      "variant": text("Optional variant ID from gateway_search_connections.", 64),
+                      **WATCH_PROPERTIES}),
+            "oneOf": [
+                {"required": ["tool", "connection", "arguments"],
+                 "not": {"anyOf": [{"required": [key]} for key in WATCH_PROPERTIES]}},
+                {"required": ["request_id"],
+                 "not": {"anyOf": [{"required": [key]} for key in ("tool", "connection", "arguments", "background", "variant")]}},
+            ],
+        },
+        annotations=types.ToolAnnotations(read_only_hint=False),
+    ),
 ]
 BY_NAME = {tool.name: tool for tool in TOOLS}
 

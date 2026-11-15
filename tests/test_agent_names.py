@@ -30,7 +30,7 @@ async def test_rename_preserves_token_grants_restart_and_rejects_old_approvals(t
                 assert b['permissions']['openclaw'] == a['permissions']['agent-a']
                 assert 'agent-a' not in b['permissions']
         recreated = await change(http, 'clients/create', id='agent-a', household='household')
-        assert {t['name'] for t in (await rpc(origin, recreated.json()['token'])).json()['result']['tools']} == {'gateway_watch'}
+        assert {t['name'] for t in (await rpc(origin, recreated.json()['token'])).json()['result']['tools']} == {'gateway_call_tool'}
         assert (await rpc(origin, TOKEN_A)).json()['result']['tools'] == tools
     async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
         await login(http, key, origin)

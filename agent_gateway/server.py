@@ -215,7 +215,7 @@ class Gateway:
         ]
         return types.ListToolsResult(tools=tools)
 
-    async def call_tool(self, ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
+    async def call_tool(self, ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult | dict:
         started = time.monotonic()
         who = caller_of(ctx.request, self.cfg.clients)
         if who is None:
@@ -224,47 +224,50 @@ class Gateway:
         route = self.routes.get(name)
         arguments = params.arguments or {}
         background = False
-        if self.cfg.server.tool_discovery == "search":
-            from . import discovery
-            if name in discovery.BY_NAME:
-                def discovery_audit(decision, reason):
-                    self.audit.write("tool_call", client=who.client_id, principal=who.principal, tool=name,
-                                     remote=ctx.request.client.host if ctx.request.client else None,
-                                     decision=decision, reason=reason, arg_keys=sorted(arguments),
-                                     duration_ms=int((time.monotonic() - started) * 1000))
+        from . import discovery, mcp_tasks
+        from .passkey import PasskeyApprover
 
-                validator = Draft202012Validator(discovery.BY_NAME[name].input_schema)
-                failure = jsonschema_exceptions.best_match(validator.iter_errors(arguments))
-                if failure is not None:
-                    discovery_audit("deny", "invalid_arguments")
-                    return _error("Invalid discovery arguments: " + failure.message[:300])
-                if name != discovery.CALL_TOOL:
-                    data = (discovery.search_tools if name == discovery.SEARCH_TOOLS else discovery.search_connections)(self, who, arguments)
-                    payload = json.dumps(self.scrubber.data(data), ensure_ascii=False)
-                    if len(payload.encode()) > self.cfg.server.max_result_bytes // 2:
-                        discovery_audit("deny", "result_too_large")
-                        return _error("Discovery result is too large. Narrow the query or use a smaller limit.")
-                    discovery_audit("allow", "discovery")
-                    return types.CallToolResult(content=[types.TextContent(type="text", text=payload)])
-                choices = discovery.candidates(self, who, arguments)
-                if not choices:
-                    discovery_audit("deny", "unknown_tool")
-                    raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
-                if len(choices) > 1:
-                    valid = []
-                    for candidate in choices:
-                        try:
-                            if not set(arguments["arguments"]) & candidate.tool.pin.keys() and candidate.validator.is_valid(arguments["arguments"]):
-                                valid.append(candidate)
-                        except Exception:  # an unresolved local schema reference cannot select a route
-                            continue
-                    if len(valid) != 1:
-                        discovery_audit("deny", "ambiguous_variant")
-                        return _error("This connection has multiple permitted parameter variants. Select a variant from gateway_search_connections.")
-                    choices = valid
-                background = arguments.get("background", False)
-                route, arguments = choices[0], arguments["arguments"]
-                name = route.tool.name
+        has_dispatch = isinstance(self.approver, PasskeyApprover)
+        if name in discovery.BY_NAME and (self.cfg.server.tool_discovery == "search"
+                                          or (has_dispatch and name == discovery.CALL_TOOL)):
+            def discovery_audit(decision, reason):
+                self.audit.write("tool_call", client=who.client_id, principal=who.principal, tool=name,
+                                 remote=ctx.request.client.host if ctx.request.client else None,
+                                 decision=decision, reason=reason, arg_keys=sorted(arguments),
+                                 duration_ms=int((time.monotonic() - started) * 1000))
+
+            validator = Draft202012Validator(discovery.BY_NAME[name].input_schema)
+            failure = jsonschema_exceptions.best_match(validator.iter_errors(arguments))
+            if failure is not None:
+                discovery_audit("deny", "invalid_arguments")
+                return _error("Invalid discovery arguments: " + failure.message[:300])
+            if name != discovery.CALL_TOOL:
+                data = (discovery.search_tools if name == discovery.SEARCH_TOOLS else discovery.search_connections)(self, who, arguments)
+                payload = json.dumps(self.scrubber.data(data), ensure_ascii=False)
+                if len(payload.encode()) > self.cfg.server.max_result_bytes // 2:
+                    discovery_audit("deny", "result_too_large")
+                    return _error("Discovery result is too large. Narrow the query or use a smaller limit.")
+                discovery_audit("allow", "discovery")
+                return types.CallToolResult(content=[types.TextContent(type="text", text=payload)])
+            choices = discovery.candidates(self, who, arguments)
+            if not choices:
+                discovery_audit("deny", "unknown_tool")
+                raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
+            if len(choices) > 1:
+                valid = []
+                for candidate in choices:
+                    try:
+                        if not set(arguments["arguments"]) & candidate.tool.pin.keys() and candidate.validator.is_valid(arguments["arguments"]):
+                            valid.append(candidate)
+                    except Exception:  # an unresolved local schema reference cannot select a route
+                        continue
+                if len(valid) != 1:
+                    discovery_audit("deny", "ambiguous_variant")
+                    return _error("This connection has multiple permitted parameter variants. Select a variant from gateway_search_connections.")
+                choices = valid
+            background = arguments.get("background", False)
+            route, arguments = choices[0], arguments["arguments"]
+            name = route.tool.name
         peer = ctx.request.client
         record: dict[str, Any] = {
             "client": who.client_id,
@@ -293,7 +296,9 @@ class Gateway:
             raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
 
         try:
-            return await self._call(who, route, effect, arguments, done, background=background)
+            native_tasks = has_dispatch and mcp_tasks.enabled(ctx)
+            return await self._call(who, route, effect, arguments, done, background=background,
+                                    native_task=native_tasks and (effect != "approval_required" or mcp_tasks.url_enabled(ctx)))
         except MCPError:
             raise
         except Exception as exc:  # never let an internal error message reach an agent
@@ -352,7 +357,7 @@ class Gateway:
             }),
         )
 
-    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any, *, background=False) -> types.CallToolResult:
+    async def _call(self, who: Any, route: ToolRoute, effect: str, arguments: dict[str, Any], done: Any, *, background=False, native_task=False) -> types.CallToolResult | dict:
         prepared = self._prepare_call(who.client_id, route, arguments, done)
         if isinstance(prepared, types.CallToolResult):
             return prepared
@@ -361,6 +366,7 @@ class Gateway:
             return await self._run(route, upstream_arguments, done, "ok")
 
         from .approval_dispatch import response
+        from .mcp_tasks import created
         from .passkey import PasskeyApprover, Refused
         client = next(c for c in self.cfg.clients if c.id == who.client_id)
         if effect != "approval_required":
@@ -374,8 +380,10 @@ class Gateway:
                 done("deny", "too_many_queued")
                 return _error("Too many background requests. Watch the existing requests before starting more.")
             done("queued", "background", request_id=job)
+            if native_task and (task := created(self.approver, job)) is not None:
+                return task
             return response({"status": "queued", "request_id": job},
-                            f"Request queued. Call gateway_watch with request_id {job}. Do not resubmit the action.")
+                            f"Request queued. Call gateway_call_tool with only request_id {job}. Do not resubmit the action.")
 
         request = self._approval_request(client, route, final_arguments)
         decision = await self.approver.authorize(request)
@@ -385,11 +393,13 @@ class Gateway:
             # The approver's own wording (where the request waits); it is gateway code, not upstream text.
             if approval:
                 if isinstance(self.approver, PasskeyApprover):
+                    if native_task and (task := created(self.approver, approval)) is not None:
+                        return task
                     status = "pending" if decision.reason in ("pending", "requested") else decision.reason
                     data = {"status": status, "request_id": approval}
                     if status == "pending":
                         data["approval_url"] = self.approver._url(approval)
-                    message = decision.message or f"Action already submitted. Call gateway_watch with request_id {approval}. Do not resubmit the action."
+                    message = decision.message or f"Action already submitted. Call gateway_call_tool with only request_id {approval}. Do not resubmit the action."
                     return response(data, message, error=True)
             return _error(decision.message or NOT_EXECUTED)
         # From here the approval is spent, whatever happens. Tell the approver how it ended.
@@ -505,19 +515,21 @@ def build_app(gateway: Gateway) -> Starlette:
         runtime.gateway.configuration_revision = catalog_revision(synced, lock)
     gateway = runtime.gateway
     cfg = gateway.cfg
-    from .approval_dispatch import ApprovalDispatcher, WATCH, WATCH_TOOL
+    from . import discovery, mcp_tasks
+    from .approval_dispatch import ApprovalDispatcher, WATCH_TOOL
     from .passkey import PasskeyApprover
     dispatcher = ApprovalDispatcher(runtime) if isinstance(gateway.approver, PasskeyApprover) else None
 
     async def list_tools(ctx, params):
         async with runtime.lease() as current:
             result = await current.list_tools(ctx, params)
-            if dispatcher:
-                return types.ListToolsResult(tools=[t for t in result.tools if t.name != WATCH_TOOL] + [WATCH])
+            if dispatcher and current.cfg.server.tool_discovery == "all":
+                return types.ListToolsResult(tools=[*result.tools, discovery.BY_NAME[discovery.CALL_TOOL]])
             return result
 
     async def call_tool(ctx, params):
-        if dispatcher and params.name == WATCH_TOOL:
+        if dispatcher and (params.name == WATCH_TOOL or
+                           (params.name == discovery.CALL_TOOL and "request_id" in (params.arguments or {}))):
             # Watching a request must not hold the runtime lease or block permission changes.
             return await dispatcher.watch(ctx.request, params.arguments or {})
         async with runtime.lease() as current:
@@ -530,6 +542,8 @@ def build_app(gateway: Gateway) -> Starlette:
         # Called before the caller is known, so it must not reveal anything: no schema, no validation.
         get_tool_input_schema=lambda name: None,
     )
+    if dispatcher:
+        mcp_tasks.register(server, dispatcher)
     server.middleware.clear()  # the SDK's default is a telemetry hook; the gateway emits none
 
     hosts = list(cfg.server.allowed_hosts)

@@ -153,7 +153,7 @@ async def test_discovery_updates_without_reloading_and_approvals_bind_connection
         token = (await change(http, 'clients/create', id='discovery-agent', household='household')).json()['token']
         async with agent(origin + '/mcp', token) as client:
             cached_list = await tool_names(client)
-            assert cached_list == CORE | {'gateway_watch'}
+            assert cached_list == CORE
             assert (await search(client, 'tools'))['total'] == (await search(client, 'connections'))['total'] == 0
             for conn in ['notes-a', 'notes-house']:
                 reply = await change(http, 'permissions/connection', client='discovery-agent', connection=conn, access='read_write', approver='person_a')
