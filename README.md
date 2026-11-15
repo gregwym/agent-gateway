@@ -105,8 +105,11 @@ message, including unknown or unattempted outcomes. SMTP acceptance does not pro
 delivery. See [deployment and connector behavior](docs/deployment.md) for limits.
 
 The web console connects remote Streamable HTTP MCP servers using OAuth, Bearer
-or API-key headers, or no authentication. Preview tools, select which to expose,
-and classify each as read or write before assigning Agent permissions. OAuth
+or API-key headers, or no authentication. Search the [MCP Registry](https://registry.modelcontextprotocol.io/)
+from **Add connector** to fill in a published HTTPS endpoint. The Registry verifies
+publisher namespace ownership. Check the publisher and endpoint before authorizing.
+Preview tools, select which to expose, and classify each as read or write before
+assigning Agent permissions. OAuth
 supports server discovery, PKCE, registered clients, dynamic registration and
 client metadata URLs. Tokens stay encrypted and refresh automatically.
 

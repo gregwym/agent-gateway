@@ -13,6 +13,12 @@ const navigationError = document.querySelector('meta[name="gateway-error"]');
 if (navigationError) history.replaceState(null, '', '/admin/');
 if (location.hash) history.replaceState(null, '', location.pathname);
 const messages = {
+  registry_query_invalid: ['Enter a service name between 3 and 100 characters.', '请输入 3 到 100 字符的服务名称。'],
+  registry_cursor_invalid: ['This results page is no longer available. Search again.', '此结果页已无法读取，请重新搜索。'],
+  registry_rate_limited: ['The MCP Registry is limiting requests. Try again shortly or enter the endpoint manually.', 'MCP Registry 正在限制请求，请稍后重试或手动填写接口地址。'],
+  registry_timeout: ['The MCP Registry did not respond in time. Try again or enter the endpoint manually.', 'MCP Registry 响应超时，请重试或手动填写接口地址。'],
+  registry_response_invalid: ['The MCP Registry returned data the gateway could not read. Try again or enter the endpoint manually.', '网关无法读取 MCP Registry 返回的数据，请重试或手动填写接口地址。'],
+  registry_unavailable: ['The gateway could not reach the MCP Registry or the registry returned an error. Try again or enter the endpoint manually.', '网关无法访问 MCP Registry，或目录返回了错误。请重试或手动填写接口地址。'],
   oauth_refresh_busy: ['An OAuth request is still running. Wait for it to finish and revoke again.', 'OAuth 请求仍在执行，请等待结束后再次撤销授权。'],
   oauth_registration_rejected: ['The provider rejected automatic client registration. Use a registered client or check its supported client settings.', '服务商拒绝自动注册客户端，请使用已注册客户端，或检查其支持的客户端配置。'],
   oauth_discovery_failed: ['OAuth metadata is invalid or does not match this MCP resource or issuer. Check the server configuration.', 'OAuth 元数据无效，或与 MCP 资源、issuer 不匹配，请检查服务器配置。'],
@@ -533,6 +539,71 @@ function connections() {
     button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permission rules will be removed.', '该连接器的工具和权限规则将一起移除。'), async () => mutate('connections/remove', {id: conn.id})), 'danger');
   }
 }
+function registryPicker(onSelect) {
+  const box = modal(tr('Search MCP Registry', '搜索 MCP Registry'));
+  const form = el(box, 'form');
+  const query = field(form, tr('Service name', '服务名称'), 'registry_query', '', 'search', tr('Search terms are sent to the public MCP Registry.', '搜索词会发送到公开的 MCP Registry。'));
+  query.required = true;
+  query.minLength = 3;
+  query.maxLength = 100;
+  const suggested = el(box, 'div', undefined, 'actions');
+  const status = el(box, 'p', '', 'muted registry-status');
+  status.setAttribute('role', 'status');
+  const results = el(box, 'ul', undefined, 'registry-results');
+  const paging = el(box, 'div');
+
+  async function search(term, cursor) {
+    if (query.disabled) return;
+    query.disabled = true;
+    submit.disabled = true;
+    try {
+      const data = await api('registry/search', {query: term, cursor});
+      if (!box.open) return;
+      if (!cursor) results.replaceChildren();
+      for (const result of data.results) {
+        const row = el(results, 'li');
+        el(row, 'strong', result.title);
+        if (result.title !== result.name) el(row, 'p', result.name, 'muted');
+        if (result.description) el(row, 'p', result.description);
+        el(row, 'code', result.url, 'url');
+        const actions = el(row, 'div', undefined, 'row');
+        button(actions, tr('Use endpoint', '使用此地址'), () => {
+          onSelect(result);
+          box.close();
+        });
+        if (result.docs) {
+          const docs = el(actions, 'a', tr('Provider setup', '服务商配置说明'));
+          docs.href = result.docs;
+          docs.target = '_blank';
+          docs.rel = 'noopener noreferrer';
+        }
+      }
+      status.textContent = results.children.length ? '' : data.next_cursor
+        ? tr('No compatible endpoints on this page.', '本页没有兼容的接口。')
+        : tr('No HTTPS Streamable HTTP endpoints found. Try another name or enter a URL manually.', '未找到 HTTPS Streamable HTTP 接口。请更换名称或手动填写地址。');
+      paging.replaceChildren();
+      if (data.next_cursor) button(paging, tr('More results', '更多结果'), () => search(term, data.next_cursor), '', tr('Searching…', '搜索中…'));
+    } finally {
+      query.disabled = false;
+      submit.disabled = false;
+    }
+  }
+
+  const submit = button(form, tr('Search', '搜索'), () => {
+    query.value = query.value.trim();
+    if (form.reportValidity()) return search(query.value);
+  }, 'primary', tr('Searching…', '搜索中…'));
+  form.addEventListener('submit', event => { event.preventDefault(); submit.click(); });
+  for (const [label, term] of [['Todoist', 'net.todoist/mcp'], ['Notion', 'com.notion/mcp'], ['Linear', 'app.linear/linear'], ['GitHub', 'io.github.github/github-mcp-server']]) {
+    button(suggested, label, () => {
+      if (query.disabled) return;
+      query.value = term;
+      return search(term);
+    }, '', tr('Searching…', '搜索中…'));
+  }
+  query.focus();
+}
+
 function connectorForm(existing) {
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
@@ -542,6 +613,17 @@ function connectorForm(existing) {
   name.required = true; name.maxLength = 32; name.pattern = '[a-z][a-z0-9_\\-]{0,31}';
   name.title = tr('Start with a lowercase letter; use lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，只用小写字母、数字、下划线或连字符。');
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
+  if (!existing) {
+    button(form, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
+      kind.value = 'remote';
+      fields();
+      settings.url.value = result.url;
+      settings.service.value = result.service;
+      settings.auth.value = result.auth || '';
+      settings.auth.dispatchEvent(new Event('change'));
+      name.focus();
+    }));
+  }
   const dynamic = el(form, 'div'); let settings = {}, credentials = {};
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
@@ -557,7 +639,8 @@ function connectorForm(existing) {
     if (kind.value === 'remote') {
       settings.url = field(dynamic, tr('MCP endpoint URL', 'MCP 接口地址'), 'url', existing?.settings.url || '', 'url'); settings.url.required = true;
       settings.service = field(dynamic, tr('Service ID', '服务标识'), 'service', existing?.settings.service || 'remote-mcp', 'text', tr('Use the same ID for accounts that expose the same service tools.', '同一服务的不同账号使用相同标识。')); settings.service.disabled = !!existing;
-      settings.auth = select(dynamic, tr('Authentication', '认证方式'), 'auth', [['none', tr('None', '无需认证')], ['bearer', 'Bearer token'], ['header', tr('API key header', 'API 密钥 Header')], ['oauth', 'OAuth']], existing?.settings.auth || 'oauth');
+      settings.auth = select(dynamic, tr('Authentication', '认证方式'), 'auth', [['', tr('Choose authentication', '选择认证方式')], ['none', tr('None', '无需认证')], ['bearer', 'Bearer token'], ['header', tr('API key header', 'API 密钥 Header')], ['oauth', 'OAuth']], existing?.settings.auth || 'oauth');
+      settings.auth.required = true;
       const tokenBox = el(dynamic, 'div'), headerBox = el(dynamic, 'div'), oauthBox = el(dynamic, 'div');
       credentials.token = field(tokenBox, tr('Token / API key', 'Token / API 密钥'), 'token', '', 'password', existing ? tr('Blank keeps the saved value only when the endpoint is unchanged.', '接口地址未变时，留空保留原值。') : '');
       settings.header = field(headerBox, tr('Credential header', '凭据 Header'), 'header', existing?.settings.header || 'X-API-Key');

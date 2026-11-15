@@ -13,6 +13,7 @@ import anyio
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
+from . import registry
 from .admin_auth import AdminAuth, COOKIE
 from .admin_config import CATALOG, CONNECTION_ACCESS, ManagedStore, catalog_additions, connection_access, extend_catalog_tools, kind_of, make_connection, member_name, settings_of, tool_access
 from .auth import hash_token, new_token
@@ -571,6 +572,8 @@ class AdminController:
                     response = _json({"ok": True}, 200)
                     response.delete_cookie(cookie_name, path=cookie_path, secure=secure, httponly=True, samesite="strict")
                     return response
+                if operation == "registry/search":
+                    return _json(await registry.search(body), 200)
                 async with self.editing():
                     self.auth.session(token)  # may have expired while waiting for another change
                     result = await self.operate(operation, body, session)
