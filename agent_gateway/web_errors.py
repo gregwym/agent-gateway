@@ -73,6 +73,10 @@ def probe_error(kind, result):
                "connector_network_failed", "connector_internal_error", "smtp_credentials_rejected", "smtp_not_configured",
                "smtp_invalid_security", "smtp_invalid_address", "smtp_tls_failed", "smtp_dns_failed", "smtp_not_supported",
                "smtp_request_rejected", "smtp_unreachable"}
+    if kind == "web":
+        allowed.update({"web_login_required", "web_profile_mismatch", "web_http_rejected",
+                        "web_redirect_refused", "web_unsafe_address", "web_response_limit", "connector_rate_limited",
+                        "web_session_busy", "web_session_storage_failed"})
     code = result.meta.get("agw_error") if isinstance(result.meta, dict) else None
     if isinstance(code, str) and code in allowed:
         return code

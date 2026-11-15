@@ -22,7 +22,7 @@ MODULES = {
 
 
 def bundled_kind(conn):
-    if conn.transport != "stdio" or len(conn.command) != 3 or conn.command[1] != "-m":
+    if conn.plugin or conn.transport != "stdio" or len(conn.command) != 3 or conn.command[1] != "-m":
         return None
     executable = Path(conn.command[0]).name
     if executable not in ("python", "python3") and not executable.startswith("python3."):

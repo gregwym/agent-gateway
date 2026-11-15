@@ -180,6 +180,17 @@ const messages = {
   duplicate_connector: ['This connector name already exists. Choose another name.', '此连接器名称已存在，请使用其他名称。'],
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
+  web_session_busy: ['Another read is in progress. Try again shortly.', '正在读取这个网站，请稍后重试。'],
+  web_session_storage_failed: ['The updated session could not be saved. Check the gateway storage and import a fresh session.', '更新后的会话无法保存。请检查网关存储，再导入新会话。'],
+  web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
+  web_login_required: ['The website needs you to sign in again. Import a fresh session in Edit settings.', '网站需要重新登录。请在「编辑设置」中导入新会话。'],
+  web_profile_mismatch: ['The site did not return the expected page. This profile may need an update.', '网站未返回预期页面，可能需要更新站点配置。'],
+  web_http_rejected: ['The website rejected the read request.', '网站拒绝了读取请求。'],
+  web_redirect_refused: ['The site redirected to an unapproved page. The gateway stopped the request.', '网站跳转到了站点配置之外的页面，网关已停止请求。'],
+  web_unsafe_address: ['The website resolved to a non-public address. The gateway stopped the request.', '网站解析到了非公网地址，网关已停止请求。'],
+  web_response_limit: ['The website exceeded the connector’s response or session size limit.', '网站响应或会话超出了连接器的大小限制。'],
+  local_plugin_unavailable: ['This connector plugin is not installed on the gateway host.', '网关主机未安装这个连接器扩展。'],
+  local_plugin_credential_required: ['Enter the required plugin credentials.', '请填写扩展所需的凭据。'],
   invalid_connector: ['Some connector fields are invalid. Check the form.', '连接器字段无效，请检查表单。'],
   connector_review_required: ['Preview tools to review this new MCP endpoint before saving.', '请先预览并审阅这个新 MCP 地址的工具，再保存。'],
   invalid_imap_server: ['Check the IMAP server name and TLS port (1–65535).', '请检查 IMAP 服务器地址及 TLS 端口（1–65535）。'],
@@ -630,7 +641,7 @@ function settingsTable(parent, key, label, headings, entries, searchText, addRow
   }
   search.addEventListener('input', filter); filter();
 }
-function serviceLabel(conn) { return state.catalog[conn.kind]?.label || tr('Custom connector', '自定义连接器'); }
+function serviceLabel(conn) { return state.plugins?.find(p => p.id === conn.settings?.plugin)?.label || state.catalog[conn.kind]?.label || tr('Custom connector', '自定义连接器'); }
 function connectionRowTitle(row, conn, showMailbox = false) {
   const name = el(row, 'th'); name.scope = 'row';
   el(name, 'strong', conn.id);
@@ -641,7 +652,7 @@ function connectionSearchText(conn) {
   return [conn.id, serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email, ...(conn.mailbox?.aliases || [])].join(' ');
 }
 function connectionStatus(parent, conn) {
-  const remote = conn.kind === 'remote', failed = conn.test?.ok === false;
+  const remote = ['remote', 'local'].includes(conn.kind), failed = conn.test?.ok === false;
   const [label, style] = failed ? [remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败'), 'bad'] :
     conn.oauth?.error ? [tr('Authorization error', '授权异常'), 'bad'] :
     conn.test?.ok ? [remote ? tr('MCP check passed', 'MCP 验证通过') : tr('Read check passed', '读取验证通过'), ''] :
@@ -670,7 +681,7 @@ function connectorDetails(id) {
   function populate() {
     const conn = state?.connections.find(c => c.id === id);
     if (!conn) { box.close(); return; }
-    const remote = conn.kind === 'remote';
+    const remote = ['remote', 'local'].includes(conn.kind);
     content.replaceChildren();
     el(content, 'p', [serviceLabel(conn), nameOf(conn.owner), conn.mailbox?.email].filter(Boolean).join(' · '), 'muted');
     if (conn.kind === 'gmail') el(content, 'p', tr('Gmail access: ', 'Gmail 权限：') + gmailAccessLabels()[conn.settings.gmail_access || 'read'], 'muted');
@@ -700,7 +711,7 @@ function connectorDetails(id) {
       notify(remote ? tr('MCP check passed.', 'MCP 验证通过。') : tr('Read check passed.', '读取验证通过。'));
     }, 'primary', tr('Testing connection…', '正在验证连接…'));
     button(actions, tr('Rename', '改名'), () => renameConnector(conn, box));
-    if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
+    if (remote || conn.kind === 'web') button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
     if (conn.kind === 'gmail' || conn.oauth) {
@@ -900,7 +911,7 @@ function connectorForm(existing, reauthorize = false) {
   const revision = state.revision;
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
-  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = !!existing;
+  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).filter(([key]) => key !== 'local' || existing || state.plugins?.some(p => p.kind !== 'web')).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = !!existing;
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Group: ', '群组共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
@@ -919,6 +930,37 @@ function connectorForm(existing, reauthorize = false) {
     }
     const spec = state.catalog[kind.value];
     const defaults = {host: 'imap.mail.me.com', port: '993', smtp_host: !existing || (existing.settings.host || 'imap.mail.me.com') === 'imap.mail.me.com' ? 'smtp.mail.me.com' : '', smtp_port: '587', smtp_security: 'starttls', url: kind.value === 'caldav' ? 'https://caldav.icloud.com' : '', timezone: 'UTC'};
+    if (['local', 'web'].includes(kind.value)) {
+      const web = kind.value === 'web';
+      const options = (state.plugins || []).filter(p => web === (p.kind === 'web')).map(p =>
+        [p.id, web ? p.label : p.label + ' · ' + (p.kind === 'stdio' ? 'stdio MCP' : 'CLI')]);
+      if (existing && !options.some(([id]) => id === existing.settings.plugin)) options.push([existing.settings.plugin, existing.settings.plugin]);
+      settings.plugin = select(dynamic, web ? tr('Website', '网站') : tr('Installed connector', '已安装的连接器'), 'plugin', options, existing?.settings.plugin || options[0]?.[0]);
+      settings.plugin.disabled = !!existing;
+      const fields = el(dynamic, 'div');
+      const render = () => {
+        fields.replaceChildren(); credentials = {};
+        const plugin = state.plugins.find(p => p.id === settings.plugin.value);
+        if (web) {
+          const site = existing?.website || plugin;
+          const link = el(fields, 'a', tr('Open website to sign in', '打开网站登录'));
+          link.href = site.origin; link.target = '_blank'; link.rel = 'noopener noreferrer';
+          if (site.experimental) el(fields, 'p', tr('Experimental profile; signing in and reading live orders are not yet verified.', '实验性站点配置，尚未验证真实账号登录和订单读取。'), 'hint');
+          const upload = field(fields, tr('Browser session JSON', '浏览器会话 JSON'), 'session_file', '', 'file',
+            existing ? tr('Choose a file only to replace this session.', '需要更换会话时才选择文件。') : tr('Use a cookie export from the signed-in browser.', '请选择登录后从浏览器导出的 Cookie 文件。'));
+          upload.accept = '.json,application/json'; upload.required = !existing;
+          credentials.AGwSessionUpload = upload;
+          return;
+        }
+        const slots = existing?.plugin_credentials || plugin?.credentials || {};
+        for (const [key, label] of Object.entries(slots)) {
+          credentials[key] = field(fields, label, key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
+          credentials[key].required = !existing;
+        }
+      };
+      settings.plugin.addEventListener('change', render); render();
+      return;
+    }
     if (kind.value === 'remote') {
       if (!existing) button(dynamic, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
         settings.url.value = result.url;
@@ -988,6 +1030,7 @@ function connectorForm(existing, reauthorize = false) {
     return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values};
   }
   function needsReview() {
+    if (['local', 'web'].includes(kind.value)) return !existing;
     return ['remote', 'reminders'].includes(kind.value) && (!existing || settings.url.value.trim() !== existing.settings.url);
   }
   function needsOAuth() {
@@ -1010,19 +1053,26 @@ function connectorForm(existing, reauthorize = false) {
     name.value = name.value.trim();
     if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
     if (!form.reportValidity()) return;
-    if (gmailConsent()) {
-      const result = await api('oauth/start', values()); location.assign(result.url); return;
+    const payload = values();
+    const google = gmailConsent(), oauth = needsOAuth(), review = needsReview();
+    if (payload.kind === 'web') {
+      const file = credentials.AGwSessionUpload.files[0];
+      if (file?.size > 60000) throw new Error(tr('The browser session file exceeds 60 KB.', '浏览器会话文件超过 60 KB。'));
+      payload.credentials = file ? {AGW_WEB_SESSION: await file.text()} : {};
     }
-    if (needsOAuth()) {
-      const result = await api('oauth/mcp/start', values()); location.assign(result.url); return;
+    if (google) {
+      const result = await api('oauth/start', payload); location.assign(result.url); return;
     }
-    if (needsReview()) {
-      const result = await api('connections/preview', values());
+    if (oauth) {
+      const result = await api('oauth/mcp/start', payload); location.assign(result.url); return;
+    }
+    if (review) {
+      const result = await api('connections/preview', payload);
       for (const input of Object.values(credentials)) input.value = '';
       showReview(result, box);
       return;
     }
-    await mutate('connections/save', values());
+    await mutate('connections/save', payload);
     box.close(); notify(tr('Connector saved.', '连接器已保存。'));
   }, 'primary', tr('Saving…', '正在保存…'));
   kind.addEventListener('change', fields);
@@ -1041,13 +1091,14 @@ function showReview(result, form) {
   el(review, 'p', tr('Grant Agent access to new tools under Permissions.', '新增工具默认不授权，请在「权限」中配置。'), 'hint');
   if (result.oauth?.issuer) el(review, 'p', tr('Authorization server: ', '授权服务器：') + result.oauth.issuer, 'hint');
   if (result.oauth?.scope) el(review, 'p', tr('Granted scopes: ', '已授权范围：') + result.oauth.scope, 'hint');
-  if (result.remote) el(review, 'p', tr('Confirm each tool’s access. Deselecting a tool or changing it from Read to Write removes its existing grants.', '请核对工具类型。取消选择工具或将其从读取改为写入，会撤销已有授权。'), 'hint');
+  if (result.remote && !result.fixed_access) el(review, 'p', tr('Confirm each tool’s access. Deselecting a tool or changing it from Read to Write removes its existing grants.', '请核对工具类型。取消选择工具或将其从读取改为写入，会撤销已有授权。'), 'hint');
   const selections = [];
   for (const definition of result.definitions) {
     const row = el(review, 'div', undefined, 'row');
     if (result.remote) {
       const included = checkbox(row, definition.name); included.checked = true;
       const access = select(row, tr('Operation type: ', '操作类型：') + definition.name, 'access_' + selections.length, [['write', tr('Write', '写入')], ['read', tr('Read', '读取')]], result.tools.find(t => t.upstream === definition.name)?.access || 'write');
+      access.disabled = Boolean(result.fixed_access);
       selections.push({upstream: definition.name, included, access});
     } else el(row, 'strong', definition.name);
     const detail = el(review, 'details'); el(detail, 'summary', tr('Definition', '工具定义')); el(detail, 'pre', JSON.stringify(definition, null, 2));

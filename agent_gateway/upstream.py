@@ -56,12 +56,20 @@ def http_client(**kwargs):
 
 
 @asynccontextmanager
-async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None) -> AsyncIterator[Client]:
+async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None, web_sessions=None) -> AsyncIterator[Client]:
     """Connect to one upstream, handing it its own credentials and nothing else."""
     if conn.oauth_ref and oauth is None and auth is None:
         from .passkey import Refused
         raise Refused("oauth_reauthorization_required", 401)
-    if conn.transport == "stdio":
+    from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+    if conn.plugin and PROFILE_ENV in conn.env:
+        from .connectors._base import build_server
+        from .connectors.web import SiteSession
+        web = (web_sessions.get(conn, secrets) if web_sessions else
+               SiteSession(WebProfile.model_validate_json(conn.env[PROFILE_ENV]), secrets[conn.secret_env[SESSION_ENV]]))
+        async with _client(conn, build_server(conn.service, web.tools())) as client:
+            yield client
+    elif conn.transport == "stdio":
         # The SDK starts the child with a minimal environment (HOME, PATH, ...) plus
         # what is passed here; the gateway's own environment is not inherited.
         env = dict(conn.env)
@@ -122,8 +130,9 @@ async def list_all_tools(client: Client) -> list[types.Tool]:
 
 
 class Upstream:
-    def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit, oauth=None) -> None:
+    def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit, oauth=None, web_sessions=None) -> None:
         self.oauth = oauth
+        self.web_sessions = web_sessions
         self.conn = conn
         self._secrets = secrets
         self._lock = lock
@@ -142,7 +151,7 @@ class Upstream:
         while True:
             self._connecting = True
             try:
-                async with open_client(self.conn, self._secrets, self.oauth) as client:
+                async with open_client(self.conn, self._secrets, self.oauth, web_sessions=self.web_sessions) as client:
                     with anyio.fail_after(_CONNECT_TIMEOUT):
                         await self._verify(client)
                     self._client = client

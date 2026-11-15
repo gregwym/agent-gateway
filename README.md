@@ -125,9 +125,14 @@ which tools to expose and classify them before granting Agent access. Remote
 connections support OAuth, Bearer or API-key headers, and unauthenticated
 endpoints. OAuth tokens stay encrypted and refresh automatically.
 
-Custom stdio commands remain host-configured. Gateway-client OAuth and an external
-approval-service adapter are not implemented. See the [product requirements](docs/requirements.md)
-and [remote connection setup](docs/deployment.md#remote-mcp).
+Host-installed [connector manifests](docs/deployment.md#connector-plugins)
+add stdio MCP servers, fixed CLI operations, and read-only website profiles.
+Website connections keep browser cookies per account and do not expose them to
+agents. Amazon US and Weee! profiles are experimental; authenticated reads have
+only been tested against simulated sites.
+
+See [product requirements](docs/requirements.md) and
+[remote connection setup](docs/deployment.md#remote-mcp).
 
 ## Quick start
 

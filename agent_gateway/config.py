@@ -142,6 +142,7 @@ class AdminCfg(_Model):
 
     owner: str = Field(pattern=NAME)
     state: Path
+    plugins_dir: Path | None = None
     session_seconds: int = Field(1800, ge=60, le=3600)
 
 
@@ -193,6 +194,7 @@ class ConnectionCfg(_Model):
     mailbox_email: str | None = None
     mailbox_aliases: list[str] = Field(default_factory=list, max_length=50)
     mailbox_access: dict[str, list[str]] = Field(default_factory=dict, max_length=100)
+    plugin: str | None = Field(None, pattern=NAME)
     transport: Literal["stdio", "http"]
 
     # stdio
@@ -223,6 +225,13 @@ class ConnectionCfg(_Model):
     @model_validator(mode="after")
     def _check(self) -> ConnectionCfg:
         where = f"connection {self.id}"
+        if self.plugin and self.transport != "stdio":
+            raise ValueError(f"{where}: local plugins require stdio")
+        if self.plugin and "AGW_WEB_PROFILE" in self.env:
+            from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+            WebProfile.model_validate_json(self.env[PROFILE_ENV])
+            if set(self.secret_env) != {SESSION_ENV} or any(t.access != "read" for t in self.tools):
+                raise ValueError(f"{where}: Website connections require one browser session and read-only tools")
         if self.mailbox_access:
             from .catalog_sync import bundled_kind
             if bundled_kind(self) not in ("imap", "gmail"):
@@ -480,5 +489,8 @@ def load_config(path: str | Path) -> Config:
     if cfg.approvals:
         updates["approvals"] = cfg.approvals.model_copy(update={"store": located(cfg.approvals.store)})
     if cfg.admin:
-        updates["admin"] = cfg.admin.model_copy(update={"state": located(cfg.admin.state)})
+        updates["admin"] = cfg.admin.model_copy(update={
+            "state": located(cfg.admin.state),
+            "plugins_dir": located(cfg.admin.plugins_dir) if cfg.admin.plugins_dir else base / "plugins",
+        })
     return cfg.model_copy(update=updates)

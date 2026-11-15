@@ -95,13 +95,16 @@ def apply_selection(draft, body):
         raise Refused("remote_tool_selection_required", 400)
     raw = draft["state"]["config"]
     conn = next(c for c in raw["connections"] if c["id"] == draft["connection"])
+    from .plugins import MANIFEST_ENV
+    from .web_profiles import PROFILE_ENV
+    fixed = bool({MANIFEST_ENV, PROFILE_ENV} & conn.get("env", {}).keys()) and conn.get("plugin")
     available = {t["upstream"]: t for t in conn["tools"]}
     chosen, names, revoke = [], set(), set()
     for item in selection:
         if not isinstance(item, dict) or set(item) != {"upstream", "access"} or not isinstance(item.get("upstream"), str):
             raise Refused("invalid_remote_tool_selection", 400)
         tool = available.get(item["upstream"])
-        if tool is None or item["upstream"] in names or item["access"] not in ("read", "write"):
+        if tool is None or item["upstream"] in names or item["access"] not in ("read", "write") or (fixed and item["access"] != tool["access"]):
             raise Refused("invalid_remote_tool_selection", 400)
         names.add(item["upstream"])
         if tool.get("access") == "read" and item["access"] == "write":

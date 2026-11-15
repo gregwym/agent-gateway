@@ -175,6 +175,7 @@ class Gateway:
         audit: Audit,
         approver: Approver | None = None,
         oauth=None,
+        web_sessions=None,
     ) -> None:
         self.cfg = cfg
         self.lock = lock
@@ -189,7 +190,7 @@ class Gateway:
         self.routes: dict[str, ToolRoute] = {}
         for conn in cfg.connections:
             own = {name: secrets[name] for name in conn.secret_names()}
-            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth)
+            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions)
             for tool in conn.tools:
                 self.routes[tool.name] = build_route(conn, tool, lock.get(conn.id, tool.upstream))
 

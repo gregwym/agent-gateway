@@ -24,8 +24,10 @@ from .catalog_sync import bundled_kind
 from .config import NAME, ToolCfg, is_mail_send, valid_mailbox_paths
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
+from .plugins import MANIFEST_ENV, connector_plugins
 from .upstream import list_all_tools, open_client
 from .web_errors import connector_failure, failure_response, probe_error
+from .web_profiles import PROFILE_ENV, WebProfile
 
 
 def needs_admin_confirmation(operation, body):
@@ -53,6 +55,8 @@ class AdminController:
         from .oauth import OAuthVault
         from .admin_mcp_oauth import MCPConsent
         self.oauth = OAuthVault(self.store.base)
+        from .web_sessions import WebSessions
+        self.web_sessions = WebSessions(self.store.base)
         self.mcp_oauth = MCPConsent(self)
         from .admin_oauth import GoogleConsent
         self.google = GoogleConsent(self)
@@ -63,7 +67,7 @@ class AdminController:
     def _gateway(self, state):
         from .server import Gateway
         cfg, lock, values = self.store.effective(state)
-        result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver, self.oauth)
+        result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver, self.oauth, self.web_sessions)
         from .catalog_sync import catalog_revision
         result.configuration_revision = "web:" + str(state["revision"]) + ":" + catalog_revision(cfg, lock)
         return result
@@ -79,11 +83,18 @@ class AdminController:
                     self.oauth.prune({c.oauth_ref for c in self.runtime.gateway.cfg.connections if c.oauth_ref})
                 except Exception:
                     self.runtime.gateway.audit.write("oauth_cleanup_failed", reason="storage_unavailable")
+                self.prune_web_sessions(self.runtime.gateway)
                 pending = {f["ref"] for f in self.mcp_oauth.flows.values()} | {d.get("oauth_ref") for d in self.drafts.values()}
                 for ref, record in list(self.oauth.records.items()):
                     if ref not in self.oauth.persisted and ref not in pending and record["created"] + 600 <= now:
                         self.oauth.discard(ref)
                 self.google.flows = {k: v for k, v in self.google.flows.items() if v["expires"] > now}
+
+    def prune_web_sessions(self, gateway):
+        try:
+            self.web_sessions.prune(gateway.cfg, gateway.secrets)
+        except Exception:
+            gateway.audit.write("web_session_cleanup_failed", reason="storage_unavailable")
 
     @asynccontextmanager
     async def editing(self):
@@ -146,6 +157,7 @@ class AdminController:
             await self.runtime.replace(gateway, persist)
         except TimeoutError:
             raise Refused("active_calls_busy", 409) from None
+        self.prune_web_sessions(gateway)
         self.tests.clear()
         gateway.audit.write("admin_updated", principal=self.auth.owner, detail=action,
                             revision=state["revision"])
@@ -155,6 +167,7 @@ class AdminController:
         from .admin_oauth import saved_gmail_client
         gw = self.runtime.gateway
         keys = self.auth.approver.passkeys()
+        plugins = connector_plugins(self.store.base.admin.plugins_dir)
         connections = []
         for conn in gw.cfg.connections:
             tools = []
@@ -169,6 +182,11 @@ class AdminController:
                                 "approver": conn.approver or conn.owner,
                                 "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
                                 "settings": self.connection_settings(conn), "tools": tools,
+                                "website": self.website(conn),
+                                "plugin_credentials": {
+                                    key: plugins[conn.plugin].credential_slots().get(key, key) if conn.plugin in plugins else key
+                                    for key in conn.secret_env
+                                } if conn.plugin else {},
                                 "mailbox_access": conn.mailbox_access if bundled_kind(conn) in ("imap", "gmail") else None,
                                 "mailbox": mailbox_metadata(conn),
                                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None,
@@ -188,7 +206,10 @@ class AdminController:
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
                 "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
-                "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()}}
+                "plugins": [plugin.public() for plugin in plugins.values()],
+                "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()
+                            if k != "local" or any(p.kind != "web" for p in plugins.values())
+                            or any(kind_of(c) == "local" for c in gw.cfg.connections)}}
 
     @staticmethod
     def stage_connection(state, cfg, conn, added):
@@ -253,9 +274,17 @@ class AdminController:
     def preview_result(self, state, conn, added, definitions, session):
         from .admin_remote import remote_tools
         cfg, _, _ = self.store.effective(state)
-        remote = kind_of(conn) == "remote"
+        kind = kind_of(conn)
+        remote = kind in ("remote", "local", "web")
+        cli = kind == "local" and MANIFEST_ENV in conn.env
         if remote:
             conn = remote_tools(conn, definitions, cfg)
+            if kind == "web":
+                conn = conn.model_copy(update={"tools": [t.model_copy(update={"access": "read"}) for t in conn.tools]})
+            elif cli:
+                conn = conn.model_copy(update={"tools": [
+                    t.model_copy(update={"access": "read" if definitions[t.upstream].get("annotations", {}).get("readOnlyHint") else "write"})
+                    for t in conn.tools]})
         elif any(tool.upstream not in definitions for tool in conn.tools):
             raise Refused("missing_upstream_tool", 422)
         if not conn.tools:
@@ -280,7 +309,7 @@ class AdminController:
         # Definitions can echo credentials. Scrub prior to displaying them too.
         scrubber = self._gateway(state).scrubber
         return {"draft": draft, "connection": conn.id, "definitions": scrubber.data(list({t.upstream: definitions[t.upstream] for t in conn.tools}.values())),
-                "owner": conn.owner, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote,
+                "owner": conn.owner, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote, "fixed_access": kind == "web" or cli, "read_only": kind == "web",
                 "tools": [{"upstream": t.upstream, "access": tool_access(conn, t)} for t in conn.tools],
                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None}
 
@@ -295,6 +324,13 @@ class AdminController:
         if previous and conn.url == previous.url:
             return await self.save_connection(state, cfg, conn, added, previous)
         return self.preview_result(state, conn, added, flow["definitions"], session)
+
+    @staticmethod
+    def website(conn):
+        if kind_of(conn) != "web":
+            return None
+        spec = WebProfile.model_validate_json(conn.env[PROFILE_ENV])
+        return {"origin": spec.origin, "experimental": spec.experimental}
 
     def connection_settings(self, conn):
         settings = settings_of(conn)
@@ -383,11 +419,14 @@ class AdminController:
             if not conn or kind_of(conn) not in CATALOG:
                 raise Refused("unsupported_connector", 400)
             probe, arguments = CATALOG[kind_of(conn)]["probe"]
+            if kind_of(conn) == "web":
+                probe = WebProfile.model_validate_json(conn.env[PROFILE_ENV]).probe
             values = self.runtime.gateway.secrets
             problem = None
             try:
                 with anyio.fail_after(35):
-                    async with open_client(conn, {n: values[n] for n in conn.secret_names()}, self.oauth) as client:
+                    async with open_client(conn, {n: values[n] for n in conn.secret_names()}, self.oauth,
+                                           web_sessions=self.web_sessions if kind_of(conn) == "web" else None) as client:
                         live = {t.name: definition_of(t) for t in await list_all_tools(client)}
                         if any(self.runtime.gateway.lock.get(conn.id, tool.upstream) is None or
                                digest_of(live.get(tool.upstream, {})) != self.runtime.gateway.lock.get(conn.id, tool.upstream)["sha256"]
@@ -580,7 +619,8 @@ class AdminController:
                     raise Refused("unsupported_connector", 400)
                 conn, added = extend_catalog_tools(previous, cfg), {}
             else:
-                conn, added = make_connection(body, cfg, values, gmail_email=gmail_email)
+                plugins = connector_plugins(self.store.base.admin.plugins_dir) if body.get("kind") in ("local", "web") else None
+                conn, added = make_connection(body, cfg, values, gmail_email=gmail_email, plugins=plugins)
             if len(raw["connections"]) >= 50 and not any(c["id"] == conn.id for c in raw["connections"]):
                 raise Refused("connector_limit", 400)
             if kind_of(conn) == "remote" and body.get("settings", {}).get("auth") == "oauth":

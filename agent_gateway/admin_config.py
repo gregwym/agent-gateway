@@ -30,9 +30,12 @@ CONNECTION_ACCESS = {
 }
 CONNECTOR_NAME = r"[a-z][a-z0-9_-]{0,31}"
 from .admin_remote import SPEC, make_remote
+from .plugins import SPEC as LOCAL_SPEC
+from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
 
 CATALOG = {
     "remote": SPEC,
+    "web": {**LOCAL_SPEC, "label": "Website / 网站"},
     "imap": {"label": "Mail / 邮箱 (IMAP + SMTP)",
              "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender",
                         "mailbox_email", "mailbox_aliases"], "secrets": ["password"],
@@ -52,6 +55,7 @@ CATALOG = {
     "reminders": {"label": "Reminders Mac helper / 提醒事项 Mac 辅助服务", "fields": ["url"], "secrets": ["token"],
                   "tools": [("reminders_lists", "lists"), ("reminders_list", "list"), ("reminders_get", "get")],
                   "probe": ("reminders_lists", {})},
+    "local": LOCAL_SPEC,
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
              "probe": ("list_notes", {"folder": "inbox"})},
@@ -182,6 +186,8 @@ class ManagedStore:
 
 
 def kind_of(conn):
+    if conn.plugin:
+        return "web" if PROFILE_ENV in conn.env else "local"
     if conn.transport == "http" and conn.service == "reminders":
         return "reminders"
     if conn.transport == "http":
@@ -201,6 +207,8 @@ def settings_of(conn):
              "CALDAV_USERNAME": "username", "CALDAV_URL": "url", "CALDAV_TIMEZONE": "timezone",
              "GMAIL_CLIENT_ID": "client_id", "GMAIL_ACCESS": "gmail_access"}
     result = {names[key]: value for key, value in conn.env.items() if key in names}
+    if conn.plugin:
+        return {"plugin": conn.plugin}
     if kind_of(conn) == "imap":
         result.update(mailbox_email=conn.mailbox_email or "", mailbox_aliases="\n".join(conn.mailbox_aliases))
     if conn.transport == "http":
@@ -286,7 +294,7 @@ def connection_access(policy, client, conn):
     return "custom"
 
 
-def make_connection(body, cfg, values, *, gmail_email=None):
+def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
     if set(body) - {"kind", "id", "owner", "settings", "credentials", "revision"}:
         raise Refused("invalid_connector", 400)
     kind, name, owner = body.get("kind"), body.get("id"), body.get("owner")
@@ -297,13 +305,30 @@ def make_connection(body, cfg, values, *, gmail_email=None):
     if owner not in cfg.principals:
         raise Refused("unknown_member", 400)
     settings, provided = body.get("settings", {}), body.get("credentials", {})
-    if (not isinstance(settings, dict) or not isinstance(provided, dict)
-            or set(settings) - set(CATALOG[kind]["fields"]) or set(provided) - set(CATALOG[kind]["secrets"])
-            or any(not isinstance(v, str) or len(v) > 16000 for v in [*settings.values(), *provided.values()])):
-        raise Refused("invalid_connector", 400)
     previous = next((c for c in cfg.connections if c.id == name), None)
     if previous and (kind_of(previous) != kind or previous.owner != owner):
         raise Refused("connector_identity_is_fixed", 409)
+    plugin = None
+    allowed_secrets = CATALOG[kind]["secrets"]
+    if kind in ("local", "web"):
+        plugin_id = settings.get("plugin") if isinstance(settings, dict) else None
+        if not isinstance(plugin_id, str):
+            raise Refused("local_plugin_unavailable", 400)
+        if previous:
+            if previous.plugin != plugin_id:
+                raise Refused("connector_identity_is_fixed", 409)
+            allowed_secrets = previous.secret_env
+        else:
+            plugin = (plugins or {}).get(plugin_id)
+            if plugin is None or (kind == "web") != (plugin.kind == "web"):
+                raise Refused("local_plugin_unavailable", 400)
+            allowed_secrets = plugin.credential_slots()
+    if (not isinstance(settings, dict) or not isinstance(provided, dict)
+            or set(settings) - set(CATALOG[kind]["fields"]) or set(provided) - set(allowed_secrets)
+            or any(not isinstance(v, str) or len(v) > 16000 for v in settings.values())
+            or any(not isinstance(v, str) or len(v) > (60_000 if kind == "web" and k == SESSION_ENV else 16000)
+                   for k, v in provided.items())):
+        raise Refused("invalid_connector", 400)
     # The public ID can change. Keep the account and credentials bound to the
     # original connector, even if the old ID is used to create another one.
     accounts = {c.account for c in cfg.connections}
@@ -343,6 +368,27 @@ def make_connection(body, cfg, values, *, gmail_email=None):
         secret_name = credential_ref(key, old_name)
         fresh[secret_name] = value
         return secret_name
+
+    if kind in ("local", "web"):
+        if kind == "web" and provided.get(SESSION_ENV):
+            from .connectors.web import import_session
+            profile = (WebProfile.model_validate_json(previous.env[PROFILE_ENV]) if previous
+                       else WebProfile.model_validate(plugin.web))
+            try:
+                provided = {SESSION_ENV: import_session(provided[SESSION_ENV], profile)}
+            except (ValueError, RecursionError):
+                raise Refused("web_session_invalid", 400) from None
+        refs = {}
+        for env_name in allowed_secrets:
+            if not provided.get(env_name) and (not previous or not values.get(previous.secret_env.get(env_name))):
+                raise Refused("local_plugin_credential_required", 400)
+            refs[env_name] = secret(env_name, env_name)
+        if previous:
+            return previous.model_copy(update={"secret_env": refs}), fresh
+        command, env = plugin.connection()
+        return ConnectionCfg(id=name, service=plugin.id, account=account, owner=owner, plugin=plugin.id,
+                             transport="stdio", command=command, env=env, secret_env=refs,
+                             max_concurrency=1, timeout_seconds=60, tools=[]), fresh
 
     service = {"demo": "notes", "imap": "imap-mail", "caldav": "caldav-calendar"}.get(kind, kind)
     raw = {"id": name, "service": previous.service if previous else service,

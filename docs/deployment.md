@@ -460,7 +460,7 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 「撤销授权」立即清除本地 Token，再尝试服务商的撤销接口；界面区分服务商已确认、未支持或未确认的结果。
 删除连接会删除网关保存的授权；如需在服务商侧撤销，请先使用「撤销授权」或其账号管理页面。
 
-网页新增凭据和配置保存在 `admin.enc`，主密钥、原有 YAML/lock/secret 挂载继续只读。备份需包含 `admin.enc`、存在时的 `admin.enc.oauth` 和
+网页新增凭据和配置保存在 `admin.enc`，主密钥、原有 YAML/lock/secret 挂载继续只读。备份需包含 `admin.enc`、存在时的 `admin.enc.oauth`、`admin.enc.web-sessions` 和
 `approvals.sqlite`，主密钥单独保存。第一次网页保存后，五个账号配置段由加密状态覆盖 YAML；主机设置仍来自 YAML。
 网页不支持任意命令/自定义连接器部署。停用 `admin` 会停用这些覆盖，迁回 YAML 前需由部署者整理出有效配置。
 
@@ -469,6 +469,72 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 接入或权限配置变更会等待正在执行的调用结束，最多 30 秒；这类修改会使旧审批失效。
 最后一个管理员 Passkey 不能从网页删除；所有设备都丢失时，由主机管理员用 `agw approval enroll <admin.owner>`
 生成恢复注册链接，再从网页撤销丢失的 Passkey。
+
+<a id="connector-plugins"></a>
+
+### 连接器扩展
+
+主机管理员在 Gateway 配置文件旁的 `plugins/` 放置 JSON 清单（可通过 `admin.plugins_dir` 改路径）。
+文件名为 `<id>.json`，`version` 默认为 1。打开或刷新「连接器 → 添加连接器」，从「本地连接器」或「网站」
+选择扩展，填写凭据，审阅工具，再在「权限」里授权。安装新清单无需重启。已保存连接保留其创建时的清单；
+更新或移除清单不会悄悄改变现有连接，可新增连接来评估新版本，再移除旧连接。
+
+stdio MCP 示例：
+
+```json
+{
+  "id": "inventory-mcp",
+  "label": "Inventory MCP",
+  "kind": "stdio",
+  "command": ["/opt/connectors/inventory-mcp", "--stdio"],
+  "credentials": {"INVENTORY_TOKEN": "Inventory token"}
+}
+```
+
+有 CLI、没有 MCP 的服务，可定义固定操作：
+
+```json
+{
+  "id": "inventory-cli",
+  "label": "Inventory CLI",
+  "kind": "cli",
+  "command": ["/opt/connectors/inventory"],
+  "tools": {
+    "list_items": {
+      "description": "List inventory items in a warehouse.",
+      "argv": ["list"],
+      "access": "read",
+      "output": "json",
+      "options": {"warehouse": {"flag": "--warehouse", "type": "string", "required": true}}
+    }
+  }
+}
+```
+
+在容器部署中，程序需位于容器内的绝对路径；用派生镜像安装，或配合只读挂载。仅安装信任的代码。
+避免给 CLI 工具开放可执行脚本、任意文件路径或重新配置程序的选项。网页管理员不能提交命令；CLI 参数
+按清单传递，网关不调用 Shell。CLI 预览只检查工具定义。stdio 预览会启动 MCP 程序并列出工具。
+
+### 网站会话
+
+在「连接器 → 添加连接器 → 网站」选择站点。用自己的浏览器登录，导入该站 Cookie 的 JSON 文件，应用后点
+「验证连接」。格式为浏览器导出的 Cookie 数组或 Playwright 的 `storageState`；其他站点 Cookie 与浏览器存储不会采用。
+如果浏览器没有导出能力，可在自己的电脑上安装 Playwright Chromium，用
+`python -m examples.export_web_session amazon-us ./browser-session.json`（Weee 用 `weee-orders`），
+在打开的独立窗口登录再导出。上传后删除本地文件。
+
+每个连接只会向站点配置的 HTTPS 来源发送会话，HTTPS 请求使用验证过的公网地址，不跟随跳转。
+更新的 Cookie 加密保存，重启后会复用。会话过期时在「编辑设置」导入新的会话。
+凭据需备份 `admin.enc` 和存在时的 `admin.enc.web-sessions`；删除连接会删除 Gateway 保存的会话，
+在站点撤销会话需使用服务商自己的账户设置。
+
+Amazon US 和 Weee! 为实验配置。模拟验收覆盖账号隔离、限定读取和会话轮换。实际站点可能要求浏览器
+脚本、验证或新的页面结构；此时会显示错误，不能用模拟验收代替实站验证。
+
+可用 `kind: "web"` 的扩展增加任意**已知读取操作**的站点：清单的 `web` 字段声明 `origin`、`probe` 和 `actions`。
+每个操作指定 `path`、`description`、可选 `query` 和 `parameters`（工具参数名映射到查询参数名）。
+HTML 操作需声明 `expect`（预期页面标记），返回剥除脚本及隐藏字段后的文字；JSON 操作指定 `format: "json"`
+和允许返回的顶层 `json_fields`。站点发布者负责验证路径只读；浏览器会话在站点上仍可能有写权限。
 
 ## 9. 日常操作
 
