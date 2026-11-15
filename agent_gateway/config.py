@@ -40,6 +40,7 @@ class ServerCfg(_Model):
     # Accepted Host header values ("gateway.example.ts.net:8080"). Empty disables the check.
     allowed_hosts: list[str] = []
     max_result_bytes: int = Field(1_000_000, ge=1_000)
+    tool_discovery: Literal["search", "all"] = "search"
 
 
 class AuditCfg(_Model):

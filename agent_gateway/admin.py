@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import time
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 import anyio
@@ -41,7 +42,8 @@ class AdminController:
         from .server import Gateway
         cfg, lock, values = self.store.effective(state)
         result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver)
-        result.configuration_revision = "web:" + str(state["revision"])
+        from .catalog_sync import catalog_revision
+        result.configuration_revision = "web:" + str(state["revision"]) + ":" + catalog_revision(cfg, lock)
         return result
 
     async def sweep(self):
@@ -50,6 +52,18 @@ class AdminController:
             now = time.time()
             self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > now}
             self.google.flows = {k: v for k, v in self.google.flows.items() if v["expires"] > now}
+
+    @asynccontextmanager
+    async def editing(self):
+        try:
+            with anyio.fail_after(5):
+                await self.mutex.acquire()
+        except TimeoutError:
+            raise Refused("admin_busy", 409) from None
+        try:
+            yield
+        finally:
+            self.mutex.release()
 
     def _revision(self, body):
         if type(body.get("revision")) is not int or body["revision"] != self.store.state["revision"]:
@@ -63,6 +77,7 @@ class AdminController:
             for member in state["config"][kind]:
                 member["name"] = names.get(member["id"], member["name"])
         state["revision"] = self.store.state["revision"] + 1
+        state, catalog_updates = self.store.reconcile(state)
         gateway = self._gateway(state)
         for route in gateway.routes.values():
             if route.problem:
@@ -73,6 +88,7 @@ class AdminController:
 
         def persist():
             self.store.save(state)
+            self.store.catalog_updates = catalog_updates
             # Revision-bound approvals are unusable immediately after publication,
             # including a crash between the atomic state write and this cleanup.
             with self.auth.approver._db() as db:
@@ -103,6 +119,7 @@ class AdminController:
                                 "approver": conn.approver or conn.owner,
                                 "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
                                 "settings": settings_of(conn), "tools": tools,
+                                "catalog_sync": self.store.catalog_updates.get(conn.id),
                                 "available_tools": [{**t, "access": tool_access(conn, ToolCfg.model_validate(t))} for t in catalog_additions(conn)],
                                 "connected": gw.upstreams[conn.id]._client is not None,
                                 "test": self.tests.get(conn.id)})
@@ -429,7 +446,7 @@ class AdminController:
                             return _json({"initialized": self.auth.initialized(), "authenticated": False}, 200)
                     self.auth.session(token)
                     if operation == "state":
-                        async with self.mutex:
+                        async with self.editing():
                             self.auth.session(token)
                             return _json(self.state(), 200)
                     raise Refused("not_found", 404)
@@ -463,7 +480,7 @@ class AdminController:
                     response = _json({"ok": True}, 200)
                     response.delete_cookie(cookie_name, path=cookie_path, secure=secure, httponly=True, samesite="strict")
                     return response
-                async with self.mutex:
+                async with self.editing():
                     self.auth.session(token)  # may have expired while waiting for another change
                     result = await self.operate(operation, body, session)
                 return _json(result, 200)

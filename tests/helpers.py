@@ -62,6 +62,7 @@ def notes_connection(conn_id: str, owner: str, secret: str, tools: list[dict[str
 def base_config() -> dict[str, Any]:
     """Two people and a household account; one notes connector per account."""
     return {
+        "server": {"tool_discovery": "all"},  # compatibility tests; discovery has separate real-MCP coverage
         "audit": {"path": "audit/audit.jsonl", "retention_days": 30},
         "secrets": {"path": "secrets.enc", "key_file": "master.key"},
         "principals": ["person_a", "person_b", "household"],

@@ -1,4 +1,4 @@
-"""An old four-tool mail connection upgrades directly from its permission card."""
+"""An old four-tool mail connection gains capability controls automatically."""
 import sys
 
 import pytest
@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.anyio, pytest.mark.browser]
 
 
 @pytest.mark.parametrize('locale', ['en-US', 'zh-CN'])
-async def test_legacy_mail_card_explains_and_reviews_new_write_tools(tmp_path, locale):
+async def test_legacy_mail_gains_write_controls_without_a_review_or_data_edit(tmp_path, locale):
     def t(en, zh):
         return zh if locale == 'zh-CN' else en
     port = free_port()
@@ -31,17 +31,11 @@ async def test_legacy_mail_card_explains_and_reviews_new_write_tools(tmp_path, l
     async with admin_page(tmp_path, locale, path=path, port=port) as (page, origin):
         await page.get_by_role('button', name=t('Permissions', '权限'), exact=True).click()
         card = page.locator('.permission-card[data-connection=mail]')
-        await playwright.expect(card).to_contain_text(t('older tool list', '仍使用旧工具列表'))
+        await playwright.expect(card).to_contain_text(t('registered automatically', '自动登记'))
         await playwright.expect(card).not_to_contain_text(t('only provides read operations', '不支持写入'))
-        assert await card.locator('select[name=connection_access] option[value=read_write]').count() == 0
+        assert await card.locator('select[name=connection_access] option[value=read_write]').count() == 1
         before = (await rpc(origin, TOKEN_A)).json()['result']['tools']
-        await card.get_by_role('button', name=t('Review new tools', '审阅新工具'), exact=True).click()
-        review = page.get_by_role('dialog')
-        await playwright.expect(review.get_by_role('heading', name='send_message', exact=True)).to_have_count(1)
-        assert (await rpc(origin, TOKEN_A)).json()['result']['tools'] == before
-        await review.get_by_role('checkbox', name=t('I reviewed these definitions and permissions.', '我已审阅这些工具定义和权限。'), exact=True).check()
-        await review.get_by_role('button', name=t('Apply connector', '应用连接器'), exact=True).click()
-        await playwright.expect(review).to_have_count(0)
+        assert {tool['name'] for tool in before if tool['name'].startswith('mail_')} == {'mail_' + n for n in old}
         await playwright.expect(card.get_by_role('button', name=t('Review new tools', '审阅新工具'), exact=True)).to_have_count(0)
         assert await card.locator('select[name=connection_access] option[value=read_write]').count() == 1
         assert (await rpc(origin, TOKEN_A)).json()['result']['tools'] == before

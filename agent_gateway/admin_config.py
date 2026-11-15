@@ -67,7 +67,19 @@ class ManagedStore:
             self.state = json.loads(self.file.get("state"))
         # Fail closed on a malformed/corrupt state file, including tool locks.
         self.effective(self.state)
-        self.state = self.upgrade(self.state)
+        self.state, self.catalog_updates = self.reconcile(self.upgrade(self.state))
+
+    def reconcile(self, state):
+        from .catalog_sync import sync_catalog
+        cfg, lock, _ = self.effective(state)
+        cfg, lock, metadata, reports = sync_catalog(cfg, lock, state.get("bundled_catalog", {}))
+        result = copy.deepcopy(state)
+        result["config"] = {key: cfg.model_dump(mode="json")[key] for key in SECTIONS}
+        for conn_id, report in reports.items():
+            if report["automatic"]:
+                result["locks"][conn_id] = lock.entries.get(conn_id, {})
+        result["bundled_catalog"] = metadata
+        return result, reports
 
     def upgrade(self, state):
         """Normalize legacy web state without changing any existing Agent's grants.

@@ -56,7 +56,19 @@ class Runtime:
                     with anyio.fail_after(30):
                         while self.active:
                             await self.condition.wait()
+                    reuse = (gateway.secrets == self.gateway.secrets and gateway.lock.entries == self.gateway.lock.entries
+                             and set(gateway.upstreams) == set(self.gateway.upstreams)
+                             and all(gateway.upstreams[key].conn.model_dump(exclude={'approver'}) ==
+                                     self.gateway.upstreams[key].conn.model_dump(exclude={'approver'})
+                                     for key in gateway.upstreams))
                     commit()
+                    if reuse:
+                        # Permission/token/approver changes do not change the
+                        # upstream account, definitions or transport. Keep its
+                        # process and pagination snapshots alive.
+                        gateway.upstreams = self.gateway.upstreams
+                        self.gateway = gateway
+                        return
                     old = self.generation
                     if self.tasks:
                         self.generation = await self.tasks.start(self._generation, gateway)

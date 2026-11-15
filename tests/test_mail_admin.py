@@ -15,7 +15,9 @@ pytestmark = pytest.mark.anyio
 
 
 @pytest.mark.parametrize('operation', ['connections/preview', 'connections/review-tools'])
-async def test_review_extends_existing_mail_and_preserves_original_restrictions(tmp_path, operation):
+async def test_review_extends_existing_mail_and_preserves_original_restrictions(tmp_path, operation, monkeypatch):
+    # Non-bundled/externally managed connectors retain the manual review path.
+    monkeypatch.setattr('agent_gateway.catalog_sync.bundled_manifest', lambda conn: None)
     with mail_account(tmp_path / 'server', 'account@example.test', 'fake-app-password') as account:
         port = free_port()
         origin = f'http://localhost:{port}'

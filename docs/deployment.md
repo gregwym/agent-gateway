@@ -319,6 +319,25 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 
 `$A`、`$B`、`$H` 是 person_a、person_b、household 三个 client 的 Token。
 
+0.6 默认只列出三个入口。先搜索工具，再选择有权限的连接，最后调用：
+
+```sh
+call "$A" gateway_search_tools '{"query":"mail"}'
+call "$A" gateway_search_connections '{"tool":"mail_list_messages"}'
+# connection 使用上一步实际返回的 ID；参数采用它的 inputSchema。
+call "$A" gateway_call_tool '{"tool":"mail_list_messages","connection":"my_mail","arguments":{"limit":25}}'
+```
+
+工具搜索支持 connection 筛选，连接搜索支持 tool 筛选；两者都支持 query、offset、limit，跟随 next_offset 完整遍历。
+两个邮箱连接会共用 `mail_list_messages` 等工具名，授权和审批仍按实际连接分别检查。
+升级到 0.6 后，已有 Agent 会话需要刷新一次 MCP 清单（或新建会话）以获得这三个入口。
+之后能力或授权变化通过搜索即可看到。未授权 Agent 也有三个入口，但搜索结果为空。
+下面旧的前缀工具名调用仍兼容；如需复现旧的完整 tools/list 清单，在 YAML 中设置 `server.tool_discovery: all`。
+
+标准内置连接器的能力随网关版本自动同步，无需修数据库或逐个更新连接。新能力默认未授权；
+请在 Permissions 中选择 Agent 的连接权限，分别决定读取和写入是否逐次审批。
+权限修改不会重启未改变的连接器；请求响应丢失时，网页会读取最新设置确认保存结果，不自动重复提交。
+
 **Phase 2**
 
 | # | 验收项 | 怎么验 | 预期 |
@@ -328,7 +347,7 @@ tools() { curl -s "$AGW_URL" -H "Authorization: Bearer $1" -H "Content-Type: app
 | 2b | 中转地址 | `call $A a_mail_search '{"to":"<你的某个隐藏邮件地址>"}'` | 搜得到，`Delivered-To` / `To` 显示中转地址 |
 | 3 | 指定账号的日历 | `call $A a_calendar_list '{}'`；`call $A a_calendar_events '{"start":"2026-11-16","end":"2026-11-23"}'`；对一个重复日程用 `a_calendar_event`（`calendar`、`uid`、`start` 都取自上一步）；`call $A a_calendar_conflicts '{"start":"2026-11-18T09:00","end":"2026-11-18T10:00"}'` | 和「日历」App 一致：全天日程、重复日程的每一次、别人邀请的日程、时区。iCloud 的每次日历调用可能要几秒 |
 | 3b | 提醒事项 | 按第 7 节搭好后 `call $A a_reminders_lists '{}'`、`call $A a_reminders_list '{}'` | 实验性；任何不一致都请记下来 |
-| 4 | 账号隔离 | `tools $B` 和 `tools $H`；`call $B a_mail_search '{}'`；`call $H a_calendar_events '{"start":"2026-11-16","end":"2026-11-23"}'`；`call $H family_calendar_events '{"start":"2026-11-16","end":"2026-11-23","calendar":"<A 的另一个日历 id>"}'` | B 的列表里没有任何 `a_*`；household 只有 `family_calendar_*`；越权调用得到和「工具不存在」一样的回答；最后一条因为试图设置固定参数被拒绝 |
+| 4 | 账号隔离 | 用 B、H 分别调用 `gateway_search_connections`；尝试通过 `gateway_call_tool` 选择未授权连接；尝试传入固定参数 | 搜索仅返回已授权连接；越权调用得到和「工具不存在」一样的回答；固定参数不能被覆盖 |
 | 5 | 没有全量索引 | 用一段时间后看 `data/state/` | 只有 `audit/`（和启用审批后的 `approvals.sqlite`）；审计行里没有邮件内容和参数值 |
 | 6a | 授权失效 | 在 Apple 账号页吊销邮件的 App 专用密码，再 `call $A a_mail_search '{}'` | 回答 `The mail server rejected this account's credentials…`，不是崩溃，也不泄露密码；`secret set` 新密码并重启后恢复 |
 | 6b | Gmail 授权失效 | 在 [myaccount.google.com/connections](https://myaccount.google.com/connections) 移除这个应用的访问权，再调用 | 回答 `Google no longer accepts this account's authorisation…`；重新跑 `gmail_auth` 并重启后恢复 |

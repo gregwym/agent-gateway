@@ -50,13 +50,18 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
 - **One connection per account.** Each upstream MCP server process is bound to one
   account and receives only that account's credential. Reaching into another
   principal's account needs an explicit `cross_account: true` in the rule.
+- **Discover tools when needed.** MCP lists just three gateway tools: search tools,
+  search connections, and execute. Accounts of the same connector share tool names;
+  each call selects a connection. Searches show only usable, granted tools and
+  connections. Every execution rechecks restrictions and approval requirements.
 - **Argument restrictions.** A tool can be exposed with arguments fixed (`pin`) or
   limited to listed values (`allow_values`), e.g. "the family calendar only".
   Arguments that are not in the reviewed schema are rejected.
-- **Locked tool definitions.** Names, descriptions and schemas are reviewed once and
-  stored in `tools.lock.json`. Agents are served the locked text. If an upstream
-  changes a definition, that tool is withdrawn until a human re-reviews it; new
-  upstream tools never appear on their own.
+- **Locked tool definitions.** Agents receive locked names, descriptions and schemas.
+  Bundled connector capabilities reconcile from the installed package on startup;
+  newly added tools start denied and existing grants and argument restrictions remain.
+  Custom or remote upstream changes require explicit review. Definitions that differ
+  from the expected lock remain disabled.
 - **Credentials stay behind.** Upstream secrets live in an encrypted file, are handed
   only to their own connector, and known secret values are scrubbed from results.
   Errors shown to agents are fixed strings.
@@ -139,12 +144,35 @@ curl -s http://127.0.0.1:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-Each token lists a different set of tools. `a_notes_add` is listed for person_a and
-does not run: it answers "This action needs human approval and was not executed."
+All authenticated tokens list the same three entry points. Tool and connection
+search results depend on that token's permissions. For example:
+
+```json
+{"name":"gateway_search_tools","arguments":{"query":"notes"}}
+{"name":"gateway_search_connections","arguments":{"tool":"notes_add_note"}}
+{"name":"gateway_call_tool","arguments":{"tool":"notes_add_note","connection":"notes-a","arguments":{"folder":"inbox","text":"hello"}}}
+```
+
+These objects are the `params` of a `tools/call` JSON-RPC request. The write does
+not run without approval: it answers "This action needs human approval and was not executed."
 To try the approval flow, run `agw approval enroll person_a` and open the link it
 prints in a browser on the same machine (the example config uses
 `http://localhost:8080`) to create a passkey. Call `a_notes_add` again: the answer
 now names a page where the request waits. Open it, approve, and repeat the same call.
+
+Both searches support `query`, `offset` and `limit` (1–25, default 10), returning
+`total` and `next_offset`. Tool search also accepts `connection`; connection search
+accepts a shared `tool` name and returns exact permitted parameter schemas and
+`approval_required` for each binding. Use `variant` in `gateway_call_tool` only when
+the same tool has several restricted bindings on a connection. Fixed parameters
+remain hidden and cannot be supplied by the caller.
+
+On the first upgrade to 0.6, reconnect the MCP client or start a session that reloads
+its tool list to acquire these three entry points. Thereafter capability and permission
+changes are discovered through searches without reloading the MCP tool list. Existing
+prefixed calls remain accepted with full authorization checks, but are hidden from
+the default list. `server.tool_discovery: all` retains the previous listing for clients
+that explicitly need it.
 
 ## Web onboarding
 
@@ -188,8 +216,8 @@ limits are under **Advanced**. Only known catalog reads or host-reviewed `tools[
 preset; unknown tools are treated as writes, regardless of upstream MCP hints.
 Connectors without write tools, including the Gmail and calendar readers,
 offer read-only access. Changing a setting does not add unsupported connector operations.
-A zero-tool Agent explicitly explains why MCP returns
-an empty list. Being in the same household does not identify the current human
+A zero-tool Agent still sees the three entry points, but searches return no available
+tools or connections. Being in the same household does not identify the current human
 speaker or make one Agent inherit another Agent's permissions.
 
 Use **Agents → Rename** to correct an Agent name. The token, endpoint, household,
@@ -199,7 +227,12 @@ records retain the name used at the time. Reusing the old name grants no access.
 
 Access and connector changes wait up to 30 seconds for active calls to finish, then atomically save and
 apply; busy calls leave the configuration unchanged. These changes invalidate
-outstanding approvals. Sessions last 30 minutes, are revocable, and cannot be
+outstanding approvals. Permission-only edits reuse running connectors and preserve
+their pagination snapshots. Queued admin requests fail with a specific busy reason
+after five seconds. If a permission save response times out or is lost, the page
+reads the current revision and settings to confirm the result without resubmitting.
+If the save succeeded but the refresh failed, it explicitly reports that the save succeeded.
+Sessions last 30 minutes, are revocable, and cannot be
 used as MCP tokens. Host paths, administrator identity, origin, and subprocess
 commands cannot be changed through the browser. Connectors use a fixed catalog;
 custom connectors remain a host configuration task.
@@ -267,7 +300,7 @@ people with iCloud Mail, iCloud Calendar and Gmail each.
 
 | Key | Meaning |
 |---|---|
-| `server` | `host`, `port`, `allowed_hosts` (Host header check), `max_result_bytes` |
+| `server` | `host`, `port`, `allowed_hosts` (Host header check), `max_result_bytes`, `tool_discovery` (`search` by default, `all` for legacy listing) |
 | `audit` | `path`, `retention_days` (one file per UTC day) |
 | `secrets` | `path` of the encrypted store, `key_file` |
 | `lock_file` | reviewed tool definitions, default `tools.lock.json` |
@@ -386,13 +419,22 @@ during submission return unknown and are never automatically retried. It does no
 an extra copy to Sent; that depends on the provider. The administrator's connection
 test checks IMAP plus configured SMTP authentication without sending email.
 
-For an existing mail connection, its Permissions or Connectors card shows **Review new tools**
-when installed capabilities have not been registered. **Review new tools → Apply connector**
-preserves the exact existing server settings and credential references. Alternatively, **Edit & review → Preview tools → Apply connector**
-adds the new tools while preserving existing names, restrictions, credentials and grants.
-New tools start denied. Then save that Agent's desired connection access and separate
-read/write approval settings in **Permissions**. New mail connections also start denied.
-The original four IMAP definitions remain compatible with existing tool locks.
+Existing bundled IMAP, Gmail, CalDAV and demo connections automatically register new
+capabilities and compatible definitions when the gateway starts after an upgrade.
+This is a general catalog reconciliation mechanism; it requires no connection-ID-specific
+data repair. It preserves names, settings, credentials, grants and argument restrictions.
+New tools start denied even on an existing read/write connection; choose the desired
+Agent permissions to grant them. A tool reclassified from read to write loses its prior
+grants. Removed tools lose grants too. Incompatible restrictions are retained, with a
+specific explanation on the connection card. Startup overlays do not write managed
+state; the next admin edit persists them. Approval bindings include the bundled catalog
+revision so an old approval cannot authorize changed tool definitions.
+
+Automatic reconciliation applies only to standard bundled `python -m` launch commands.
+Custom wrappers, remote helpers and arbitrary upstreams keep the explicit lock/review
+workflow. Where a catalog addition can be reviewed manually, **Review new tools**
+preserves the existing server settings and credential references. The original four
+IMAP definitions remain compatible with existing tool locks.
 
 Long bodies are returned in pages and attachments up to a size limit. A refused credential produces a
 fixed message telling the agent that a person has to act, and the connector stops

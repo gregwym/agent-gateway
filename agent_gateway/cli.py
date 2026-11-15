@@ -92,6 +92,10 @@ def cmd_check(args: argparse.Namespace) -> int:
         store = ManagedStore(gateway)
         cfg, lock, values = store.effective(store.state)
         gateway = Gateway(cfg, lock, values, Audit(None))
+    else:
+        from .catalog_sync import sync_catalog
+        cfg, lock, _, _ = sync_catalog(cfg, lock)
+        gateway = Gateway(cfg, lock, gateway.secrets, Audit(None))
     policy = Policy(cfg)
     problems: list[str] = []
 

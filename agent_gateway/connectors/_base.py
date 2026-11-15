@@ -43,6 +43,10 @@ class Tool:
     required: tuple[str, ...] = ()
     read_only: bool = True
 
+    def as_mcp(self) -> types.Tool:
+        return types.Tool(name=self.name, description=self.description, input_schema=self.schema,
+                          annotations=types.ToolAnnotations(read_only_hint=self.read_only))
+
     @property
     def schema(self) -> dict[str, Any]:
         return {
@@ -126,15 +130,7 @@ def build_server(name: str, tools: list[Tool]) -> Server[Any]:
 
     async def on_list_tools(ctx: Any, params: Any) -> types.ListToolsResult:
         return types.ListToolsResult(
-            tools=[
-                types.Tool(
-                    name=tool.name,
-                    description=tool.description,
-                    input_schema=tool.schema,
-                    annotations=types.ToolAnnotations(read_only_hint=tool.read_only),
-                )
-                for tool in tools
-            ]
+            tools=[tool.as_mcp() for tool in tools]
         )
 
     async def on_call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:

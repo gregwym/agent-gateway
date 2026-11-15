@@ -16,6 +16,7 @@ const messages = {
   invalid_setup_link: ['This setup link is invalid, expired, or already used.', '设置链接无效、已过期或已被使用。'],
   verification_failed: ['Passkey verification failed. Try again.', '通行密钥验证失败，请重试。'],
   configuration_changed: ['Configuration changed in another window. Refresh and try again.', '其他窗口已修改配置，请刷新后重试。'],
+  admin_busy: ['Another configuration change or connection check is still running. Wait for it to finish; this request was not applied.', '另一项配置变更或连接检查仍在运行，请等待其完成；本次请求未应用。'],
   connector_unavailable: ['Connector initialization or communication failed unexpectedly. Use the error ID to locate the gateway failure.', '连接器初始化或通信发生未预期故障，请使用错误编号定位网关故障。'],
   connector_internal_error: ['The connector encountered an internal error while reading the service. Use the error ID to locate it.', '连接器在读取服务时发生内部错误，请使用错误编号定位。'],
   connector_login_or_read_failed: ['Login or the read check failed. Check account credentials and permissions.', '登录或读取验证失败，请检查账号凭据和权限。'],
@@ -171,18 +172,20 @@ function showError(source, error) {
   }
   message.textContent = errorText(error); message.scrollIntoView({block: 'nearest'}); message.focus();
 }
-async function api(path, body) {
+async function api(path, body, timeoutMs = 45000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 45000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response, data;
   try {
     response = await fetch('/admin/api/' + path, {signal: controller.signal, ...(body === undefined ? {} : {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: JSON.stringify(body)})});
     data = await response.json();
   } catch (error) {
-    throw new Error(error.name === 'SyntaxError' ? tr(`The gateway returned an unreadable response (HTTP ${response?.status}). Refresh and check the service.`, `网关返回了无法解析的响应（HTTP ${response?.status}），请刷新并检查服务。`)
+    const failure = new Error(error.name === 'SyntaxError' ? tr(`The gateway returned an unreadable response (HTTP ${response?.status}). Refresh and check the service.`, `网关返回了无法解析的响应（HTTP ${response?.status}），请刷新并检查服务。`)
       : error.name === 'AbortError' ? tr('The request timed out. Refresh to check its status before retrying.', '请求超时，请刷新确认状态后再重试。')
       : tr('Could not reach the gateway. Check your connection and try again.', '无法连接网关，请检查连接后重试。'));
+    failure.code = error.name === 'AbortError' ? 'request_timeout' : 'network_error';
+    throw failure;
   } finally { clearTimeout(timer); }
   if (!response.ok) {
     if (response.status === 401) { csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); }
@@ -304,7 +307,32 @@ async function welcome(initialized) {
   }, 'primary');
   el(welcome, 'footer', tr('Agent tokens cannot sign in here. Administrator access requires your passkey.', 'Agent Token 无法登录此页面，管理权限需要你的通行密钥。'));
 }
-async function mutate(path, data) { const result = await api(path, {revision: state.revision, ...data}); await refresh(); return result; }
+function permissionMatches(path, data, current) {
+  const conn = current.connections.find(c => c.id === data.connection);
+  if (!conn) return false;
+  if (path === 'permissions/save') return conn.tools.find(t => t.name === data.tool)?.permissions[data.client] === data.effect;
+  return path === 'permissions/connection' && conn.access[data.client] === data.access &&
+    (data.approver === undefined || conn.approver === data.approver);
+}
+async function mutate(path, data) {
+  const revision = state.revision, permission = path.startsWith('permissions/');
+  let result;
+  try { result = await api(path, {revision, ...data}); }
+  catch (error) {
+    if (!permission || !['request_timeout', 'network_error'].includes(error.code)) throw error;
+    let current;
+    try { current = await api('state', undefined, 10000); } catch (_) { throw error; }
+    state = current; render();
+    if (current.revision > revision && permissionMatches(path, data, current)) return {revision: current.revision, recovered: true};
+    throw new Error(tr('Could not confirm that the requested permissions were saved. The latest settings are shown; check them before retrying.', '尚未确认所选权限已保存。已显示最新设置，请核对后再重试。'));
+  }
+  try { await refresh(); }
+  catch (error) {
+    if (permission) throw new Error(tr('Permissions were saved, but the page could not reload them. Refresh to display the saved settings; do not submit again.', '权限已保存，但页面未能重新读取。请刷新以显示已保存设置，无需重复提交。'));
+    throw error;
+  }
+  return result;
+}
 async function refresh() { state = await api('state'); render(); }
 function nameOf(id) { return [...state.members, ...state.households].find(member => member.id === id)?.name || id; }
 function identityLabel(id) { return nameOf(id); }
@@ -411,7 +439,7 @@ function agents() {
     const row = el(body, 'tr'); const agent = el(row, 'td'); el(agent, 'div', client.id);
     button(agent, tr('Rename', '改名'), () => renameAgent(client));
     const access = el(row, 'td'); el(access, 'div', nameOf(client.household));
-    el(access, 'p', client.tool_count ? tr(`${client.tool_count} tool(s) granted`, `已授权 ${client.tool_count} 个工具`) : tr('No tools granted. MCP will return an empty tool list.', '尚未授权工具，MCP 将返回空工具列表。'), 'muted');
+    el(access, 'p', client.tool_count ? tr(`${client.tool_count} tool(s) granted`, `已授权 ${client.tool_count} 个工具`) : tr('No tools granted. Tool search will return no available tools.', '尚未授权工具，工具搜索将不会返回可用工具。'), 'muted');
     button(access, tr('Configure permissions', '配置权限'), () => { subject = client.id; tab = 'permissions'; render(); });
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');
     el(actions, 'code', tr('Check code: ', '核对码：') + client.fingerprint, 'token-fingerprint');
@@ -531,6 +559,21 @@ function showReview(result, form) {
   }, 'primary'); apply.disabled = true; checked.addEventListener('change', () => { apply.disabled = !checked.checked; });
 }
 function toolUpdateNotice(parent, conn) {
+  const sync = conn.catalog_sync;
+  if (sync?.automatic) {
+    el(parent, 'p', tr('Bundled capabilities update automatically with the gateway. New tools start with no access; choose connection permissions to authorize them.', '内置连接器的能力随网关升级自动同步。新工具默认未授权，请选择连接权限来授权。'), 'muted');
+    if (sync.added.length) el(parent, 'p', tr(`${sync.added.length} new tools were registered automatically. Existing permissions were preserved.`, `已自动登记 ${sync.added.length} 个新工具，原有授权已保留。`), 'hint');
+    if (sync.revoked.length) el(parent, 'p', tr('Some tools changed from reading to writing. Their old grants were removed; choose write permissions before using them.', '部分工具从读取变为写入，已撤销这些工具的旧授权，请重新选择写入权限。'), 'hint');
+  }
+  for (const issue of sync?.issues || []) {
+    const reasons = {
+      bundle_unavailable: tr('Bundled connector definitions could not be loaded. Check that this connector’s dependencies are installed.', '无法加载内置连接器定义，请检查其依赖是否已安装。'),
+      tool_removed: tr('This tool is no longer provided by the installed connector.', '当前连接器版本已不再提供此工具。'),
+      pin_unknown_argument: tr('A fixed argument was removed by the connector update. Adjust this tool’s argument limits under Advanced.', '连接器更新移除了固定参数中的字段，请在高级设置中调整该工具的参数限制。'),
+      allow_values_unknown_argument: tr('A restricted argument was removed by the connector update. Adjust this tool’s argument limits under Advanced.', '连接器更新移除了受限参数字段，请在高级设置中调整该工具的参数限制。'),
+    };
+    el(parent, 'p', (issue.tool ? issue.tool + ': ' : '') + (reasons[issue.reason] || serverError({error: issue.reason}, 400).message), 'error');
+  }
   const additions = conn.available_tools || [];
   if (!additions.length) return;
   const writes = additions.filter(t => t.access === 'write').length;
@@ -603,9 +646,14 @@ function permissions() {
       if (access === 'read_write') access = readApproval.value === 'approval_required'
         ? (writeApproval.value === 'approval_required' ? 'read_write_approval' : 'read_approval_write_direct')
         : (writeApproval.value === 'approval_required' ? 'read_write' : 'read_write_direct');
-      await mutate('permissions/connection', {client: subject, connection: conn.id, access,
-        ...(!approval.hidden ? {approver: approver.value} : {})});
-      notify(tr('Connection permissions updated.', '连接权限已更新。'));
+      const controls = [...card.querySelectorAll('input, select, button')];
+      const disabled = controls.map(control => control.disabled);
+      controls.forEach(control => { control.disabled = true; });
+      try {
+        await mutate('permissions/connection', {client: subject, connection: conn.id, access,
+          ...(!approval.hidden ? {approver: approver.value} : {})});
+        notify(tr('Connection permissions updated.', '连接权限已更新。'));
+      } finally { controls.forEach((control, index) => { control.disabled = disabled[index]; }); }
     }, 'primary');
     const details = el(card, 'details'); details.open = advancedConnections.has(conn.id);
     el(details, 'summary', tr('Advanced: individual tools and argument limits', '高级设置：逐工具权限与参数限制'));

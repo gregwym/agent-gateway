@@ -200,6 +200,9 @@ class Gateway:
         who = caller_of(ctx.request)
         if who is None:
             raise MCPError(types.INVALID_REQUEST, "Not authenticated")
+        if self.cfg.server.tool_discovery == "search":
+            from .discovery import TOOLS
+            return types.ListToolsResult(tools=TOOLS)
         tools = [
             route.exposed
             for name, route in self.routes.items()
@@ -217,6 +220,46 @@ class Gateway:
         name = params.name
         route = self.routes.get(name)
         arguments = params.arguments or {}
+        if self.cfg.server.tool_discovery == "search":
+            from . import discovery
+            if name in discovery.BY_NAME:
+                def discovery_audit(decision, reason):
+                    self.audit.write("tool_call", client=who.client_id, principal=who.principal, tool=name,
+                                     remote=ctx.request.client.host if ctx.request.client else None,
+                                     decision=decision, reason=reason, arg_keys=sorted(arguments),
+                                     duration_ms=int((time.monotonic() - started) * 1000))
+
+                validator = Draft202012Validator(discovery.BY_NAME[name].input_schema)
+                failure = jsonschema_exceptions.best_match(validator.iter_errors(arguments))
+                if failure is not None:
+                    discovery_audit("deny", "invalid_arguments")
+                    return _error("Invalid discovery arguments: " + failure.message[:300])
+                if name != discovery.CALL_TOOL:
+                    data = (discovery.search_tools if name == discovery.SEARCH_TOOLS else discovery.search_connections)(self, who, arguments)
+                    payload = json.dumps(self.scrubber.data(data), ensure_ascii=False)
+                    if len(payload.encode()) > self.cfg.server.max_result_bytes // 2:
+                        discovery_audit("deny", "result_too_large")
+                        return _error("Discovery result is too large. Narrow the query or use a smaller limit.")
+                    discovery_audit("allow", "discovery")
+                    return types.CallToolResult(content=[types.TextContent(type="text", text=payload)])
+                choices = discovery.candidates(self, who, arguments)
+                if not choices:
+                    discovery_audit("deny", "unknown_tool")
+                    raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
+                if len(choices) > 1:
+                    valid = []
+                    for candidate in choices:
+                        try:
+                            if not set(arguments["arguments"]) & candidate.tool.pin.keys() and candidate.validator.is_valid(arguments["arguments"]):
+                                valid.append(candidate)
+                        except Exception:  # an unresolved local schema reference cannot select a route
+                            continue
+                    if len(valid) != 1:
+                        discovery_audit("deny", "ambiguous_variant")
+                        return _error("This connection has multiple permitted parameter variants. Select a variant from gateway_search_connections.")
+                    choices = valid
+                route, arguments = choices[0], arguments["arguments"]
+                name = route.tool.name
         peer = ctx.request.client
         record: dict[str, Any] = {
             "client": who.client_id,
@@ -366,6 +409,12 @@ def build_app(gateway: Gateway) -> Starlette:
     if gateway.cfg.admin:
         from .admin import AdminController
         admin = AdminController(runtime)
+    else:
+        from .catalog_sync import catalog_revision, sync_catalog
+        synced, lock, _, _ = sync_catalog(gateway.cfg, gateway.lock)
+        if synced != gateway.cfg or lock.entries != gateway.lock.entries:
+            runtime.gateway = Gateway(synced, lock, gateway.secrets, gateway.audit, gateway.approver)
+        runtime.gateway.configuration_revision = catalog_revision(synced, lock)
     gateway = runtime.gateway
     cfg = gateway.cfg
 

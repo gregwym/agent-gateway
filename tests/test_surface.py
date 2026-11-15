@@ -103,16 +103,16 @@ async def test_host_header_check_when_configured(tmp_path):
     async with running_gateway(await prepare(tmp_path, raw)) as gw:
         async with httpx2.AsyncClient(headers=RPC_HEADERS) as http:
             direct = await http.post(gw.url, json=rpc("tools/list"))  # Host: 127.0.0.1:<port>
-            assert direct.status_code in (400, 403, 421) and "a_list_notes" not in direct.text
+            assert direct.status_code in (400, 403, 421) and "gateway_search_tools" not in direct.text
             named = await http.post(gw.url, json=rpc("tools/list"), headers={"Host": "gateway.tailnet.example:8080"})
-            assert named.status_code == 200 and "a_list_notes" in named.text
+            assert named.status_code == 200 and "gateway_search_tools" in named.text
             # A browser page on another origin (DNS rebinding) is refused even with the right Host.
             browser = await http.post(
                 gw.url,
                 json=rpc("tools/list"),
                 headers={"Host": "gateway.tailnet.example:8080", "Origin": "https://evil.example"},
             )
-            assert browser.status_code in (400, 403) and "a_list_notes" not in browser.text
+            assert browser.status_code in (400, 403) and "gateway_search_tools" not in browser.text
 
 
 def test_a_connector_started_without_the_gateway_has_no_credential():

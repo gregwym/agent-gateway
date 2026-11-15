@@ -48,7 +48,7 @@
 ```
 Agent ──HTTP(Streamable)──► /mcp
                              │ 1 身份      Bearer Token → client → principal（SDK 的鉴权中间件）
-                             │ 2 路由      暴露名 → (connection, 上游工具名)
+                             │ 2 路由      共享工具名 + connection → 内部授权绑定 → 上游工具名
                              │ 3 策略      (principal, tool) → allow / approval_required / deny，默认 deny
                              │ 4 定义      工具必须在 lock 里，且与上游当前定义一致
                              │ 5 参数      按给 Agent 看的 schema 校验；pin 的参数由 Gateway 填入
@@ -62,6 +62,15 @@ Agent ──HTTP(Streamable)──► /mcp
 ```
 
 每一步失败都是拒绝。第 2、3 步的拒绝对 Agent 表现为同一个 `Unknown tool`，无法探测别人有哪些工具。
+
+从 0.6 起，默认 MCP 清单固定为 `gateway_search_tools`、`gateway_search_connections`、`gateway_call_tool`。
+搜索按调用者的当前权限过滤；同类连接共用工具名，执行时显式选择 connection，并重新验证原有的每一道检查。
+搜索返回每个连接的精确参数 schema；同一连接存在多个受限绑定时，用 variant 指定其中一个。
+内部工具别名继续承载权限和审批绑定，旧客户端直接调用这些名字仍受相同检查；默认不再把它们全部加入 MCP 清单。
+
+标准内置连接器在启动时从当前安装包同步能力和锁定义，新工具默认 deny。更新保留连接配置及已有授权；
+读变写或被移除的能力撤销旧授权。与参数限制冲突的更新保留原限制并在网页显示原因。
+远程连接器和自定义启动命令仍需显式审阅。安装包升级因此也是内置能力定义的信任边界，不能把远程动态定义自动当作已审阅。
 
 网页管理使用家庭模型：`households` 是家庭，`members` 是有姓名和家庭归属的个人，`clients` 是有家庭归属的 Agent。
 连接的 owner 是成员或家庭。`policy.clients × connection × tools` 决定 Agent 的权限；家庭不是被授权主体，成员关系没有权限继承。
@@ -95,6 +104,8 @@ Agent 通过 MCP 能改变的管理状态仍只有发起待审批请求（每个
 | `auth.py` | Token 生成、哈希、常数时间比对；从请求里取调用者 |
 | `policy.py` | 把规则预计算成 `(principal, tool) → effect` |
 | `lock.py` | 工具定义的规范化、摘要和 lock 文件 |
+| `catalog_sync.py` | 从安装包同步标准内置连接器能力；新工具默认拒绝，保留已有限制 |
+| `discovery.py` | 固定发现入口、共享工具名、权限过滤后的连接与参数 schema |
 | `credentials.py` | 加密密钥文件、结果脱敏 |
 | `upstream.py` | 每个 connection 一条长连接：连接、校验定义、重连、错误归一化 |
 | `server.py` | 两个 MCP handler（`tools/list`、`tools/call`）和 HTTP 应用 |
@@ -104,7 +115,7 @@ Agent 通过 MCP 能改变的管理状态仍只有发起待审批请求（每个
 | `cli.py` | `agw serve / check / lock / token / secret / approval` |
 | `admin*.py`、`static/admin.*` | 一次性初始化、Passkey 管理会话、成员和 Token、连接器目录、Google 网页授权、权限编辑 |
 | `runtime.py` | 等待在途 MCP 请求结束，原子切换有效配置；Token 鉴权在相同读取租约内 |
-| `connectors/` | 自带的 Connector，每个是一个独立进程；Gateway 核心不引用它们 |
+| `connectors/` | 自带的 Connector，每个账号使用独立进程；目录同步只读取纯 schema 工厂，不访问账号 |
 
 ## 4. 复用与自研
 
