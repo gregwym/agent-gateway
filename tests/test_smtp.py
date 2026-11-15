@@ -10,7 +10,7 @@ from contextlib import contextmanager
 import pytest
 
 from agent_gateway.connectors._base import ConnectorError
-from agent_gateway.connectors._smtp import Submission
+from agent_gateway.connectors._smtp import Submission, address_literal
 from service_helpers import localhost_certificate
 
 
@@ -37,6 +37,7 @@ def smtp_server(path, *, implicit=False, reject_auth=False, disconnect_data=Fals
                     command = command.upper()
                     events.append(command.decode())
                     if command in (b"EHLO", b"HELO"):
+                        events.append("EHLO_ARG:" + arg.decode())
                         conn.sendall(b"250-localhost\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n")
                     elif command == b"STARTTLS":
                         conn.sendall(b"220 Start TLS\r\n")
@@ -97,6 +98,9 @@ def smtp_server(path, *, implicit=False, reject_auth=False, disconnect_data=Fals
 def test_unified_smtp_tls_auth_partial_recipients_and_bcc_privacy(tmp_path, monkeypatch, implicit):
     with smtp_server(tmp_path, implicit=implicit) as (port, cert, events, messages, envelopes):
         monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        def no_local_dns(*args, **kwargs):
+            raise AssertionError("SMTP must not resolve its local hostname")
+        monkeypatch.setattr(socket, "getfqdn", no_local_dns)
         sender = Submission("localhost", port, "tls" if implicit else "starttls", "account@example.test", "fake-app-password", "account@example.test")
         assert sender.check({}) == {"smtp": "authenticated", "sent": False}
         assert not messages and "MAIL" not in events
@@ -108,6 +112,8 @@ def test_unified_smtp_tls_auth_partial_recipients_and_bcc_privacy(tmp_path, monk
         recipients, raw = messages[0]
         parsed = email.message_from_bytes(raw)
         assert parsed["From"] == "account@example.test" and parsed["Bcc"] is None
+        assert parsed["Message-ID"].endswith('@example.test>')
+        assert {e for e in events if e.startswith('EHLO_ARG:')} == {'EHLO_ARG:[127.0.0.1]'}
         assert b"private@example.test" not in raw and any("private@example.test" in r for r in recipients)
         assert parsed.is_multipart()
         assert envelopes == ["FROM:<account@example.test>"]
@@ -142,3 +148,8 @@ def test_smtp_rejects_address_and_header_injection_without_connecting(recipient)
     sender = Submission("unused", 587, "starttls", "unused", "unused", "account@example.test")
     with pytest.raises(ConnectorError):
         sender.send({"to": [recipient], "subject": "hi", "text": "body"})
+
+
+@pytest.mark.parametrize('ip,literal', [('192.0.2.3', '[192.0.2.3]'), ('2001:db8::1', '[IPv6:2001:db8::1]'), ('fe80::1%en0', '[IPv6:fe80::1]')])
+def test_ehlo_address_literals(ip, literal):
+    assert address_literal(ip) == literal

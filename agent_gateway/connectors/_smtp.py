@@ -4,12 +4,18 @@ from __future__ import annotations
 import smtplib
 import socket
 import ssl
+from ipaddress import ip_address
 from email.errors import HeaderParseError
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
 from ._base import ConnectorError, CredentialGate, Tool, plain, string
+
+
+def address_literal(value):
+    ip = ip_address(value.split("%", 1)[0])
+    return f"[IPv6:{ip}]" if ip.version == 6 else f"[{ip}]"
 
 
 def address(value):
@@ -39,10 +45,15 @@ class Submission:
         smtp, ready = None, False
         try:
             context = ssl.create_default_context()
+            # Avoid smtplib's unbounded getfqdn() lookup of the gateway host.
+            # Before EHLO, replace this constructor placeholder with the local
+            # socket address (RFC 5321 sections 4.1.1.1 and 4.1.3).
             if self.security == "tls":
-                smtp = smtplib.SMTP_SSL(self.host, self.port, timeout=30, context=context)
+                smtp = smtplib.SMTP_SSL(self.host, self.port, timeout=30, context=context, local_hostname="localhost")
             else:
-                smtp = smtplib.SMTP(self.host, self.port, timeout=30)
+                smtp = smtplib.SMTP(self.host, self.port, timeout=30, local_hostname="localhost")
+            smtp.local_hostname = address_literal(smtp.sock.getsockname()[0])
+            if self.security == "starttls":
                 smtp.ehlo()
                 smtp.starttls(context=context)
                 smtp.ehlo()
@@ -83,7 +94,7 @@ class Submission:
             msg["Cc"] = ", ".join(groups["cc"])
         # Bcc appears only in the envelope, never in the transmitted headers.
         msg["Subject"] = plain(args["subject"])
-        msg["Date"], msg["Message-ID"] = formatdate(localtime=False), make_msgid()
+        msg["Date"], msg["Message-ID"] = formatdate(localtime=False), make_msgid(domain=Address(addr_spec=sender).domain)
         msg.set_content(args["text"])
         if args.get("html"):
             msg.add_alternative(args["html"], subtype="html")

@@ -418,6 +418,9 @@ acceptance/refusal per recipient; acceptance is not confirmed delivery. Disconne
 during submission return unknown and are never automatically retried. It does not append
 an extra copy to Sent; that depends on the provider. The administrator's connection
 test checks IMAP plus configured SMTP authentication without sending email.
+SMTP uses the connected socket's address literal for EHLO and the sender's domain
+for Message-ID, avoiding implicit local-host DNS lookups that can stall authentication
+or sending on hosts without reliable reverse DNS.
 
 Existing bundled IMAP, Gmail, CalDAV and demo connections automatically register new
 capabilities and compatible definitions when the gateway starts after an upgrade.
