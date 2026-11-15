@@ -18,12 +18,29 @@
 .mailbox-scope{margin:12px 0}.mailbox-scope small{display:block}
 
 .connector-save[hidden] { display: none; }
-.website-login { width: min(100% - 1rem, 480px); }
-.website-login .login-host { font-weight: 650; overflow-wrap: anywhere; margin-block: .3rem; }
-.website-login .hint { margin-block: .35rem; }
-.login-keyboard { display: flex; align-items: end; gap: .5rem; margin-block: .5rem; }
+.website-login { width: min(680px, calc(100vw - 24px)); padding: 0; overflow: hidden; }
+.website-login[open] { display: flex; flex-direction: column; }
+.login-bar, .login-keyboard, .login-controls { display: flex; align-items: center; gap: .4rem; padding: .4rem .65rem; flex: none; }
+.login-bar { border-bottom: 1px solid var(--line); }
+.login-bar .login-close { padding-inline: .65rem; font-size: 20px; line-height: 1; }
+.login-host { flex: 1; font-weight: 650; overflow-wrap: anywhere; margin: 0; }
+.login-bar button, .login-keyboard button { min-height: 42px; white-space: nowrap; }
+.login-view { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fff; }
+.login-status { margin: .7rem; }
+.login-status:empty { display: none; }
+.login-keyboard { border-top: 1px solid var(--line); }
 .login-keyboard .field { flex: 1; min-width: 0; margin: 0; }
+.login-keyboard label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 .login-keyboard input { font-size: 16px; }
-.login-controls { margin-block: .5rem; }
-.login-frame { display: block; width: 100%; height: auto; background: #fff; border-radius: .4rem; touch-action: none; user-select: none; }
+.login-controls { padding-top: 0; flex-wrap: wrap; }
+.login-controls button { min-width: 37px; min-height: 38px; padding: 6px 9px; }
+.login-zoom { min-width: 3.2em; text-align: center; font-variant-numeric: tabular-nums; }
+.login-frame { display: block; width: min(100%, 530px); height: auto; margin: 0 auto; background: #fff; touch-action: none; user-select: none; }
 .login-frame:not([src]) { display: none; }
+.website-login .operation-error { margin: .3rem .65rem; padding: .4rem .65rem; flex: none; }
+@media (max-width: 640px), (max-height: 520px) and (pointer: coarse) {
+  .website-login { position: fixed; inset: var(--login-top, 0px) 0 auto; margin: 0; border: 0; border-radius: 0;
+    width: 100%; max-width: none; height: var(--login-height, 100dvh); max-height: none;
+    padding-bottom: env(safe-area-inset-bottom); }
+  .login-frame { width: 100%; }
+}

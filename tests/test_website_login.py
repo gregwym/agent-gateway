@@ -27,7 +27,7 @@ def socket_dir():
 
 
 def fake_browser(monkeypatch, *, screenshot=None):
-    backend = {"auth": False, "actions": [], "inputs": [], "swipes": []}
+    backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100}
 
     def fetch(host, target, headers, receive):
         if headers.get("Cookie") != "auth=" + SECRET or not backend["auth"]:
@@ -41,11 +41,13 @@ def fake_browser(monkeypatch, *, screenshot=None):
             backend["inputs"].append(data["text"])
         if action == "scroll":
             backend["swipes"].append((data["dx"], data["dy"]))
+        if action == "zoom":
+            backend["zoom"] = data["percent"]
         if action == "cookies":
             assert data["origin"] == "https://www.amazon.com"
             return {"cookies": [{"name": "auth", "domain": ".amazon.com", "value": SECRET},
                                 {"name": "auth", "domain": "evil.test", "value": "unrelated-password"}]}
-        return {"image": screenshot, "host": "www.amazon.com"}
+        return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"]}
 
     monkeypatch.setattr(web, "_fetch", fetch)
     monkeypatch.setattr(WebsiteLogin, "worker", worker)
@@ -140,6 +142,14 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         image = login_box.get_by_role("img", name="可操作的网站登录页")
         await playwright.expect(image).to_be_visible()
         await image.evaluate("node => node.decode()")
+        assert await login_box.evaluate("""node => {
+            const rect = node.getBoundingClientRect(), image = node.querySelector('img').getBoundingClientRect();
+            return rect.left === 0 && rect.width === innerWidth && rect.height >= visualViewport.height - 1
+                && image.width === innerWidth;
+        }""")
+        await login_box.get_by_role("button", name="放大网页").tap()
+        await playwright.expect(login_box.locator('.login-zoom')).to_have_text("125%")
+        assert backend["zoom"] == 125
         await image.scroll_into_view_if_needed()
         await image.evaluate("""image => {
             const {left, top} = image.getBoundingClientRect();
@@ -163,3 +173,35 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         if directory := os.environ.get("AGW_TEST_ARTIFACTS"):
             await page.screenshot(path=str(Path(directory) / "mobile-website-connected.png"))
+
+
+@pytest.mark.browser
+async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
+    from agent_gateway.browser_worker import Browser
+    playwright = pytest.importorskip("playwright.async_api")
+    async with playwright.async_playwright() as driver:
+        chromium = await driver.chromium.launch()
+        try:
+            view = Browser(socket_dir / "control.sock")
+            view.context = await chromium.new_context(viewport={"width": 420, "height": 620})
+            view.navigation, view.zoom = ("signin.example",), None
+            page = await view.context.new_page()
+            await page.route("https://signin.example/**", lambda route: route.fulfill(
+                content_type="text/html",
+                body='<button style="width:100px">Continue</button><p>Before</p>'))
+            await page.goto("https://signin.example/")
+            await page.get_by_role("button").evaluate(
+                "node => node.onclick = () => document.querySelector('p').textContent = 'Clicked'")
+            result = await view.use("zoom", {"percent": 150})
+            assert result["zoom"] == 150
+            rect = await page.get_by_role("button").bounding_box()
+            assert rect["width"] == 150
+            await view.use("tap", {"x": rect["x"] + 140, "y": rect["y"] + rect["height"] / 2})
+            await playwright.expect(page.locator("p")).to_have_text("Clicked")
+            # A subsequent navigation (for example password to verification code)
+            # maintains zoom in the new page without rewriting the click mapping.
+            await page.goto("https://signin.example/next")
+            await view.use("frame", {})
+            assert (await page.get_by_role("button").bounding_box())["width"] == 150
+        finally:
+            await chromium.close()

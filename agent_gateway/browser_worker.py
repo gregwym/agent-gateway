@@ -17,6 +17,7 @@ from .browser_tunnel import host_allowed, tunnel
 
 WIDTH, HEIGHT = 420, 620
 KEYS = {"Enter", "Tab", "Backspace", "Escape"}
+ZOOM_LEVELS = (100, 125, 150, 200)
 FLOW = re.compile(r"[0-9a-f]{24}")
 
 
@@ -43,6 +44,7 @@ class Browser:
 
     async def start(self, driver, body):
         self.id, self.expires = body["id"], body["expires"]
+        self.zoom = None
         proxy = self.path.parent / f'{self.id}.proxy'
         allowed = self.navigation = body["navigation"]
 
@@ -114,14 +116,26 @@ class Browser:
         elif op == "scroll":
             await page.mouse.move(body["x"], body["y"])
             await page.mouse.wheel(body["dx"], body["dy"])
+        elif op == "zoom":
+            self.zoom = body["percent"]
         elif op == "reload":
             with suppress(Exception):
                 await page.reload(wait_until="commit", timeout=6500)
         elif op != "frame":
             raise ValueError("invalid action")
         parts = urlsplit(page.url)
-        picture = await page.screenshot(type="jpeg", quality=70, timeout=5000)
-        return {"image": base64.b64encode(picture).decode("ascii"), "host": parts.hostname if parts.scheme == "https" else None}
+        if self.zoom is not None and parts.scheme == "https" and host_allowed(parts.hostname or "", self.navigation):
+            # Apply to the actual page so clickable coordinates stay in the same
+            # viewport, and retain the scale when a sign-in step navigates.
+            await page.evaluate("""factor => {
+                const style = document.documentElement?.style;
+                if (!style) return;
+                if (factor === 1) style.removeProperty('zoom');
+                else if (style.zoom !== String(factor)) style.zoom = factor;
+            }""", self.zoom / 100)
+        picture = await page.screenshot(type="jpeg", quality=75, timeout=5000)
+        return {"image": base64.b64encode(picture).decode("ascii"),
+                "host": parts.hostname if parts.scheme == "https" else None, "zoom": self.zoom or 100}
 
 
 def make_app(path):

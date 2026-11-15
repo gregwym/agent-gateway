@@ -15,7 +15,7 @@ import httpx2 as httpx
 
 from .admin_config import CONNECTOR_NAME, kind_of, make_connection
 from .browser_tunnel import connect
-from .browser_worker import HEIGHT, KEYS, WIDTH
+from .browser_worker import HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
 from .connectors.web import ConnectorError, SiteSession, import_session
 from .lock import definition_of
 from .passkey import Refused
@@ -160,6 +160,7 @@ class WebsiteLogin:
                 "text": ("text",),
                 "key": ("key",),
                 "reload": (),
+                "zoom": ("percent",),
             }
             if operation not in spec or body.keys() != {"id", *spec[operation]}:
                 raise Refused("web_browser_input", 400)
@@ -169,7 +170,8 @@ class WebsiteLogin:
                                                 for key in ("dx", "dy"))
                     or "text" in body and not (isinstance(body["text"], str) and 0 < len(body["text"]) <= 2048
                                                and not any(ord(s) < 32 for s in body["text"]))
-                    or "key" in body and not (isinstance(body["key"], str) and body["key"] in KEYS)):
+                    or "key" in body and not (isinstance(body["key"], str) and body["key"] in KEYS)
+                    or "percent" in body and not (type(body["percent"]) is int and body["percent"] in ZOOM_LEVELS)):
                 raise Refused("web_browser_input", 400)
             return await self.worker(operation, body)
 

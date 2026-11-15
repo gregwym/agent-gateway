@@ -1112,22 +1112,40 @@ function connectorForm(existing, reauthorize = false) {
 function showWebsiteLogin(flow, connector) {
   const box = modal(tr('Website sign-in', '网站登录'));
   box.classList.add('website-login');
-  const host = el(box, 'p', flow.host, 'login-host');
-  el(box, 'p', tr('Tap a field in the page, then type below. Complete the website’s sign-in before saving.',
-    '先点网页中的输入框，再用下方键盘输入。完成网站登录后再保存。'), 'hint');
+  const [heading, close] = box.children;
+  const bar = el(box, 'div', undefined, 'login-bar');
+  heading.remove();
+  close.className = 'login-close';
+  bar.append(close);
+  const host = el(bar, 'p', flow.host, 'login-host');
+  button(bar, tr('Save connection', '保存连接'), () => perform('save'), 'primary', tr('Checking orders…', '正在检查订单…'));
+  const viewer = el(box, 'div', undefined, 'login-view');
+  const picture = el(viewer, 'img', undefined, 'login-frame');
+  picture.width = flow.width; picture.height = flow.height; picture.draggable = false;
+  picture.alt = tr('Interactive sign-in page', '可操作的网站登录页');
+  const status = el(viewer, 'p', tr('Loading sign-in page…', '正在加载登录页…'), 'login-status');
+  status.setAttribute('role', 'status');
   const keyboard = el(box, 'form', undefined, 'login-keyboard');
   const input = field(keyboard, tr('Type into the selected field', '输入到选中的框'), 'login_input', '', 'password');
+  input.placeholder = tr('Tap a field above, then type here', '点选网页输入框，再在此输入');
   input.setAttribute('autocapitalize', 'none'); input.spellcheck = false;
   input.maxLength = 2048;
   const send = el(keyboard, 'button', tr('Type', '输入'));
   send.type = 'submit';
-  const tools = el(box, 'div', undefined, 'actions login-controls');
-  const picture = el(box, 'img', undefined, 'login-frame');
-  picture.width = flow.width; picture.height = flow.height; picture.draggable = false;
-  picture.alt = tr('Interactive sign-in page', '可操作的网站登录页');
-  const status = el(box, 'p', tr('Loading sign-in page…', '正在加载登录页…'), 'hint');
-  status.setAttribute('role', 'status');
-  let busy = false, timer, url, saved = false, pointer;
+  const tools = el(box, 'div', undefined, 'login-controls');
+  const levels = [100, 125, 150, 200];
+  let busy = false, timer, url, saved = false, pointer, zoom = 100;
+  function fit() {
+    // iOS can shrink the visual viewport without changing CSS viewport units
+    // while its keyboard is open. Keep the input and submit button above it.
+    if (window.visualViewport && window.visualViewport.scale === 1) {
+      box.style.setProperty('--login-height', Math.floor(window.visualViewport.height) + 'px');
+      box.style.setProperty('--login-top', Math.floor(window.visualViewport.offsetTop) + 'px');
+    }
+  }
+  window.visualViewport?.addEventListener('resize', fit);
+  window.visualViewport?.addEventListener('scroll', fit);
+  fit();
   function frame(result) {
     const bytes = Uint8Array.from(atob(result.image), c => c.charCodeAt(0));
     if (url) URL.revokeObjectURL(url);
@@ -1135,6 +1153,10 @@ function showWebsiteLogin(flow, connector) {
     picture.src = url;
     host.textContent = result.host || flow.host;
     status.textContent = '';
+    zoom = result.zoom ?? zoom;
+    zoomLabel.textContent = zoom + '%';
+    smaller.disabled = zoom === levels[0];
+    bigger.disabled = zoom === levels.at(-1);
   }
   async function perform(op, props = {}) {
     if (busy || !box.open) return;
@@ -1162,13 +1184,26 @@ function showWebsiteLogin(flow, connector) {
     if (!input.value || busy) return;
     const text = input.value;
     input.value = '';
+    input.blur();
     action('text', {text});
   });
+  const changeZoom = step => {
+    const percent = levels[levels.indexOf(zoom) + step];
+    if (percent) action('zoom', {percent});
+  };
+  const smaller = el(tools, 'button', '−');
+  const zoomLabel = el(tools, 'span', '100%', 'login-zoom');
+  const bigger = el(tools, 'button', '+');
+  smaller.type = bigger.type = 'button';
+  smaller.setAttribute('aria-label', tr('Zoom out', '缩小网页'));
+  bigger.setAttribute('aria-label', tr('Zoom in', '放大网页'));
+  smaller.disabled = true;
+  smaller.addEventListener('click', () => changeZoom(-1));
+  bigger.addEventListener('click', () => changeZoom(1));
   button(tools, 'Tab', () => perform('key', {key: 'Tab'}));
-  button(tools, 'Enter', () => perform('key', {key: 'Enter'}));
   button(tools, '⌫', () => perform('key', {key: 'Backspace'})).setAttribute('aria-label', tr('Backspace', '退格'));
+  button(tools, 'Enter', () => perform('key', {key: 'Enter'}));
   button(tools, tr('Reload', '刷新'), () => perform('reload'));
-  button(tools, tr('Save connection', '保存连接'), () => perform('save'), 'primary', tr('Checking orders…', '正在检查订单…'));
   const coordinate = event => {
     const rect = picture.getBoundingClientRect(), clamp = (n, max) => Math.min(max - 1, Math.max(0, Math.floor(n)));
     return {x: clamp((event.clientX - rect.left) * flow.width / rect.width, flow.width),
@@ -1211,6 +1246,8 @@ function showWebsiteLogin(flow, connector) {
   }
   box.addEventListener('close', () => {
     clearTimeout(timer);
+    window.visualViewport?.removeEventListener('resize', fit);
+    window.visualViewport?.removeEventListener('scroll', fit);
     input.value = '';
     if (url) URL.revokeObjectURL(url);
     if (!saved) api('web-login/cancel', {id: flow.id}, 10000).catch(() => {});
