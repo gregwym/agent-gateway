@@ -233,3 +233,40 @@ async def test_web_onboarding_in_readonly_container_and_state_survives_restart()
         metadata = json.loads(docker('inspect', name))[0]
         assert metadata['HostConfig']['ReadonlyRootfs']
         assert not next(m for m in metadata['Mounts'] if m['Destination']=='/config')['RW']
+
+
+async def test_isolated_browser_container_starts_and_renders_without_network():
+    image = os.environ["AGW_TEST_BROWSER_IMAGE"]
+    name = "agw-browser-acceptance-" + uuid.uuid4().hex[:12]
+    try:
+        docker("run", "-d", "--name", name, "--network", "none", "--read-only", "--cap-drop", "ALL",
+               "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:size=384m,mode=1777",
+               "--init", "--memory", "768m", "--pids-limit", "256", "-v", f"{name}:/browser", image)
+        metadata = json.loads(docker("inspect", name))[0]
+        assert metadata["HostConfig"]["NetworkMode"] == "none"
+        assert [mount["Destination"] for mount in metadata["Mounts"]] == ["/browser"]
+        probe = """
+import base64, socket, time
+import httpx2
+http = httpx2.Client(transport=httpx2.HTTPTransport(uds='/browser/control.sock'), timeout=25)
+for _ in range(75):
+    try:
+        http.post('http://browser/health').raise_for_status()
+        break
+    except httpx2.TransportError:
+        time.sleep(.2)
+else:
+    raise AssertionError('Browser control socket was not ready')
+ident='0123456789abcdef01234567'
+def call(op, **kw):
+    r=http.post('http://browser/'+op,json=dict(id=ident,**kw))
+    return r.raise_for_status().json()
+assert call('start', url='data:text/html,<h1>Simulated login</h1>',
+            navigation=['www.amazon.com'], expires=time.time()+50)['width'] == 420
+assert base64.b64decode(call('frame')['image']).startswith(b'\\xff\\xd8')
+assert call('close') == {}
+"""
+        docker("exec", name, "python", "-c", probe)
+    finally:
+        docker("rm", "-f", name, check=False)
+        docker("volume", "rm", name, check=False)

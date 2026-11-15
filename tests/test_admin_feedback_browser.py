@@ -14,12 +14,13 @@ pytestmark = [pytest.mark.anyio, pytest.mark.browser]
 
 
 @asynccontextmanager
-async def admin_page(tmp_path, locale, **gateway_options):
+async def admin_page(tmp_path, locale, *, mobile=False, **gateway_options):
     async with web_gateway(tmp_path, **gateway_options) as (gateway, http, origin, config):
         async with playwright.async_playwright() as driver:
             browser = await driver.chromium.launch()
             try:
-                context = await browser.new_context(locale=locale, viewport={'width': 390 if locale == 'zh-CN' else 1280, 'height': 900})
+                screen = driver.devices['iPhone 15'] if mobile else {'viewport': {'width': 390 if locale == 'zh-CN' else 1280, 'height': 900}}
+                context = await browser.new_context(locale=locale, **screen)
                 page = await context.new_page()
                 errors = []
                 page.on('pageerror', lambda error: errors.append(str(error)))

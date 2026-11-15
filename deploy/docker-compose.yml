@@ -28,6 +28,8 @@ services:
   gateway:
     <<: *gateway
     restart: unless-stopped
+    environment:
+      AGW_BROWSER_SOCKET: /browser/control.sock
     ports:
       # One address only. Set AGW_BIND to this host's Tailscale IP; never 0.0.0.0.
       - "${AGW_BIND:-127.0.0.1}:${AGW_PORT:-8080}:8080"
@@ -36,8 +38,34 @@ services:
       - ${AGW_HOME:-./data}/secrets:/secrets:ro
       - ${AGW_KEY_DIR:-./data/key}:/key:ro
       - ${AGW_HOME:-./data}/state:/state
+      - browser-sockets:/browser
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # The browser has no network or Gateway data mounts. A Unix socket allows
+  # admin control; website HTTPS goes through a per-login, restricted tunnel.
+  browser:
+    build:
+      context: ..
+      target: login-browser
+    image: agent-gateway-browser:local
+    user: "10001:10001"
+    restart: unless-stopped
+    network_mode: none
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:size=384m,mode=1777"]
+    shm_size: 128mb
+    mem_limit: 768m
+    pids_limit: 256
+    volumes: ["browser-sockets:/browser"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx2; r=httpx2.Client(transport=httpx2.HTTPTransport(uds='/browser/control.sock'), timeout=3).post('http://browser/health'); r.raise_for_status()"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -55,3 +83,6 @@ services:
       - ${AGW_HOME:-./data}/secrets:/secrets
       - ${AGW_KEY_DIR:-./data/key}:/key
       - ${AGW_HOME:-./data}/state:/state
+
+volumes:
+  browser-sockets:

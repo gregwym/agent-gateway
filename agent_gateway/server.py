@@ -585,7 +585,11 @@ def build_app(gateway: Gateway) -> Starlette:
             runtime.tasks.start_soon(dispatcher.run)
             if admin:
                 runtime.tasks.start_soon(admin.sweep)
-            yield
+            try:
+                yield
+            finally:
+                if admin:
+                    await admin.website_login.close()
 
     async def healthz(request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")

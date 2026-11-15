@@ -79,12 +79,13 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 if not zh:
                     await service.select_option('web')
                     await page.get_by_label('Website', exact=True).select_option('weee-orders')
-                    await playwright.expect(page.get_by_role('link', name='Open website to sign in')).to_have_attribute('href', 'https://www.weee.com')
+                    await playwright.expect(page.get_by_role('button', name='Sign in to website', exact=True)).not_to_be_visible()
+                    await page.get_by_text('Advanced: import a session file', exact=True).click()
                     await page.get_by_label('Connector name', exact=True).fill('browser-weee')
                     await page.get_by_label('Browser session JSON', exact=True).set_input_files({
                         'name': 'weee-session.json', 'mimeType': 'application/json',
                         'buffer': b'[{"domain":"www.weee.com","name":"auth","value":"fake-browser-session"}]'})
-                    await page.get_by_role('button', name='Preview tools', exact=True).click()
+                    await page.get_by_role('button', name='Import session', exact=True).click()
                     review = page.get_by_role('dialog', name='Review tool definitions')
                     await playwright.expect(review.get_by_label('Operation type: list_orders')).to_be_disabled()
                     await review.get_by_label('I reviewed these definitions and permissions.').check()

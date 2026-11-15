@@ -44,7 +44,7 @@ def main() -> int:
     (output / "junit.xml").unlink(missing_ok=True)
     report = {"started": datetime.now(timezone.utc).isoformat(), "python": sys.version.split()[0],
               "platform": platform.platform(), "mode": "simulated", "docker": args.docker, "checks": []}
-    image = None
+    image = browser_image = None
 
     def check(name: str, command: list[str], env=None) -> None:
         print(f"\n[{name}] {' '.join(command)}", flush=True)
@@ -78,12 +78,16 @@ def main() -> int:
         check("diff", ["git", "diff", "--check"])
         env = os.environ.copy()
         env.pop("AGW_TEST_IMAGE", None)
+        env.pop("AGW_TEST_BROWSER_IMAGE", None)
         env["AGW_TEST_ARTIFACTS"] = str(output / "screenshots")
         if args.docker:
             image = "agent-gateway:acceptance-" + uuid.uuid4().hex[:12]
             check("compose", ["docker", "compose", "-f", "deploy/docker-compose.yml", "config", "--quiet"])
             check("image", ["docker", "build", "-t", image, "."])
             env["AGW_TEST_IMAGE"] = image
+            browser_image = image.replace("agent-gateway:", "agent-gateway-browser:")
+            check("browser-image", ["docker", "build", "--target", "login-browser", "-t", browser_image, "."])
+            env["AGW_TEST_BROWSER_IMAGE"] = browser_image
         junit = output / "junit.xml"
         check("pytest", [sys.executable, "-m", "pytest", "-v", "-x", "--tb=short", "-o", "faulthandler_timeout=120", f"--junitxml={junit}"], env=env)
         if source_fingerprint() != report["source_sha256"]:
@@ -101,8 +105,8 @@ def main() -> int:
                 for key in counts:
                     counts[key] += int(suite.get(key, 0))
             report["tests"] = counts
-        if image:
-            subprocess.run(["docker", "image", "rm", image], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for built_image in filter(None, [image, browser_image]):
+            subprocess.run(["docker", "image", "rm", built_image], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         report["finished"] = datetime.now(timezone.utc).isoformat()
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"\nAcceptance {report['status']}: {output / 'report.json'}")

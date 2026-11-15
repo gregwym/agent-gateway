@@ -182,8 +182,15 @@ const messages = {
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   web_session_busy: ['Another read is in progress. Try again shortly.', '正在读取这个网站，请稍后重试。'],
   web_session_storage_failed: ['The updated session could not be saved. Check the gateway storage and import a fresh session.', '更新后的会话无法保存。请检查网关存储，再导入新会话。'],
+  web_browser_sign_in_required: ['The order page still requires sign-in. Finish signing in above and try again.', '订单页仍要求登录。请在上方完成登录后再保存。'],
+  web_browser_unavailable: ['The sign-in browser could not start. Check the Gateway browser service.', '登录浏览器无法启动，请检查网关的浏览器服务。'],
+  web_browser_in_use: ['Another website sign-in is already open. Close it or wait for it to expire.', '已有一个网站登录窗口。请关闭它或等待过期。'],
+  web_browser_expired: ['This sign-in window expired. Open a new one and try again.', '此次登录窗口已过期，请重新打开。'],
+  web_browser_timeout: ['The login browser stopped responding. Refresh it or open a new window.', '登录浏览器响应超时，请刷新或重新打开窗口。'],
+  web_browser_failed: ['The login page could not be loaded or operated. Refresh it and try again.', '无法加载或操作登录页，请刷新后重试。'],
+  web_browser_input: ['This browser action is invalid. Try again.', '浏览器操作无效，请重试。'],
   web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
-  web_login_required: ['The website needs you to sign in again. Import a fresh session in Edit settings.', '网站需要重新登录。请在「编辑设置」中导入新会话。'],
+  web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
   web_profile_mismatch: ['The site did not return the expected page. This profile may need an update.', '网站未返回预期页面，可能需要更新站点配置。'],
   web_http_rejected: ['The website rejected the read request.', '网站拒绝了读取请求。'],
   web_redirect_refused: ['The site redirected to an unapproved page. The gateway stopped the request.', '网站跳转到了站点配置之外的页面，网关已停止请求。'],
@@ -952,12 +959,12 @@ function connectorForm(existing, reauthorize = false) {
         const plugin = state.plugins.find(p => p.id === settings.plugin.value);
         if (web) {
           const site = existing?.website || plugin;
-          const link = el(fields, 'a', tr('Open website to sign in', '打开网站登录'));
-          link.href = site.origin; link.target = '_blank'; link.rel = 'noopener noreferrer';
-          if (site.experimental) el(fields, 'p', tr('Experimental profile; signing in and reading live orders are not yet verified.', '实验性站点配置，尚未验证真实账号登录和订单读取。'), 'hint');
-          const upload = field(fields, tr('Browser session JSON', '浏览器会话 JSON'), 'session_file', '', 'file',
-            existing ? tr('Choose a file only to replace this session.', '需要更换会话时才选择文件。') : tr('Use a cookie export from the signed-in browser.', '请选择登录后从浏览器导出的 Cookie 文件。'));
-          upload.accept = '.json,application/json'; upload.required = !existing;
+          if (site.experimental) el(fields, 'p', tr('Experimental · read only', '实验功能 · 只读'), 'hint');
+          if (!state.website_login) el(fields, 'p', tr('The sign-in browser is offline. You can still import a session under Advanced.', '登录浏览器暂不可用。仍可在高级选项中导入会话。'), 'hint');
+          const advanced = el(fields, 'details');
+          el(advanced, 'summary', tr('Advanced: import a session file', '高级：导入会话文件'));
+          const upload = field(advanced, tr('Browser session JSON', '浏览器会话 JSON'), 'session_file', '', 'file');
+          upload.accept = '.json,application/json';
           credentials.AGwSessionUpload = upload;
           return;
         }
@@ -1053,6 +1060,8 @@ function connectorForm(existing, reauthorize = false) {
     return kind.value === 'gmail' && (systemGmail() || reauthorize || settings.gmail_access.value !== (existing.settings.gmail_access || 'read'));
   }
   function saveLabel() {
+    if (kind.value === 'web') return credentials.AGwSessionUpload?.files?.length
+      ? tr('Import session', '导入会话') : existing ? tr('Sign in again', '重新登录') : tr('Sign in to website', '登录网站');
     if (gmailConsent()) return tr('Authorize with Google', '通过 Google 授权');
     if (needsReview()) return tr('Preview tools', '预览工具');
     if (needsOAuth()) return tr('Authorize and save', '授权并保存');
@@ -1066,7 +1075,12 @@ function connectorForm(existing, reauthorize = false) {
     const google = gmailConsent(), oauth = needsOAuth(), review = needsReview();
     if (payload.kind === 'web') {
       const file = credentials.AGwSessionUpload.files[0];
-      if (file?.size > 60000) throw new Error(tr('The browser session file exceeds 60 KB.', '浏览器会话文件超过 60 KB。'));
+      if (!file) {
+        const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, plugin: payload.settings.plugin});
+        showWebsiteLogin(flow, box);
+        return;
+      }
+      if (file.size > 60000) throw new Error(tr('The browser session file exceeds 60 KB.', '浏览器会话文件超过 60 KB。'));
       payload.credentials = file ? {AGW_WEB_SESSION: await file.text()} : {};
     }
     if (google) {
@@ -1084,14 +1098,124 @@ function connectorForm(existing, reauthorize = false) {
     await mutate('connections/save', payload);
     box.close(); notify(tr('Connector saved.', '连接器已保存。'));
   }, 'primary', tr('Saving…', '正在保存…'));
+  save.classList.add('connector-save');
   kind.addEventListener('change', fields);
   function updateSave() {
-    save.hidden = kind.value === 'gmail' && systemGmail() && !state.gmail_oauth.client_id;
+    save.hidden = (kind.value === 'gmail' && systemGmail() && !state.gmail_oauth.client_id)
+      || (kind.value === 'web' && !state.website_login && !credentials.AGwSessionUpload?.files?.length);
     if (!save.disabled) save.textContent = saveLabel();
   }
   form.addEventListener('input', updateSave);
   form.addEventListener('change', updateSave);
   updateSave();
+}
+function showWebsiteLogin(flow, connector) {
+  const box = modal(tr('Website sign-in', '网站登录'));
+  box.classList.add('website-login');
+  const host = el(box, 'p', flow.host, 'login-host');
+  el(box, 'p', tr('Tap a field in the page, then type below. Complete the website’s sign-in before saving.',
+    '先点网页中的输入框，再用下方键盘输入。完成网站登录后再保存。'), 'hint');
+  const keyboard = el(box, 'form', undefined, 'login-keyboard');
+  const input = field(keyboard, tr('Type into the selected field', '输入到选中的框'), 'login_input', '', 'password');
+  input.setAttribute('autocapitalize', 'none'); input.spellcheck = false;
+  input.maxLength = 2048;
+  const send = el(keyboard, 'button', tr('Type', '输入'));
+  send.type = 'submit';
+  const tools = el(box, 'div', undefined, 'actions login-controls');
+  const picture = el(box, 'img', undefined, 'login-frame');
+  picture.width = flow.width; picture.height = flow.height; picture.draggable = false;
+  picture.alt = tr('Interactive sign-in page', '可操作的网站登录页');
+  const status = el(box, 'p', tr('Loading sign-in page…', '正在加载登录页…'), 'hint');
+  status.setAttribute('role', 'status');
+  let busy = false, timer, url, saved = false, pointer;
+  function frame(result) {
+    const bytes = Uint8Array.from(atob(result.image), c => c.charCodeAt(0));
+    if (url) URL.revokeObjectURL(url);
+    url = URL.createObjectURL(new Blob([bytes], {type: 'image/jpeg'}));
+    picture.src = url;
+    host.textContent = result.host || flow.host;
+    status.textContent = '';
+  }
+  async function perform(op, props = {}) {
+    if (busy || !box.open) return;
+    busy = true;
+    send.disabled = true;
+    try {
+      const result = await api('web-login/' + op, {id: flow.id, ...props}, op === 'save' ? 60000 : 15000);
+      if (!box.open) return;
+      if (op === 'save') {
+        saved = true;
+        box.close();
+        connector.close();
+        await refresh();
+        notify(tr('Website connected. Grant access under Permissions.', '网站已连接。请在「权限」中授予 Agent 访问。'));
+      } else frame(result);
+    } finally { busy = false; send.disabled = false; }
+  }
+  function action(op, props = {}) {
+    if (busy) return;
+    box.querySelector('.operation-error')?.remove();
+    perform(op, props).catch(error => showError(box, error));
+  }
+  keyboard.addEventListener('submit', event => {
+    event.preventDefault();
+    if (!input.value || busy) return;
+    const text = input.value;
+    input.value = '';
+    action('text', {text});
+  });
+  button(tools, 'Tab', () => perform('key', {key: 'Tab'}));
+  button(tools, 'Enter', () => perform('key', {key: 'Enter'}));
+  button(tools, '⌫', () => perform('key', {key: 'Backspace'})).setAttribute('aria-label', tr('Backspace', '退格'));
+  button(tools, tr('Reload', '刷新'), () => perform('reload'));
+  button(tools, tr('Save connection', '保存连接'), () => perform('save'), 'primary', tr('Checking orders…', '正在检查订单…'));
+  const coordinate = event => {
+    const rect = picture.getBoundingClientRect(), clamp = (n, max) => Math.min(max - 1, Math.max(0, Math.floor(n)));
+    return {x: clamp((event.clientX - rect.left) * flow.width / rect.width, flow.width),
+            y: clamp((event.clientY - rect.top) * flow.height / rect.height, flow.height)};
+  };
+  picture.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || !picture.src) return;
+    picture.setPointerCapture(event.pointerId);
+    pointer = {id: event.pointerId, ...coordinate(event)};
+  });
+  picture.addEventListener('pointerup', event => {
+    if (pointer?.id !== event.pointerId) return;
+    const point = coordinate(event), dx = pointer.x - point.x, dy = pointer.y - point.y;
+    if (Math.hypot(dx, dy) > 20) action('scroll', {x: pointer.x, y: pointer.y, dx: Math.round(dx * 1.6), dy: Math.round(dy * 1.6)});
+    else action('tap', point);
+    pointer = null;
+  });
+  picture.addEventListener('pointercancel', () => { pointer = null; });
+  picture.addEventListener('wheel', event => {
+    if (!picture.src) return;
+    event.preventDefault();
+    const amount = delta => Math.round(Math.max(-1200, Math.min(1200, delta * (event.deltaMode === 1 ? 25 : 1))));
+    const dx = amount(event.deltaX), dy = amount(event.deltaY);
+    if (dx || dy) action('scroll', {...coordinate(event), dx, dy});
+  }, {passive: false});
+  async function poll() {
+    if (!box.open || !box.isConnected) return;
+    try {
+      // Do not consume a tap while a passive screen refresh is in flight.
+      if (!busy) {
+        const result = await api('web-login/frame', {id: flow.id}, 15000);
+        if (!busy && box.open && box.isConnected) frame(result);
+      }
+    } catch (error) {
+      if (!box.open || !box.isConnected) return;
+      showError(box, error);
+      if (error.code === 'web_browser_expired') return;
+    }
+    if (box.open && box.isConnected) timer = setTimeout(poll, 1700);
+  }
+  box.addEventListener('close', () => {
+    clearTimeout(timer);
+    input.value = '';
+    if (url) URL.revokeObjectURL(url);
+    if (!saved) api('web-login/cancel', {id: flow.id}, 10000).catch(() => {});
+  });
+  poll();
 }
 function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));

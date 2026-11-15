@@ -520,19 +520,22 @@ stdio MCP 示例：
 
 ### 网站会话
 
-在「连接器 → 添加连接器 → 网站」选择站点。用自己的浏览器登录，导入该站 Cookie 的 JSON 文件，应用后点
-「验证连接」。格式为浏览器导出的 Cookie 数组或 Playwright 的 `storageState`；其他站点 Cookie 与浏览器存储不会采用。
-如果浏览器没有导出能力，可在自己的电脑上安装 Playwright Chromium，用
-`python -m examples.export_web_session amazon-us ./browser-session.json`（Weee 用 `weee-orders`），
-在打开的独立窗口登录再导出。上传后删除本地文件。
+在手机或电脑打开「连接器 → 添加连接器 → 网站」，选择站点后点「登录网站」。在登录页点选输入框，
+再用下方的输入框输入账号、密码或验证码。登录后点「保存连接」；网关先验证能否读取订单，再加密保存
+会话。旧会话失效时，在「编辑设置」中点「重新登录」。新连接默认不向 Agent 开放。
 
-每个连接只会向站点配置的 HTTPS 来源发送会话，HTTPS 请求使用验证过的公网地址，不跟随跳转。
-更新的 Cookie 加密保存，重启后会复用。会话过期时在「编辑设置」导入新的会话。
-凭据需备份 `admin.enc` 和存在时的 `admin.enc.web-sessions`；删除连接会删除 Gateway 保存的会话，
-在站点撤销会话需使用服务商自己的账户设置。
+Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据，也没有直接网络访问。登录窗口仅供
+管理员使用，关闭后清除浏览器数据。依赖手机本机通行密钥的站点登录方式无法在此窗口使用。
 
-Amazon US 和 Weee! 为实验配置。模拟验收覆盖账号隔离、限定读取和会话轮换。实际站点可能要求浏览器
-脚本、验证或新的页面结构；此时会显示错误，不能用模拟验收代替实站验证。
+「高级：导入会话文件」仍支持 Cookie JSON 数组或 Playwright `storageState`。无法在登录窗口完成
+登录时，可在自己的电脑运行 `python -m examples.export_web_session amazon-us ./browser-session.json`，
+Weee 用 `weee-orders`。导入后删除文件。
+
+订单读取只向配置的 HTTPS 来源发送 Cookie，不跟随跳转。会话备份包括 `admin.enc` 和存在时的
+`admin.enc.web-sessions`。删除连接会删除网关保存的会话；撤销网站端会话请使用网站账户设置。
+
+Amazon US 和 Weee! 为实验配置。模拟验收覆盖登录、账号隔离和限定读取；实站可能要求额外验证，
+或返回与已知读取规则不同的页面。
 
 可用 `kind: "web"` 的扩展增加任意**已知读取操作**的站点：清单的 `web` 字段声明 `origin`、`probe` 和 `actions`。
 每个操作指定 `path`、`description`、可选 `query` 和 `parameters`（工具参数名映射到查询参数名）。

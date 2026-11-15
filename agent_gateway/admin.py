@@ -15,6 +15,7 @@ from starlette.routing import Route
 
 from . import __version__, registry
 from .admin_auth import AdminAuth, COOKIE
+from .admin_web_login import WebsiteLogin
 from .admin_config import (
     CATALOG, CONNECTION_ACCESS, CONNECTOR_NAME, ManagedStore, catalog_additions, connection_access,
     extend_catalog_tools, kind_of, mailbox_metadata, make_connection, member_name, settings_of, tool_access,
@@ -30,6 +31,16 @@ from .web_errors import connector_failure, failure_response, probe_error
 from .web_profiles import PROFILE_ENV, WebProfile
 
 
+_ADMIN_PAGE_HEADERS = {**_PAGE_HEADERS, "Content-Security-Policy":
+                       _PAGE_HEADERS["Content-Security-Policy"] + "; img-src blob:"}
+
+
+def admin_page():
+    response = _static("admin.html", "text/html; charset=utf-8")
+    response.headers.update(_ADMIN_PAGE_HEADERS)
+    return response
+
+
 def needs_admin_confirmation(operation, body):
     if operation == "permissions/save":
         return body.get("effect") != "deny"
@@ -39,7 +50,7 @@ def needs_admin_confirmation(operation, body):
     return operation in {
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
-        "settings/gmail-oauth",
+        "settings/gmail-oauth", "web-login/start",
     }
 
 
@@ -57,6 +68,7 @@ class AdminController:
         self.oauth = OAuthVault(self.store.base)
         from .web_sessions import WebSessions
         self.web_sessions = WebSessions(self.store.base)
+        self.website_login = WebsiteLogin(self)
         self.mcp_oauth = MCPConsent(self)
         from .admin_oauth import GoogleConsent
         self.google = GoogleConsent(self)
@@ -75,6 +87,7 @@ class AdminController:
     async def sweep(self):
         while True:
             await anyio.sleep(30)
+            await self.website_login.expire()
             async with self.mutex:
                 now = time.time()
                 self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > now}
@@ -207,6 +220,7 @@ class AdminController:
                 "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
                 "plugins": [plugin.public() for plugin in plugins.values()],
+                "website_login": self.website_login.available(),
                 "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()
                             if k != "local" or any(p.kind != "web" for p in plugins.values())
                             or any(kind_of(c) == "local" for c in gw.cfg.connections)}}
@@ -270,6 +284,18 @@ class AdminController:
         self.stage_connection(state, cfg, conn, added)
         result = await self._commit(state, "connections/save")
         return {**result, "saved": True, "id": conn.id}
+
+    def stage_website(self, state, cfg, conn, added, definitions):
+        from .admin_remote import remote_tools
+        conn = remote_tools(conn, definitions, cfg)
+        if not conn.tools:
+            raise Refused("remote_no_tools", 422)
+        conn = conn.model_copy(update={"tools": [t.model_copy(update={"access": "read"}) for t in conn.tools]})
+        self.stage_connection(state, cfg, conn, added)
+        lock = Lock()
+        for tool in conn.tools:
+            lock.put(conn.id, definitions[tool.upstream])
+        state["locks"][conn.id] = lock.entries[conn.id]
 
     def preview_result(self, state, conn, added, definitions, session):
         from .admin_remote import remote_tools
@@ -780,7 +806,7 @@ class AdminController:
         async def page(request):
             if request.headers.get("host") != authority:
                 return _json({"error": "wrong_origin"}, 403)
-            return _static("admin.html", "text/html; charset=utf-8")
+            return admin_page()
 
         async def asset(request):
             name = request.path_params["name"]
@@ -834,11 +860,14 @@ class AdminController:
                     raise Refused("csrf_required")
                 if operation == "auth/logout":
                     self.auth.logout(token)
+                    await self.website_login.expire(logout=session["id"])
                     response = _json({"ok": True}, 200)
                     response.delete_cookie(cookie_name, path=cookie_path, secure=secure, httponly=True, samesite="strict")
                     return response
                 if operation == "registry/search":
                     return _json(await registry.search(body), 200)
+                if operation.startswith("web-login/") and operation != "web-login/start":
+                    return _json(await self.website_login.input(operation.split("/", 1)[1], body, session, token), 200)
                 async with self.editing():
                     session = self.auth.session(token)  # may have expired while waiting
                     if needs_admin_confirmation(operation, body):
@@ -848,7 +877,9 @@ class AdminController:
                             return _json({"error": "admin_confirmation_required", "confirmation": ceremony}, 403)
                         proof = body.pop("confirmation")
                         self.auth.confirm(session, operation, body, revision, proof)
-                    result = await self.operate(operation, body, session)
+                    if operation != "web-login/start":
+                        return _json(await self.operate(operation, body, session), 200)
+                result = await self.website_login.start(body, session)
                 return _json(result, 200)
             except Refused as exc:
                 return _json({"error": exc.code, **({"incident": exc.incident} if exc.incident else {})}, exc.status)
@@ -873,7 +904,7 @@ class AdminController:
             data = {**json.loads(error.body), "status": error.status_code}
             marker = '<meta name="gateway-error" content="' + html.escape(json.dumps(data), quote=True) + '">'
             page = _static("admin.html", "text/html").body.decode().replace("</head>", marker + "</head>")
-            return HTMLResponse(page, status_code=error.status_code, headers=_PAGE_HEADERS)
+            return HTMLResponse(page, status_code=error.status_code, headers=_ADMIN_PAGE_HEADERS)
 
         return [Route("/", page), Route("/admin", page), Route("/admin/", page),
                 *(Route(f"/admin/{section}", page) for section in ("members", "agents", "connections", "permissions", "settings")),
