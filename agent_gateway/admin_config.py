@@ -26,7 +26,10 @@ CONNECTION_ACCESS = {
     "read_write_approval": {"read": "approval_required", "write": "approval_required"},
     "read_approval_write_direct": {"read": "approval_required", "write": "allow"},
 }
+from .admin_remote import SPEC, make_remote
+
 CATALOG = {
+    "remote": SPEC,
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
              "probe": ("list_notes", {"folder": "inbox"})},
@@ -174,6 +177,8 @@ class ManagedStore:
 def kind_of(conn):
     if conn.transport == "http" and conn.service == "reminders":
         return "reminders"
+    if conn.transport == "http":
+        return "remote"
     command = " ".join(conn.command)
     for needle, kind in (("demo_connector.py", "demo"), ("agent_gateway.demo_connector", "demo"), ("connectors.imap_mail", "imap"),
                          ("connectors.caldav_calendar", "caldav"), ("connectors.gmail", "gmail")):
@@ -191,6 +196,9 @@ def settings_of(conn):
     result = {names[key]: value for key, value in conn.env.items() if key in names}
     if conn.transport == "http":
         result["url"] = conn.url
+        if kind_of(conn) == "remote":
+            result.update(service=conn.service, auth="oauth" if conn.oauth_ref else "bearer" if conn.bearer_secret else "header" if conn.secret_headers else "none",
+                          header=next(iter(conn.secret_headers), ""))
     return result
 
 
@@ -246,6 +254,8 @@ def make_connection(body, cfg, values):
     previous = next((c for c in cfg.connections if c.id == name), None)
     if previous and (kind_of(previous) != kind or previous.owner != owner):
         raise Refused("connector_identity_is_fixed", 409)
+    if kind == "remote":
+        return make_remote(name, owner, settings, provided, previous, values)
     fresh = {}
 
     def field(key, default=""):

@@ -8,10 +8,34 @@ let csrf = '', state = null, tab = 'overview', subject = '', noticeTimer;
 const advancedConnections = new Set();
 let setupCode = new URLSearchParams(location.hash.slice(1)).get('setup') || '';
 let gmailResult = new URLSearchParams(location.search).get('gmail');
+let mcpOAuthResult = new URLSearchParams(location.search).get('mcp_oauth');
 const navigationError = document.querySelector('meta[name="gateway-error"]');
 if (navigationError) history.replaceState(null, '', '/admin/');
 if (location.hash) history.replaceState(null, '', location.pathname);
 const messages = {
+  oauth_refresh_busy: ['An OAuth request is still running. Wait for it to finish and revoke again.', 'OAuth 请求仍在执行，请等待结束后再次撤销授权。'],
+  oauth_registration_rejected: ['The provider rejected automatic client registration. Use a registered client or check its supported client settings.', '服务商拒绝自动注册客户端，请使用已注册客户端，或检查其支持的客户端配置。'],
+  oauth_discovery_failed: ['OAuth metadata is invalid or does not match this MCP resource or issuer. Check the server configuration.', 'OAuth 元数据无效，或与 MCP 资源、issuer 不匹配，请检查服务器配置。'],
+  oauth_callback_invalid: ['The authorization response failed state or issuer validation. Start authorization again.', '授权回调的 state 或 issuer 校验失败，请重新授权。'],
+  oauth_reauthorization_required: ["OAuth authorization is missing, expired, or revoked. Authorize this connection again.", "OAuth 授权缺失、过期或已撤销，请重新授权此连接。"],
+  oauth_issuer_required: ["Enter the authorization server issuer for this registered OAuth client.", "使用已注册的 OAuth 客户端时，请填写授权服务器的 issuer 地址。"],
+  oauth_issuer_changed: ["The discovered authorization server differs from the configured issuer. Check the MCP address and issuer.", "发现的授权服务器与配置的 issuer 不一致，请核对 MCP 地址和 issuer。"],
+  oauth_client_settings_invalid: ["Check the OAuth client ID, secret and token authentication method. Use either a registered client or a client metadata URL.", "请核对 OAuth 客户端 ID、密钥和 Token 认证方式；已注册客户端与客户端元数据 URL 只能选一种。"],
+  oauth_metadata_missing: ["The server did not publish usable OAuth metadata. Check its MCP and authorization-server configuration.", "服务器没有提供有效的 OAuth 元数据，请检查 MCP 及授权服务器配置。"],
+  oauth_pkce_required: ["The authorization server must support PKCE S256.", "授权服务器必须支持 PKCE S256。"],
+  oauth_client_registration_required: ["This server does not support automatic client registration. Enter a registered client ID and issuer.", "此服务器不支持自动注册客户端，请填写已注册的客户端 ID 和 issuer。"],
+  oauth_scope_rejected: ["The authorization does not permit this operation. Reauthorize with the required scopes.", "当前授权范围不允许此操作，请使用所需 scope 重新授权。"],
+  oauth_token_rejected: ["The authorization server rejected the token request. Check client settings and authorize again.", "授权服务器拒绝了 Token 请求，请检查客户端设置并重新授权。"],
+  oauth_refresh_failed: ["The authorization server could not refresh the token. Check its availability and retry.", "授权服务器未能刷新 Token，请检查服务可用性后重试。"],
+  oauth_not_required: ["This MCP endpoint did not request OAuth. Select no authentication or check the endpoint URL.", "此 MCP 接口没有请求 OAuth，请选择无需认证或核对接口地址。"],
+  invalid_remote_settings: ["Choose a valid authentication mode and a service ID using lowercase letters, digits, underscores or hyphens.", "请选择有效认证方式；服务标识只能使用小写字母、数字、下划线或连字符。"],
+  invalid_remote_token: ["The credential contains a newline or control character. Paste only the credential value.", "凭据包含换行或控制字符，请只粘贴凭据本身。"],
+  invalid_credential_header: ["Enter an API-key header such as X-API-Key. Routing and protocol headers cannot hold credentials.", "请填写 X-API-Key 等 API 密钥 Header，路由和协议 Header 不能用于凭据。"],
+  invalid_remote_tool_list: ["The server returned duplicate tool names, more than 1,000 tools, or a list that did not finish within 50 pages.", "服务器返回了重复工具名、超过 1,000 个工具，或工具列表超过 50 页仍未结束。"],
+  remote_tool_selection_required: ["Select at least one tool and classify it as read or write.", "请至少选择一个工具，并标明读取或写入。"],
+  invalid_remote_tool_selection: ["The tool selection is invalid. Preview the current tools again.", "工具选择无效，请重新预览当前工具。"],
+  remote_no_tools: ["This MCP server returned no tools for the current authorization.", "此 MCP 服务器没有为当前授权返回工具。"],
+
   login_required: ['Your session expired. Sign in again.', '会话已过期，请重新登录。'],
   invalid_setup_link: ['This setup link is invalid, expired, or already used.', '设置链接无效、已过期或已被使用。'],
   verification_failed: ['Passkey verification failed. Try again.', '通行密钥验证失败，请重试。'],
@@ -30,7 +54,7 @@ const messages = {
   connector_executable_denied: ['The gateway cannot execute the connector program. Check host file permissions.', '网关无权执行连接器程序，请检查主机文件权限。'],
   connector_process_exited: ['The connector process exited before completing the request. Check its required settings and host installation.', '连接器进程在请求完成前退出，请检查必要配置及主机安装。'],
   connector_protocol_error: ['The connector rejected the MCP request or returned an invalid protocol response.', '连接器拒绝了 MCP 请求，或返回了无效的协议响应。'],
-  connector_auth_rejected: ['The upstream service rejected the saved token. Update this connector’s credentials.', '上游服务拒绝了已保存的 Token，请更新连接器凭据。'],
+  connector_auth_rejected: ['The upstream service rejected or requires authentication. Check the authentication method and credentials.', '上游服务拒绝认证或要求提供认证，请检查连接的认证方式和凭据。'],
   connector_access_denied: ['The upstream account lacks permission for this read operation. Check its grants.', '上游账号没有执行此次读取的权限，请检查授权。'],
   connector_endpoint_missing: ['The service returned HTTP 404. Check the complete MCP endpoint URL.', '服务返回 HTTP 404，请检查完整的 MCP 接口地址。'],
   connector_rate_limited: ['The upstream service rate-limited this request. Wait before retrying.', '上游服务限制了请求频率，请稍后重试。'],
@@ -83,16 +107,16 @@ const messages = {
   restrictions_object_required: ['Fixed arguments and allowed values must each be a JSON object.', '固定参数和允许值必须分别为 JSON 对象。'],
   restriction_conflict: ['The same argument cannot be both fixed and restricted to allowed values.', '同一个参数不能同时设为固定参数和允许值限制。'],
   allowed_values_required: ['Each allowed-values entry must be a non-empty JSON array.', '每个允许值条目必须是非空 JSON 数组。'],
-  oauth_already_used: ['This Google callback was already used. Start authorization again.', '此次 Google 回调已使用，请重新发起授权。'],
-  oauth_wrong_session: ['Google authorization belongs to another login session. Continue in the original session or start again.', '此次 Google 授权属于另一个登录会话，请回到原会话或重新授权。'],
-  oauth_not_ready: ['Google authorization has not finished. Complete it before continuing.', 'Google 授权尚未完成，请先完成授权。'],
-  oauth_refresh_token_missing: ['Google did not issue a refresh token. Reauthorize and allow offline access.', 'Google 没有返回刷新令牌，请重新授权并允许离线访问。'],
-  oauth_client_rejected: ['Google rejected the OAuth client ID or secret. Check the Web application client settings.', 'Google 拒绝了 OAuth 客户端 ID 或密钥，请检查 Web 应用客户端配置。'],
-  oauth_code_rejected: ['Google rejected the authorization code or callback URL. Check the exact redirect URI and authorize again.', 'Google 拒绝了授权码或回调地址，请核对完整重定向 URI 并重新授权。'],
-  oauth_network_failed: ['The gateway could not reach Google’s authorization server. Check outbound HTTPS access.', '网关无法连接 Google 授权服务器，请检查出站 HTTPS 访问。'],
+  oauth_already_used: ['This OAuth callback was already used. Start authorization again.', '此次 OAuth 回调已使用，请重新发起授权。'],
+  oauth_wrong_session: ['OAuth authorization belongs to another login session. Continue in the original session or start again.', '此次 OAuth 授权属于另一个登录会话，请回到原会话或重新授权。'],
+  oauth_not_ready: ['OAuth authorization has not finished. Complete it before continuing.', 'OAuth 授权尚未完成，请先完成授权。'],
+  oauth_refresh_token_missing: ['OAuth did not issue a refresh token. Reauthorize and allow offline access.', 'OAuth 没有返回刷新令牌，请重新授权并允许离线访问。'],
+  oauth_client_rejected: ['OAuth rejected the OAuth client ID or secret. Check the Web application client settings.', 'OAuth 拒绝了 OAuth 客户端 ID 或密钥，请检查 Web 应用客户端配置。'],
+  oauth_code_rejected: ['OAuth rejected the authorization code or callback URL. Check the exact redirect URI and authorize again.', 'OAuth 拒绝了授权码或回调地址，请核对完整重定向 URI 并重新授权。'],
+  oauth_network_failed: ['The gateway could not reach the authorization server. Check outbound HTTPS access.', '网关无法连接 OAuth 授权服务器，请检查出站 HTTPS 访问。'],
   oauth_profile_rejected: ['Google did not allow the Gmail account check. Confirm Gmail API access and the read-only grant.', 'Google 拒绝了 Gmail 账号验证，请确认 Gmail API 访问和只读授权。'],
-  oauth_timeout: ['Google authorization timed out. Check network access and start authorization again.', 'Google 授权超时，请检查网络访问并重新授权。'],
-  oauth_invalid_response: ['Google returned an invalid authorization or account response. Start authorization again.', 'Google 返回了无效的授权或账号响应，请重新授权。'],
+  oauth_timeout: ['OAuth authorization timed out. Check network access and start authorization again.', 'OAuth 授权超时，请检查网络访问并重新授权。'],
+  oauth_invalid_response: ['OAuth returned an invalid authorization or account response. Start authorization again.', 'OAuth 返回了无效的授权或账号响应，请重新授权。'],
   pin_unknown_argument: ['A fixed argument does not exist in this tool’s reviewed schema. Remove that argument.', '固定参数包含工具定义中不存在的参数，请移除此参数。'],
   allow_values_unknown_argument: ['An allowed-values restriction names an argument absent from this tool’s schema.', '允许值限制使用了工具定义中不存在的参数。'],
   missing_tool_lock: ['A tool has no reviewed definition. Edit and preview this connector again.', '工具缺少已审阅的定义，请编辑并重新预览连接器。'],
@@ -136,10 +160,10 @@ const messages = {
   invalid_tool_configuration: ['A tool restriction does not match its schema.', '工具参数限制与工具定义不匹配。'],
   connector_identity_is_fixed: ['Owner and connector type cannot be changed. Add a new connector instead.', '连接器类型和所属成员固定，请新建连接器。'],
   wrong_origin: ['Open the configured HTTPS address.', '请打开配置的 HTTPS 地址。'],
-  oauth_declined: ['Google authorization was cancelled. No connector was changed.', 'Google 授权已取消，连接器未发生变更。'],
-  oauth_failed: ['Google authorization failed. Check the web OAuth client and callback URL.', 'Google 授权失败，请检查网页 OAuth 客户端和回调地址。'],
+  oauth_declined: ['OAuth authorization was cancelled. No connector was changed.', 'OAuth 授权已取消，连接器未发生变更。'],
+  oauth_failed: ['OAuth authorization failed. Check the web OAuth client and callback URL.', 'OAuth 授权失败，请检查网页 OAuth 客户端和回调地址。'],
   gmail_readonly_required: ['Google must grant exactly Gmail read-only access.', 'Google 必须只授予 Gmail 只读权限。'],
-  oauth_expired: ['Google authorization expired. Start again.', 'Google 授权已过期，请重新开始。'],
+  oauth_expired: ['OAuth authorization expired. Start again.', 'OAuth 授权已过期，请重新开始。'],
   active_calls_busy: ['Calls are still running. No configuration was changed; try again shortly.', '仍有调用正在执行，配置未变更，请稍后重试。'],
 };
 function el(parent, tag, text, cls) {
@@ -188,7 +212,7 @@ async function api(path, body, timeoutMs = 45000) {
     throw failure;
   } finally { clearTimeout(timer); }
   if (!response.ok) {
-    if (response.status === 401) { csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); }
+    if (response.status === 401 && data?.error === 'login_required') { csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); }
     throw serverError(data, response.status);
   }
   return data;
@@ -203,7 +227,7 @@ function serverError(data, status) {
       if (typeof field.path === 'string' && /^[a-zA-Z0-9_.]{1,160}$/.test(field.path)) message += ` ${field.path}: ${tr(...(reasons[field.reason] || ['invalid field value or configuration combination', '字段值或配置组合不合法']))}.`;
     }
     if (/^[a-f0-9]{12}$/.test(data?.incident || '')) message += tr(' Error ID: ', ' 错误编号：') + data.incident;
-    return new Error(message);
+    const error = new Error(message); error.code = data?.error; return error;
 }
 function button(parent, label, action, cls = '', busyLabel = '') {
   const node = el(parent, 'button', label, cls); node.type = 'button';
@@ -475,20 +499,36 @@ function connections() {
   const grid = el(app, 'div', undefined, 'grid');
   for (const conn of state.connections) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'h2', conn.id, 'connector-title'); el(card, 'p', identityLabel(conn.owner) + ' · ' + (state.catalog[conn.kind]?.label || tr('Custom YAML connector', 'YAML 自定义连接器')), 'muted');
-    const failed = conn.test?.ok === false;
-    el(card, 'span', failed ? tr('Read check failed', '读取验证失败') : conn.test?.ok ? tr('Read check passed', '读取验证通过') : conn.connected ? tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证') : tr('Connecting tools', '正在连接工具'), failed ? 'badge bad' : 'badge');
+    const failed = conn.test?.ok === false, remote = conn.kind === 'remote';
+    el(card, 'span', failed ? (remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败')) : conn.test?.ok ? (remote ? tr('MCP initialization and tools verified', 'MCP 初始化和工具验证通过') : tr('Read check passed', '读取验证通过')) : conn.connected ? (remote ? tr('MCP connected', 'MCP 已连接') : tr('Tools connected · account not yet checked', '工具已连接 · 账号待验证')) : tr('Connecting tools', '正在连接工具'), failed ? 'badge bad' : 'badge');
     if (failed) el(card, 'p', serverError({error: conn.test.reason, incident: conn.test.incident}, 422).message, 'error').setAttribute('role', 'alert');
     if (conn.kind === 'demo') el(card, 'p', tr('Synthetic data. Notes reset when the connector restarts.', '模拟数据。连接器重启后笔记会重置。'), 'hint');
     if (conn.kind === 'reminders') el(card, 'p', tr('Experimental. Requires a helper in the account owner’s Mac login session.', '实验性功能。需要在账号所有者的 Mac 登录会话中运行辅助服务。'), 'hint');
+    if (conn.oauth) {
+      if (conn.oauth.error) el(card, 'p', serverError({error: conn.oauth.error}, 401).message, 'error');
+      if (conn.oauth.issuer) el(card, 'p', tr('Authorization server: ', '授权服务器：') + conn.oauth.issuer, 'hint');
+      if (conn.oauth.scope) el(card, 'p', tr('Granted scopes: ', '已授权范围：') + conn.oauth.scope, 'hint');
+      if (!conn.oauth.refreshable && !conn.oauth.error) el(card, 'p', tr('The provider did not issue a refresh token. Reauthorization will be needed when access expires.', '服务商未提供刷新令牌，访问权限过期后需要重新授权。'), 'hint');
+    }
     toolUpdateNotice(card, conn);
     const actions = el(card, 'div', undefined, 'actions');
     if (conn.kind) {
       button(actions, tr('Test connection', '验证连接'), async () => {
         try { await api('connections/test', {id: conn.id}); }
         catch (error) { if (state) await refresh(); throw error; }
-        await refresh(); notify(tr('Read-only connection check passed.', '只读连接验证通过。'));
+        await refresh(); notify(remote ? tr('MCP initialization and tool discovery passed. No tool was executed.', 'MCP 初始化和工具发现通过，未执行工具。') : tr('Read-only connection check passed.', '只读连接验证通过。'));
       }, 'primary', tr('Testing connection…', '正在验证连接…'));
       button(actions, tr('Edit & review', '编辑并审阅'), () => connectorForm(conn));
+    }
+    if (conn.kind === 'remote') button(actions, tr('Review current tools', '审阅当前工具'), async () => {
+      showReview(await api('connections/review-tools', {id: conn.id, revision: state.revision}));
+    });
+    if (conn.oauth) {
+      button(actions, tr('Reauthorize', '重新授权'), () => connectorForm(conn));
+      button(actions, tr('Revoke authorization', '撤销授权'), () => confirmAction(tr('Revoke authorization?', '撤销授权？'), tr('The gateway will stop using these OAuth credentials. Reauthorize to connect again.', '网关将停止使用这些 OAuth 凭据，重新连接需要再次授权。'), async () => {
+        const result = await api('oauth/revoke', {id: conn.id, revision: state.revision}); await refresh();
+        notify(result.provider === 'revoked' ? tr('Authorization revoked locally and at the provider.', '已在网关和服务商撤销授权。') : result.provider === 'unsupported' ? tr('Gateway tokens cleared. The provider has no revocation endpoint; remove the grant in its account settings if needed.', '网关 Token 已清除。服务商未提供撤销接口，需要时请在其账号设置中移除授权。') : tr('Gateway tokens cleared. The provider revocation request failed; remove the grant in its account settings.', '网关 Token 已清除。服务商撤销请求失败，请在其账号设置中移除授权。'));
+      }), 'danger');
     }
     button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permission rules will be removed.', '该连接器的工具和权限规则将一起移除。'), async () => mutate('connections/remove', {id: conn.id})), 'danger');
   }
@@ -514,6 +554,26 @@ function connectorForm(existing) {
     dynamic.replaceChildren(); settings = {}; credentials = {};
     const spec = state.catalog[kind.value];
     const defaults = {host: 'imap.mail.me.com', port: '993', smtp_host: !existing || (existing.settings.host || 'imap.mail.me.com') === 'imap.mail.me.com' ? 'smtp.mail.me.com' : '', smtp_port: '587', smtp_security: 'starttls', url: kind.value === 'caldav' ? 'https://caldav.icloud.com' : '', timezone: 'UTC'};
+    if (kind.value === 'remote') {
+      settings.url = field(dynamic, tr('MCP endpoint URL', 'MCP 接口地址'), 'url', existing?.settings.url || '', 'url'); settings.url.required = true;
+      settings.service = field(dynamic, tr('Service ID', '服务标识'), 'service', existing?.settings.service || 'remote-mcp', 'text', tr('Use the same ID for accounts that expose the same service tools.', '同一服务的不同账号使用相同标识。')); settings.service.disabled = !!existing;
+      settings.auth = select(dynamic, tr('Authentication', '认证方式'), 'auth', [['none', tr('None', '无需认证')], ['bearer', 'Bearer token'], ['header', tr('API key header', 'API 密钥 Header')], ['oauth', 'OAuth']], existing?.settings.auth || 'oauth');
+      const tokenBox = el(dynamic, 'div'), headerBox = el(dynamic, 'div'), oauthBox = el(dynamic, 'div');
+      credentials.token = field(tokenBox, tr('Token / API key', 'Token / API 密钥'), 'token', '', 'password', existing ? tr('Blank keeps the saved value only when the endpoint is unchanged.', '接口地址未变时，留空保留原值。') : '');
+      settings.header = field(headerBox, tr('Credential header', '凭据 Header'), 'header', existing?.settings.header || 'X-API-Key');
+      el(oauthBox, 'p', tr('The gateway discovers the authorization server. Leave client fields blank for automatic registration, or enter a registered client and its issuer. Callback URL:', '网关会发现授权服务器。可留空客户端字段以自动注册，也可填写已注册客户端及其 issuer。回调地址：'), 'hint');
+      el(oauthBox, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
+      settings.issuer = field(oauthBox, 'Issuer', 'issuer', existing?.settings.issuer || '');
+      settings.client_id = field(oauthBox, tr('OAuth client ID (optional)', 'OAuth 客户端 ID（可选）'), 'client_id', existing?.settings.client_id || '');
+      credentials.client_secret = field(oauthBox, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password', existing ? tr('Leave blank to keep the saved value for this client.', '同一客户端留空保留原值。') : '');
+      settings.auth_method = select(oauthBox, tr('Client authentication', '客户端认证'), 'auth_method', [['none', tr('Public client (no secret)', '公共客户端（无密钥）')], ['client_secret_post', 'Client secret in POST'], ['client_secret_basic', 'Client secret in Basic header']], existing?.settings.auth_method || 'none');
+      settings.scope = field(oauthBox, tr('Scopes (optional, space separated)', 'Scope（可选，用空格分隔）'), 'scope', existing?.settings.scope || '', 'text', tr('Blank uses the scopes requested by the MCP server. Review them on the authorization page.', '留空使用 MCP 服务器要求的范围，请在授权页面核对。'));
+      settings.client_metadata_url = field(oauthBox, tr('Client metadata URL (optional)', '客户端元数据 URL（可选）'), 'client_metadata_url', existing?.settings.client_metadata_url || '', 'text', tr('For providers supporting URL-based client registration. Use instead of a client ID.', '用于支持 URL 客户端注册的服务商，与客户端 ID 二选一。'));
+      function authFields() { tokenBox.hidden = !['bearer', 'header'].includes(settings.auth.value); headerBox.hidden = settings.auth.value !== 'header'; oauthBox.hidden = settings.auth.value !== 'oauth'; }
+      settings.auth.addEventListener('change', authFields); authFields();
+      el(dynamic, 'p', tr('Preview initializes MCP and lists tools; it does not execute a tool. You choose which tools to expose and classify each as read or write.', '预览只初始化 MCP 并列出工具，不执行工具。你可以选择开放的工具，并标明读取或写入。'), 'hint');
+      return;
+    }
     for (const key of spec.fields) settings[key] = key === 'smtp_security' ? select(dynamic, labels[key], key, [['starttls', 'STARTTLS (587)'], ['tls', 'TLS (465)']], existing?.settings[key] ?? defaults[key]) : field(dynamic, labels[key], key, existing?.settings[key] ?? defaults[key] ?? '');
     for (const key of spec.secrets) credentials[key] = field(dynamic, labels[key], key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
     if (kind.value === 'demo') el(dynamic, 'p', tr('No real account needed. Includes read tools and a demo write that requires passkey approval.', '无需真实账号。包含只读工具，以及一个需要通行密钥审批的模拟写入工具。'), 'hint');
@@ -542,6 +602,9 @@ function connectorForm(existing) {
     name.value = name.value.trim();
     if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
     if (!form.reportValidity()) return;
+    if (kind.value === 'remote' && settings.auth.value === 'oauth') {
+      const result = await api('oauth/mcp/start', values()); location.assign(result.url); return;
+    }
     const result = await api('connections/preview', values());
     for (const input of Object.values(credentials)) input.value = '';
     showReview(result, box);
@@ -552,10 +615,21 @@ function showReview(result, form) {
   el(review, 'p', result.connection + ' · ' + identityLabel(result.owner), 'muted');
   if (result.google_account) el(review, 'p', tr('Authorized Google account: ', '已授权的 Google 账号：') + result.google_account, 'hint');
   el(review, 'p', tr('These descriptions and schemas are what authorized agents will see. New connectors and newly added tools grant no access. After applying, choose the connection access and approval settings for each Agent in Permissions. Existing tool permissions are preserved.', '已获授权的 Agent 将看到这些描述和参数定义。新连接器和新增工具默认不开放访问。应用后，请在「权限」中为每个 Agent 选择连接权限及审批设置。原有工具权限会保留。'), 'hint');
-  for (const definition of result.definitions) { el(review, 'h3', definition.name); el(review, 'pre', JSON.stringify(definition, null, 2)); }
+  if (result.oauth?.issuer) el(review, 'p', tr('Authorization server: ', '授权服务器：') + result.oauth.issuer, 'hint');
+  if (result.oauth?.scope) el(review, 'p', tr('Granted scopes: ', '已授权范围：') + result.oauth.scope, 'hint');
+  if (result.remote) el(review, 'p', tr('Unknown tools default to write. Mark a tool as read only after reviewing what it does. Unselected tools and read-to-write changes lose their existing grants.', '未知工具默认为写入，请确认工具行为后再标为读取。取消选择的工具，以及从读取改为写入的工具，将撤销原有授权。'), 'hint');
+  const selections = [];
+  for (const definition of result.definitions) {
+    if (result.remote) {
+      const row = el(review, 'div', undefined, 'row'); const included = checkbox(row, definition.name); included.checked = true;
+      const access = select(row, tr('Operation type: ', '操作类型：') + definition.name, 'access_' + selections.length, [['write', tr('Write', '写入')], ['read', tr('Read', '读取')]], result.tools.find(t => t.upstream === definition.name)?.access || 'write');
+      selections.push({upstream: definition.name, included, access});
+      const detail = el(review, 'details'); el(detail, 'summary', tr('Definition', '工具定义')); el(detail, 'pre', JSON.stringify(definition, null, 2));
+    } else { el(review, 'h3', definition.name); el(review, 'pre', JSON.stringify(definition, null, 2)); }
+  }
   const checked = checkbox(review, tr('I reviewed these definitions and permissions.', '我已审阅这些工具定义和权限。'));
   const apply = button(review, tr('Apply connector', '应用连接器'), async () => {
-    await mutate('connections/apply', {draft: result.draft, reviewed: checked.checked}); review.close(); if (form) form.close(); notify(tr('Connector applied. Run its read check next.', '连接器已应用，请继续运行读取验证。'));
+    await mutate('connections/apply', {draft: result.draft, reviewed: checked.checked, ...(result.remote ? {tools: selections.filter(s => s.included.checked).map(s => ({upstream: s.upstream, access: s.access.value}))} : {})}); review.close(); if (form) form.close(); notify(tr('Connector applied. Run its read check next.', '连接器已应用，请继续运行读取验证。'));
   }, 'primary'); apply.disabled = true; checked.addEventListener('change', () => { apply.disabled = !checked.checked; });
 }
 function toolUpdateNotice(parent, conn) {
@@ -584,10 +658,11 @@ function toolUpdateNotice(parent, conn) {
   }, 'primary', tr('Reading tool definitions…', '正在读取工具定义…'));
 }
 async function resumeGoogle() {
-  if (!gmailResult) return;
-  const id = gmailResult; gmailResult = null; history.replaceState(null, '', '/admin/');
-  try { const result = await api('oauth/complete', {id}); tab = 'connections'; render(); showReview(result); }
-  catch (error) { showError(app, error); }
+  if (!gmailResult && !mcpOAuthResult) return;
+  const operation = mcpOAuthResult ? 'oauth/mcp/complete' : 'oauth/complete';
+  const id = mcpOAuthResult || gmailResult; gmailResult = null; mcpOAuthResult = null; history.replaceState(null, '', '/admin/');
+  try { const result = await api(operation, {id}); tab = 'connections'; render(); showReview(result); }
+  catch (error) { showError(app, error); if (error.code === 'oauth_not_ready') { mcpOAuthResult = id; button(app, tr('Continue authorization', '继续授权'), resumeGoogle); } }
 }
 function permissions() {
   el(app, 'h1', tr('Inspect permissions', '检查权限'));
@@ -606,6 +681,12 @@ function permissions() {
   for (const conn of state.connections.filter(c => c.household === agent.household)) {
     const card = el(app, 'section', undefined, 'card permission-card'); card.dataset.connection = conn.id;
     el(card, 'h2', conn.id);
+    if (conn.oauth) {
+      if (conn.oauth.error) el(card, 'p', serverError({error: conn.oauth.error}, 401).message, 'error');
+      if (conn.oauth.issuer) el(card, 'p', tr('Authorization server: ', '授权服务器：') + conn.oauth.issuer, 'hint');
+      if (conn.oauth.scope) el(card, 'p', tr('Granted scopes: ', '已授权范围：') + conn.oauth.scope, 'hint');
+      if (!conn.oauth.refreshable && !conn.oauth.error) el(card, 'p', tr('The provider did not issue a refresh token. Reauthorization will be needed when access expires.', '服务商未提供刷新令牌，访问权限过期后需要重新授权。'), 'hint');
+    }
     toolUpdateNotice(card, conn);
     el(card, 'p', tr('Account owner: ', '账号归属：') + nameOf(conn.owner), 'muted');
     const reads = conn.tools.filter(t => t.access === 'read').length, writes = conn.tools.length - reads;

@@ -135,7 +135,7 @@ Agent 通过 MCP 能改变的管理状态仍只有发起待审批请求（每个
 3. **Token 是静态的。** 没有过期时间，不绑定来源主机；泄露即可冒用，直到轮换。缓解手段是 Tailscale ACL
    限制谁能连到 Gateway 端口、审计日志里的 `client` 和 `remote` 字段、以及简单的轮换流程。
 4. **没有网关客户端 OAuth。** 当前使用静态 Bearer Token。Gmail 的授权流程只用于上游账号，
-   不提供客户端 OAuth，也不代表通用 MCP 上游 OAuth 已实现。
+   通用 MCP 上游也支持 OAuth；两者均不提供客户端 OAuth。
 5. **配置文件是信任根。** 能改 `gateway.yaml`、lock 文件或重启 Gateway 的人拥有全部权限。
 6. **Gateway 本身不做 TLS。** Token 以明文 HTTP 头传输，必须跑在 Tailscale（WireGuard 加密）上或 TLS 终结之后。
 
@@ -170,7 +170,7 @@ Agent 通过 MCP 能改变的管理状态仍只有发起待审批请求（每个
 Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条约定：
 
 1. 一个进程（或一个 URL）只服务一个账号。不同账号使用独立 connection 和进程。
-2. 凭据由 Gateway 给：stdio 用 `secret_env`，HTTP 用 `bearer_secret` / `secret_headers`。
+2. 凭据由 Gateway 给：stdio 用 `secret_env`，HTTP 用 `bearer_secret` / `secret_headers`，或网页管理的 OAuth 授权。
 3. 工具不接受账号、用户或凭据参数。
 4. 工具结果里不出现凭据。
 
@@ -274,8 +274,8 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 优先复用现成 MCP，再考虑针对明确 API 的薄适配器。邮件读取不等于购物平台已接入，
 业务理解与跨来源聚合由 Agent 或上游服务负责。
 
-底层 HTTP / stdio Proxy 已实现；任意远程 MCP 的网页新增、凭据管理和工具审阅是下一阶段，尚未交付。
-网页目前仅有固定 Connector 目录，通用上游 OAuth 也尚未实现。
+远程 Streamable HTTP MCP 可在网页配置 URL、认证和工具；自定义 stdio 命令由主机配置。
+通用上游 OAuth 使用官方 MCP SDK 处理发现、PKCE 和授权，Gmail 保留专用只读授权流程。
 
 ## 8. 审批
 
@@ -351,7 +351,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 | 独立主机上的审批服务 | 没有；只有接口 |
 | 自带的写工具 | IMAP 状态/移动/归档/废纸篓、SMTP 发信已实现；Calendar / Gmail / Reminders 仍只读 |
 | 扩展服务 connector | 尚未接入；通用 Proxy 的可用性不代表具体平台集成已完成 |
-| 通用远程 MCP 网页管理 / 上游 OAuth | 尚未实现；远程 MCP 的主机配置及 Bearer / secret-header 代理已经支持 |
+| 通用远程 MCP 网页管理 / 上游 OAuth | 已实现；网页配置 HTTP 连接、工具选择与分类、OAuth 发现和刷新、Bearer / API Key |
 | 防内容中的 Prompt Injection | **不防**。只保证被误导的模型仍受其 Token 的权限约束；邮件正文、日历标题等原样返回（工具描述里提示了它们是数据） |
 | 第三方模型的数据留存 / 匿名性 | **无法保证**。工具结果交给 Agent 之后的去向不在 Gateway 控制内 |
 | 结果内容的最小化 | 不做。Connector 返回什么就是什么（仅有大小上限和密钥脱敏） |
@@ -399,8 +399,11 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 HTTPS 管理会话使用 `__Host-`、Secure、HttpOnly、SameSite=Strict Cookie，最多一小时；每个 POST 需要精确 Origin、JSON，
 已登录操作还需要会话专属 CSRF Token。MCP Bearer Token 不被管理入口接受。
 
-网页只提供固定 Connector 目录，不能上传脚本或任意设置命令。新增或编辑连接器先生成绑定当前会话和配置版本的临时预览，
-用户确认工具定义后才持久化。预览和 OAuth 中间凭据仅在内存保留，10 分钟过期并定期清理；Google Token 留在服务端。
+网页提供内置 Connector 和远程 HTTPS MCP 配置，不能上传脚本或任意设置命令。新增或编辑连接器先生成绑定当前会话和配置版本的临时预览，
+用户确认工具定义后才持久化。预览和 OAuth 中间凭据仅在内存保留，10 分钟过期并定期清理；Token 留在服务端。
+Gmail 与通用 MCP 共用登录会话校验。MCP 授权还绑定资源和 issuer，后台请求不会自动扩大 scope 或启动新授权。
+通用 OAuth 使用独立加密文件保存 Token、客户端信息、元数据和绝对到期时间；每个授权共用刷新锁，轮换后立即持久化。
+刷新不获取管理写锁、不更改权限版本。移除连接后，迟到的刷新不能重新创建该授权。
 工具进程可启动不代表真实账号登录成功，所以「工具已连接」与实际只读验证分别显示。
 
 新配置先经完整模型和工具 schema 校验，再等待在途请求结束（最多 30 秒），原子写入加密状态并切换运行实例。

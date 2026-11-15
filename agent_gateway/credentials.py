@@ -116,12 +116,16 @@ class Scrubber:
     not a control: an upstream that wants to leak a secret can encode it.
     """
 
-    def __init__(self, values: list[str]) -> None:
+    def __init__(self, values: list[str], dynamic=None) -> None:
         # Longest first so a secret containing another is replaced whole.
         self._values = sorted({v for v in values if len(v) >= 6}, key=len, reverse=True)
+        self._dynamic = dynamic
 
     def text(self, text: str) -> str:
-        for value in self._values:
+        values = self._values
+        if self._dynamic:
+            values = sorted(set(values) | {v for v in self._dynamic() if len(v) >= 6}, key=len, reverse=True)
+        for value in values:
             if value in text:
                 text = text.replace(value, REDACTED)
         return text

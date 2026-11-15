@@ -104,12 +104,15 @@ restart invalidates cursors. Batch operations report a result for each requested
 message, including unknown or unattempted outcomes. SMTP acceptance does not prove
 delivery. See [deployment and connector behavior](docs/deployment.md) for limits.
 
-Custom stdio and Streamable HTTP upstreams can be configured on the host, using
-per-connection secrets, tool locks and policies. The web console currently offers
-a fixed connector catalog. **The next milestone is web management of arbitrary
-remote MCP connections.** Generic upstream OAuth and an external approval-service
-adapter are not implemented. The [product requirements](docs/requirements.md)
-separate available capabilities from planned work.
+The web console connects remote Streamable HTTP MCP servers using OAuth, Bearer
+or API-key headers, or no authentication. Preview tools, select which to expose,
+and classify each as read or write before assigning Agent permissions. OAuth
+supports server discovery, PKCE, registered clients, dynamic registration and
+client metadata URLs. Tokens stay encrypted and refresh automatically.
+
+Custom stdio commands remain host-configured. Gateway-client OAuth and an external
+approval-service adapter are not implemented. See the [product requirements](docs/requirements.md)
+and [remote connection setup](docs/deployment.md#remote-mcp).
 
 ## Quick start
 

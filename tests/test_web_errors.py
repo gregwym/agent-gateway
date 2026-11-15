@@ -80,7 +80,7 @@ async def test_save_failure_has_actionable_code_and_safe_incident(tmp_path, monk
 
 async def test_known_browser_refusals_have_human_translations():
     root = Path(__file__).resolve().parents[1] / 'agent_gateway'
-    for files, script in [(['admin.py', 'admin_auth.py', 'admin_config.py', 'admin_oauth.py'], 'admin.js'),
+    for files, script in [(['admin.py', 'admin_auth.py', 'admin_config.py', 'admin_oauth.py', 'admin_remote.py', 'admin_mcp_oauth.py', 'oauth.py'], 'admin.js'),
                           (['passkey.py'], 'approve.js')]:
         translated = set(re.findall(r'^  ([a-z_]+): \[', (root / 'static' / script).read_text(), flags=re.M))
         codes = set()

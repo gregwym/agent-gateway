@@ -57,6 +57,6 @@ async def test_connection_failure_stays_on_card_and_other_errors_stay_on_page(tm
         # Invalid OAuth navigation still renders a useful page, with the code removed from the address bar.
         response = await page.goto(origin + '/admin/oauth/google/callback?state=expired&code=private-oauth-code')
         assert response.status == 409
-        await playwright.expect(page.locator('main > .operation-error')).to_contain_text(t('Google authorization expired', 'Google 授权已过期'))
+        await playwright.expect(page.locator('main > .operation-error')).to_contain_text(t('OAuth authorization expired', 'OAuth 授权已过期'))
         await playwright.expect(page).to_have_url(origin + '/admin/')
         assert 'private-oauth-code' not in await page.locator('body').inner_text()

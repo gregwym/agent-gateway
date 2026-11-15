@@ -51,9 +51,16 @@ def _unavailable() -> UpstreamError:
     return UpstreamError("upstream_unavailable", "The upstream service is currently unavailable.")
 
 
+def http_client(**kwargs):
+    return httpx2.AsyncClient(**kwargs)
+
+
 @asynccontextmanager
-async def open_client(conn: ConnectionCfg, secrets: dict[str, str]) -> AsyncIterator[Client]:
+async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None) -> AsyncIterator[Client]:
     """Connect to one upstream, handing it its own credentials and nothing else."""
+    if conn.oauth_ref and oauth is None and auth is None:
+        from .passkey import Refused
+        raise Refused("oauth_reauthorization_required", 401)
     if conn.transport == "stdio":
         # The SDK starts the child with a minimal environment (HOME, PATH, ...) plus
         # what is passed here; the gateway's own environment is not inherited.
@@ -70,10 +77,17 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str]) -> AsyncIter
         if conn.bearer_secret:
             headers["Authorization"] = f"Bearer {secrets[conn.bearer_secret]}"
         assert conn.url is not None
+        async def diagnose(response):
+            # Preserve HTTP causes before the SDK turns a failed POST into a
+            # generic JSON-RPC error. OAuth must first handle its own challenges.
+            if response.request.method == "POST" and response.status_code >= 400:
+                response.raise_for_status()
         # trust_env=False: proxy variables must not be able to reroute credentialed traffic.
         # Redirects: the SDK transport follows them only within the configured origin.
-        async with httpx2.AsyncClient(
+        async with http_client(
             headers=headers,
+            event_hooks=None if auth or conn.oauth_ref else {"response": [diagnose]},
+            auth=auth or (oauth.auth(conn) if conn.oauth_ref and oauth else None),
             timeout=httpx2.Timeout(30.0, read=conn.timeout_seconds + 30.0),
             trust_env=False,
             follow_redirects=False,
@@ -90,18 +104,26 @@ def _client(conn: ConnectionCfg, transport: Any) -> Client:
 
 async def list_all_tools(client: Client) -> list[types.Tool]:
     tools: list[types.Tool] = []
+    seen = set()
     cursor: str | None = None
     for _ in range(_MAX_LIST_PAGES):
         page = await client.list_tools(cursor=cursor)
+        for tool in page.tools:
+            if tool.name in seen or len(seen) >= 1000:
+                from .passkey import Refused
+                raise Refused("invalid_remote_tool_list", 422)
+            seen.add(tool.name)
         tools.extend(page.tools)
         cursor = page.next_cursor
         if cursor is None:
             return tools
-    raise RuntimeError("upstream tool listing did not terminate")
+    from .passkey import Refused
+    raise Refused("invalid_remote_tool_list", 422)
 
 
 class Upstream:
-    def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit) -> None:
+    def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit, oauth=None) -> None:
+        self.oauth = oauth
         self.conn = conn
         self._secrets = secrets
         self._lock = lock
@@ -120,7 +142,7 @@ class Upstream:
         while True:
             self._connecting = True
             try:
-                async with open_client(self.conn, self._secrets) as client:
+                async with open_client(self.conn, self._secrets, self.oauth) as client:
                     with anyio.fail_after(_CONNECT_TIMEOUT):
                         await self._verify(client)
                     self._client = client

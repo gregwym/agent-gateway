@@ -176,6 +176,7 @@ class ConnectionCfg(_Model):
     allow_plain_http: bool = False
     bearer_secret: str | None = None  # secret name, sent as "Authorization: Bearer <value>"
     secret_headers: dict[str, str] = {}  # Header-Name -> secret name
+    oauth_ref: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")  # encrypted grant, never a token
 
     timeout_seconds: float = Field(30, gt=0, le=600)
     max_concurrency: int = Field(4, ge=1, le=64)
@@ -188,7 +189,7 @@ class ConnectionCfg(_Model):
         if self.transport == "stdio":
             if not self.command:
                 raise ValueError(f"{where}: stdio transport needs a command")
-            if self.url or self.bearer_secret or self.secret_headers:
+            if self.url or self.bearer_secret or self.secret_headers or self.oauth_ref:
                 raise ValueError(f"{where}: url/bearer_secret/secret_headers are http-only")
             for name in list(self.env) + list(self.secret_env):
                 if not _matches(ENV_NAME, name):
@@ -199,6 +200,8 @@ class ConnectionCfg(_Model):
             if self.command or self.env or self.secret_env:
                 raise ValueError(f"{where}: command/env/secret_env are stdio-only")
             _check_url(where, self.url, self.allow_plain_http)
+            if self.oauth_ref and (self.bearer_secret or self.secret_headers):
+                raise ValueError(f"{where}: OAuth cannot be combined with other credentials")
             if self.bearer_secret and any(h.lower() == "authorization" for h in self.secret_headers):
                 raise ValueError(f"{where}: bearer_secret and an Authorization secret header conflict")
         return self
@@ -297,6 +300,8 @@ class Config(_Model):
         # name always means the same account and the same upstream tool for everyone.
         _unique("exposed tool name", [t.name for c in self.connections for t in c.tools])
         for conn in self.connections:
+            if conn.oauth_ref and not self.admin:
+                raise ValueError("managed OAuth requires web administration")
             if conn.owner not in known:
                 raise ValueError(f"connection {conn.id}: unknown owner {conn.owner!r}")
             if conn.approver is not None:

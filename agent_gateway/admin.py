@@ -32,6 +32,10 @@ class AdminController:
         self.mutex = anyio.Lock()
         self.drafts = {}
         self.tests = {}
+        from .oauth import OAuthVault
+        from .admin_mcp_oauth import MCPConsent
+        self.oauth = OAuthVault(self.store.base)
+        self.mcp_oauth = MCPConsent(self)
         from .admin_oauth import GoogleConsent
         self.google = GoogleConsent(self)
         runtime.gateway = self._gateway(self.store.state)
@@ -41,7 +45,7 @@ class AdminController:
     def _gateway(self, state):
         from .server import Gateway
         cfg, lock, values = self.store.effective(state)
-        result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver)
+        result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver, self.oauth)
         from .catalog_sync import catalog_revision
         result.configuration_revision = "web:" + str(state["revision"]) + ":" + catalog_revision(cfg, lock)
         return result
@@ -51,6 +55,15 @@ class AdminController:
             await anyio.sleep(30)
             now = time.time()
             self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > now}
+            self.mcp_oauth.sweep()
+            try:
+                self.oauth.prune({c.oauth_ref for c in self.runtime.gateway.cfg.connections if c.oauth_ref})
+            except Exception:
+                self.runtime.gateway.audit.write("oauth_cleanup_failed", reason="storage_unavailable")
+            pending = {f["ref"] for f in self.mcp_oauth.flows.values()} | {d.get("oauth_ref") for d in self.drafts.values()}
+            for ref, record in list(self.oauth.records.items()):
+                if ref not in self.oauth.persisted and ref not in pending and record["created"] + 600 <= now:
+                    self.oauth.discard(ref)
             self.google.flows = {k: v for k, v in self.google.flows.items() if v["expires"] > now}
 
     @asynccontextmanager
@@ -87,7 +100,22 @@ class AdminController:
                                    route.problem, "invalid_tool_configuration"), 400)
 
         def persist():
-            self.store.save(state)
+            refs = {c.oauth_ref for c in gateway.cfg.connections if c.oauth_ref}
+            newly_active = refs - self.oauth.persisted
+            try:
+                self.oauth.activate(refs)
+                self.store.save(state)
+            except Exception:
+                for ref in newly_active & self.oauth.persisted:
+                    self.oauth.file.delete(ref)
+                    self.oauth.persisted.remove(ref)
+                raise
+            try:
+                self.oauth.prune(refs)
+            except Exception:
+                # Configuration is already durable. Retry credential cleanup in
+                # the sweeper rather than leaving the old gateway running.
+                gateway.audit.write("oauth_cleanup_failed", reason="storage_unavailable")
             self.store.catalog_updates = catalog_updates
             # Revision-bound approvals are unusable immediately after publication,
             # including a crash between the atomic state write and this cleanup.
@@ -118,7 +146,8 @@ class AdminController:
                                 "household": gw.cfg.household_of(conn.owner), "approvers": list(gw.cfg.approvers_of(conn)),
                                 "approver": conn.approver or conn.owner,
                                 "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
-                                "settings": settings_of(conn), "tools": tools,
+                                "settings": self.connection_settings(conn), "tools": tools,
+                                "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None,
                                 "catalog_sync": self.store.catalog_updates.get(conn.id),
                                 "available_tools": [{**t, "access": tool_access(conn, ToolCfg.model_validate(t))} for t in catalog_additions(conn)],
                                 "connected": gw.upstreams[conn.id]._client is not None,
@@ -134,7 +163,66 @@ class AdminController:
                 "connections": connections, "passkeys": keys,
                 "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()}}
 
+    def preview_result(self, state, conn, added, definitions, session):
+        from .admin_remote import remote_tools
+        cfg, _, _ = self.store.effective(state)
+        remote = kind_of(conn) == "remote"
+        if remote:
+            conn = remote_tools(conn, definitions, cfg)
+        elif any(tool.upstream not in definitions for tool in conn.tools):
+            raise Refused("missing_upstream_tool", 422)
+        if not conn.tools:
+            raise Refused("remote_no_tools", 422)
+        raw = state["config"]
+        raw["connections"] = [c for c in raw["connections"] if c["id"] != conn.id] + [conn.model_dump(mode="json")]
+        # Removed remote tools lose their rules before the candidate is validated.
+        names = {t.name for t in conn.tools}
+        raw["policy"] = [{**r, "tools": [t for t in r["tools"] if t in names]} if r["connection"] == conn.id else r
+                         for r in raw["policy"] if r["connection"] != conn.id or any(t in names for t in r["tools"])]
+        state["secrets"].update(added)
+        lock = Lock()
+        for tool in conn.tools:
+            lock.put(conn.id, definitions[tool.upstream])
+        state["locks"][conn.id] = lock.entries[conn.id]
+        self._gateway(state)
+        self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > time.time()}
+        if len(self.drafts) >= 16:
+            raise Refused("too_many_drafts", 429)
+        draft = secrets.token_urlsafe(24)
+        self.drafts[draft] = {"state": state, "session": session["id"], "expires": time.time() + 600,
+                              "connection": conn.id, "remote": remote, "oauth_ref": conn.oauth_ref}
+        # Definitions can echo credentials. Scrub prior to displaying them too.
+        scrubber = self._gateway(state).scrubber
+        return {"draft": draft, "connection": conn.id, "definitions": scrubber.data(list({t.upstream: definitions[t.upstream] for t in conn.tools}.values())),
+                "owner": conn.owner, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote,
+                "tools": [{"upstream": t.upstream, "access": tool_access(conn, t)} for t in conn.tools],
+                "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None}
+
+    async def preview_remote_oauth(self, flow, session):
+        state = self.store.candidate()
+        cfg, _, values = self.store.effective(state)
+        conn, added = make_connection(flow["body"], cfg, values)
+        if len(cfg.connections) >= 50 and not any(c.id == conn.id for c in cfg.connections):
+            raise Refused("connector_limit", 400)
+        conn = conn.model_copy(update={"oauth_ref": flow["ref"]})
+        return self.preview_result(state, conn, added, flow["definitions"], session)
+
+    def connection_settings(self, conn):
+        settings = settings_of(conn)
+        if conn.oauth_ref:
+            record = self.oauth.records.get(conn.oauth_ref, {})
+            client = record.get("client") or {}
+            settings.update(issuer=record.get("issuer") or "", scope=record.get("requested_scope") or "",
+                            client_id="" if record.get("client_metadata_url") else client.get("client_id", ""), auth_method=client.get("token_endpoint_auth_method") or "none",
+                            client_metadata_url=record.get("client_metadata_url") or "")
+        return settings
+
     async def operate(self, operation, body, session):
+        if operation == "oauth/mcp/start":
+            return await self.mcp_oauth.start(body, session)
+        if operation == "oauth/mcp/complete":
+            flow = self.mcp_oauth.complete(body.get("id"), session)
+            return await self.preview_remote_oauth(flow, session)
         if operation == "oauth/start":
             return self.google.start(body, session)
         if operation == "oauth/complete":
@@ -165,13 +253,13 @@ class AdminController:
             problem = None
             try:
                 with anyio.fail_after(35):
-                    async with open_client(conn, {n: values[n] for n in conn.secret_names()}) as client:
+                    async with open_client(conn, {n: values[n] for n in conn.secret_names()}, self.oauth) as client:
                         live = {t.name: definition_of(t) for t in await list_all_tools(client)}
                         if any(self.runtime.gateway.lock.get(conn.id, tool.upstream) is None or
                                digest_of(live.get(tool.upstream, {})) != self.runtime.gateway.lock.get(conn.id, tool.upstream)["sha256"]
                                for tool in conn.tools):
                             problem = "tool_definitions_changed"
-                        else:
+                        elif probe:
                             result = await client.call_tool(probe, arguments)
                             if result.is_error:
                                 problem = probe_error(kind_of(conn), result)
@@ -191,6 +279,20 @@ class AdminController:
             return {"ok": True, "read_tool": probe}
 
         self._revision(body)
+        if operation == "oauth/revoke":
+            conn = next((c for c in self.runtime.gateway.cfg.connections if c.id == body.get("id")), None)
+            if not conn or not conn.oauth_ref:
+                raise Refused("not_found", 404)
+            try:
+                with anyio.fail_after(30):
+                    result = await self.oauth.revoke(conn.oauth_ref)
+            except TimeoutError:
+                if self.oauth.get(conn.oauth_ref).get("tokens"):
+                    raise Refused("oauth_refresh_busy", 409) from None
+                result = "failed"
+            self.tests.pop(conn.id, None)
+            self.runtime.gateway.audit.write("admin_oauth_revoked", connection=conn.id, principal=self.auth.owner, reason=result)
+            return {"local_revoked": True, "provider": result}
         if operation in ("members/rename", "households/rename"):
             kind = "members" if operation == "members/rename" else "households"
             if not any(m["id"] == body.get("id") for m in self.store.state["config"][kind]):
@@ -291,33 +393,18 @@ class AdminController:
                 conn, added = make_connection(body, cfg, values)
             if len(raw["connections"]) >= 50 and not any(c["id"] == conn.id for c in raw["connections"]):
                 raise Refused("connector_limit", 400)
+            if kind_of(conn) == "remote" and body.get("settings", {}).get("auth") == "oauth" and not conn.oauth_ref:
+                raise Refused("oauth_reauthorization_required", 400)
             values.update(added)
             try:
                 with anyio.fail_after(35):
-                    async with open_client(conn, {n: values[n] for n in conn.secret_names()}) as client:
+                    async with open_client(conn, {n: values[n] for n in conn.secret_names()}, self.oauth) as client:
                         definitions = {t.name: definition_of(t) for t in await list_all_tools(client)}
             except Exception as exc:
                 reason, incident = connector_failure(exc, conn.transport), secrets.token_hex(6)
                 self.runtime.gateway.audit.write("admin_connector_preview", reason=reason, detail=f"{incident}:{type(exc).__name__}")
                 raise Refused(reason, 422, incident=incident) from None
-            if any(tool.upstream not in definitions for tool in conn.tools):
-                raise Refused("missing_upstream_tool", 422)
-            raw["connections"] = [c for c in raw["connections"] if c["id"] != conn.id] + [conn.model_dump(mode="json")]
-            existing = any(c.id == conn.id for c in cfg.connections)
-            # Ownership never grants an Agent access. Every new connector starts denied.
-            state["secrets"].update(added)
-            lock = Lock()
-            for tool in conn.tools:
-                lock.put(conn.id, definitions[tool.upstream])
-            state["locks"][conn.id] = lock.entries[conn.id]
-            self._gateway(state)  # validate before presenting the review
-            self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > time.time()}
-            if len(self.drafts) >= 16:
-                raise Refused("too_many_drafts", 429)
-            draft = secrets.token_urlsafe(24)
-            self.drafts[draft] = {"state": state, "session": session["id"], "expires": time.time() + 600, "connection": conn.id}
-            return {"draft": draft, "connection": conn.id, "definitions": list({t.upstream: definitions[t.upstream] for t in conn.tools}.values()),
-                    "owner": conn.owner, "existing": existing}
+            return self.preview_result(state, conn, added, definitions, session)
         if operation == "connections/apply":
             draft = self.drafts.get(body.get("draft"))
             if not draft or draft["session"] != session["id"] or draft["expires"] <= time.time():
@@ -326,6 +413,10 @@ class AdminController:
                 raise Refused("configuration_changed", 409)
             if body.get("reviewed") is not True:
                 raise Refused("review_required", 400)
+            draft = copy.deepcopy(draft)
+            if draft.get("remote"):
+                from .admin_remote import apply_selection
+                apply_selection(draft, body)
             result = await self._commit(draft["state"], operation)
             self.drafts.pop(body["draft"], None)
             return result
@@ -489,20 +580,20 @@ class AdminController:
             except Exception as exc:
                 return failure_response(exc, self.runtime.gateway.audit, _PAGE_HEADERS)
 
-        async def google_callback(request):
-            # Cross-site Google navigation has no SameSite=Strict cookie. The
+        async def oauth_callback(request):
+            # Cross-site provider navigation has no SameSite=Strict cookie. The
             # one-use state is bound to a still-live session; only that session
             # can subsequently review/apply the result via a CSRF-protected POST.
             try:
                 if request.headers.get("host") != authority:
                     raise Refused("wrong_origin")
-                target = await self.google.callback(request.query_params)
+                target = await (self.mcp_oauth if request.url.path.endswith("/mcp/callback") else self.google).callback(request.query_params)
                 return RedirectResponse(target, status_code=303, headers=_PAGE_HEADERS)
             except Refused as exc:
                 error = _json({"error": exc.code}, exc.status)
             except Exception as exc:
                 error = failure_response(exc, self.runtime.gateway.audit, _PAGE_HEADERS)
-            # Google callbacks are browser navigations, so render the normal UI
+            # OAuth callbacks are browser navigations, so render the normal UI
             # with the error instead of leaving the person on a JSON document.
             data = {**json.loads(error.body), "status": error.status_code}
             marker = '<meta name="gateway-error" content="' + html.escape(json.dumps(data), quote=True) + '">'
@@ -510,6 +601,7 @@ class AdminController:
             return HTMLResponse(page, status_code=error.status_code, headers=_PAGE_HEADERS)
 
         return [Route("/", page), Route("/admin", page), Route("/admin/", page),
-                Route("/admin/oauth/google/callback", google_callback),
+                Route("/admin/oauth/google/callback", oauth_callback),
+                Route("/admin/oauth/mcp/callback", oauth_callback),
                 Route("/admin/assets/{name}", asset),
                 Route("/admin/api/{operation:path}", api, methods=["GET", "POST"])]

@@ -174,6 +174,7 @@ class Gateway:
         secrets: dict[str, str],
         audit: Audit,
         approver: Approver | None = None,
+        oauth=None,
     ) -> None:
         self.cfg = cfg
         self.lock = lock
@@ -182,12 +183,13 @@ class Gateway:
         self.audit = audit
         self.policy = Policy(cfg)
         self.approver: Approver = approver or make_approver(cfg, audit)
-        self.scrubber = Scrubber(list(secrets.values()))
+        self.oauth = oauth
+        self.scrubber = Scrubber(list(secrets.values()), (lambda: oauth.sensitive) if oauth else None)
         self.upstreams: dict[str, Upstream] = {}
         self.routes: dict[str, ToolRoute] = {}
         for conn in cfg.connections:
             own = {name: secrets[name] for name in conn.secret_names()}
-            self.upstreams[conn.id] = Upstream(conn, own, lock, audit)
+            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth)
             for tool in conn.tools:
                 self.routes[tool.name] = build_route(conn, tool, lock.get(conn.id, tool.upstream))
 

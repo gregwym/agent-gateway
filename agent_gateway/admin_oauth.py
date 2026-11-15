@@ -17,7 +17,20 @@ TOKEN = "https://oauth2.googleapis.com/token"
 PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 
 
-class GoogleConsent:
+class ConsentSessions:
+    def _active(self, flow):
+        now = int(time.time())
+        if not flow or flow["expires"] <= now:
+            raise Refused("oauth_expired", 409)
+        with self.controller.auth.approver._db() as db:
+            active = db.execute("SELECT 1 FROM admin_sessions s JOIN credentials c ON c.id=s.credential "
+                                "WHERE s.id=? AND s.expires>? AND c.principal=?",
+                                (flow["session"], now, self.controller.auth.owner)).fetchone()
+        if not active:
+            raise Refused("login_required", 401)
+
+
+class GoogleConsent(ConsentSessions):
     def __init__(self, controller):
         self.controller = controller
         self.flows = {}
@@ -45,17 +58,6 @@ class GoogleConsent:
             "state": state, "code_challenge": websafe_encode(hashlib.sha256(verifier.encode()).digest()),
             "code_challenge_method": "S256", "include_granted_scopes": "false",
         })}
-
-    def _active(self, flow):
-        now = int(time.time())
-        if not flow or flow["expires"] <= now:
-            raise Refused("oauth_expired", 409)
-        with self.controller.auth.approver._db() as db:
-            active = db.execute("SELECT 1 FROM admin_sessions s JOIN credentials c ON c.id=s.credential "
-                                "WHERE s.id=? AND s.expires>? AND c.principal=?",
-                                (flow["session"], now, self.controller.auth.owner)).fetchone()
-        if not active:
-            raise Refused("login_required", 401)
 
     def _http(self):
         return httpx2.AsyncClient(trust_env=False, follow_redirects=False, timeout=20)

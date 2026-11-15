@@ -21,7 +21,15 @@ def leaves(error):
 
 
 def connector_failure(error, transport):
+    from .passkey import Refused
     items = leaves(error)
+    for item in items:
+        if isinstance(item, Refused):
+            return item.code
+        if isinstance(item, SecretStoreError):
+            return "credential_store_unavailable"
+        if isinstance(item, OSError) and item.errno in (errno.ENOSPC, errno.EROFS, errno.EACCES):
+            return {errno.ENOSPC: "storage_full", errno.EROFS: "storage_readonly", errno.EACCES: "storage_permission_denied"}[item.errno]
     for item in list(items):
         cause = item.__cause__
         for _ in range(8):
