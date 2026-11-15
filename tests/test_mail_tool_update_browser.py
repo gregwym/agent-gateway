@@ -40,11 +40,17 @@ async def test_legacy_mail_gains_write_controls_without_a_review_or_data_edit(tm
         assert await card.locator('select[name=connection_access] option[value=read_write]').count() == 1
         assert (await rpc(origin, TOKEN_A)).json()['result']['tools'] == before
         await card.get_by_label(t('Connection access', '连接权限'), exact=True).select_option('read_write')
+        organize = card.get_by_label(t('Mailbox organization approval', '邮箱整理审批'), exact=True)
+        sends = card.get_by_label(t('Sending approval', '发信审批'), exact=True)
+        await playwright.expect(sends).to_have_value('approval_required')
+        await organize.select_option('allow')
         await card.get_by_role('button', name=t('Save connection access', '保存连接权限'), exact=True).click()
+        await playwright.expect(card.get_by_role('status')).to_contain_text(t('Connection permissions updated', '连接权限已更新'))
         await playwright.expect(card.get_by_label(t('Connection access', '连接权限'), exact=True)).to_have_value('read_write')
         tools = (await rpc(origin, TOKEN_A)).json()['result']['tools']
         assert 'mail_send' in {tool['name'] for tool in tools}
         await page.reload()
         card = await open_permission(page, 'mail', t)
         await playwright.expect(card.get_by_label(t('Connection access', '连接权限'), exact=True)).to_have_value('read_write')
-        await playwright.expect(card.get_by_label(t('Write approval', '写入审批'), exact=True)).to_have_value('approval_required')
+        await playwright.expect(card.get_by_label(t('Mailbox organization approval', '邮箱整理审批'), exact=True)).to_have_value('allow')
+        await playwright.expect(card.get_by_label(t('Sending approval', '发信审批'), exact=True)).to_have_value('approval_required')

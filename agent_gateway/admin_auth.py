@@ -11,9 +11,11 @@ import secrets
 import time
 from pathlib import Path
 
+from fido2.utils import websafe_encode
 from fido2.webauthn import AttestedCredentialData, AuthenticationResponse, RegistrationResponse
 from fido2.webauthn import ResidentKeyRequirement, UserVerificationRequirement
 
+from .approval import canonical
 from .passkey import Refused
 
 SCHEMA = """
@@ -22,6 +24,8 @@ CREATE TABLE IF NOT EXISTS admin_ceremonies (
  id TEXT PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, state TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS admin_sessions (
  id TEXT PRIMARY KEY, credential BLOB NOT NULL, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_confirmations (
+ id TEXT PRIMARY KEY, session TEXT NOT NULL, nonce BLOB NOT NULL, expires INTEGER NOT NULL);
 """
 COOKIE = "agw_admin"
 
@@ -131,21 +135,7 @@ class AdminAuth:
                 credential_id = credential.credential_id
                 db.execute("DELETE FROM admin_bootstrap")
             else:
-                keys = self.approver._credentials(db, [self.owner])
-                try:
-                    used = self.approver._server.authenticate_complete(
-                        json.loads(row["state"]), [AttestedCredentialData(bytes(r["data"])) for r in keys], parsed)
-                    key = next(r for r in keys if bytes(r["id"]) == used.credential_id)
-                    handle = parsed.response.user_handle
-                    if handle is not None and bytes(handle) != self.owner.encode():
-                        raise ValueError()
-                    counter = parsed.response.authenticator_data.counter
-                    if (key["counter"] or counter) and counter <= key["counter"]:
-                        raise ValueError()
-                except Exception:
-                    raise Refused("verification_failed") from None
-                credential_id = used.credential_id
-                db.execute("UPDATE credentials SET counter=? WHERE id=?", (counter, credential_id))
+                credential_id = self._verify_assertion(db, json.loads(row["state"]), parsed)
             token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
             db.execute("DELETE FROM admin_sessions WHERE expires<=?", (now,))
             db.execute("DELETE FROM admin_sessions WHERE id IN (SELECT id FROM admin_sessions ORDER BY expires DESC LIMIT -1 OFFSET 7)")
@@ -155,6 +145,71 @@ class AdminAuth:
             self.link_file.unlink(missing_ok=True)
         self.approver.audit.write("admin_setup" if registration else "admin_login", principal=self.owner)
         return token, csrf
+
+    def _verify_assertion(self, db, state, parsed):
+        keys = self.approver._credentials(db, [self.owner])
+        try:
+            used = self.approver._server.authenticate_complete(
+                state, [AttestedCredentialData(bytes(r["data"])) for r in keys], parsed)
+            key = next(r for r in keys if bytes(r["id"]) == used.credential_id)
+            handle = parsed.response.user_handle
+            if handle is not None and bytes(handle) != self.owner.encode():
+                raise ValueError()
+            counter = parsed.response.authenticator_data.counter
+            if (key["counter"] or counter) and counter <= key["counter"]:
+                raise ValueError()
+        except Exception:
+            raise Refused("verification_failed") from None
+        db.execute("UPDATE credentials SET counter=? WHERE id=?", (counter, used.credential_id))
+        return used.credential_id
+
+    @staticmethod
+    def _confirmation_challenge(nonce, session, operation, body, revision):
+        return hashlib.sha256(nonce + canonical({
+            "purpose": "admin-confirmation", "session": session["id"],
+            "operation": operation, "body": body, "revision": revision,
+        })).digest()
+
+    def begin_confirmation(self, session, operation, body, revision):
+        now = int(time.time())
+        nonce = secrets.token_bytes(32)
+        challenge = self._confirmation_challenge(nonce, session, operation, body, revision)
+        with self.approver._db() as db:
+            db.execute("DELETE FROM admin_confirmations WHERE expires<=?", (now,))
+            # Separate from the public login pool. Bound the prompts of each authenticated session.
+            if db.execute("SELECT count(*) FROM admin_confirmations WHERE session=?", (session["id"],)).fetchone()[0] >= 12:
+                raise Refused("rate_limited", 429)
+            keys = self.approver._credentials(db, [self.owner])
+            options, _ = self.approver._server.authenticate_begin(
+                [AttestedCredentialData(bytes(r["data"])) for r in keys],
+                user_verification=UserVerificationRequirement.REQUIRED, challenge=challenge)
+            ceremony = secrets.token_urlsafe(24)
+            db.execute("INSERT INTO admin_confirmations VALUES (?,?,?,?)",
+                       (ceremony, session["id"], nonce, min(session["expires"], now + 120)))
+        return {"ceremony_id": ceremony, "options": dict(options)}
+
+    def confirm(self, session, operation, body, revision, proof):
+        if not isinstance(proof, dict) or not isinstance(proof.get("ceremony_id"), str) or len(proof["ceremony_id"]) > 128:
+            raise Refused("verification_failed")
+        with self.approver._db() as db:
+            key = (proof["ceremony_id"], session["id"])
+            row = db.execute("SELECT nonce, expires FROM admin_confirmations WHERE id=? AND session=?", key).fetchone()
+            db.execute("DELETE FROM admin_confirmations WHERE id=? AND session=?", key)
+        if not row or row["expires"] <= int(time.time()):
+            raise Refused("admin_confirmation_expired", 409)
+        try:
+            parsed = AuthenticationResponse.from_dict(proof.get("response"))
+            data = json.loads(bytes(parsed.response.client_data))
+            if data.get("crossOrigin") or data.get("topOrigin"):
+                raise ValueError()
+        except Exception:
+            raise Refused("verification_failed") from None
+        expected = self._confirmation_challenge(bytes(row["nonce"]), session, operation, body, revision)
+        if not hmac.compare_digest(parsed.response.client_data.challenge, expected):
+            raise Refused("admin_confirmation_changed", 409)
+        with self.approver._db() as db:
+            self._verify_assertion(db, {"challenge": websafe_encode(expected), "user_verification": UserVerificationRequirement.REQUIRED}, parsed)
+        self.approver.audit.write("admin_confirmed", principal=self.owner, detail=operation)
 
     def session(self, token):
         if not token or len(token) > 128:
@@ -171,3 +226,4 @@ class AdminAuth:
     def logout(self, token):
         with self.approver._db() as db:
             db.execute("DELETE FROM admin_sessions WHERE id=?", (digest(token),))
+            db.execute("DELETE FROM admin_confirmations WHERE session=?", (digest(token),))

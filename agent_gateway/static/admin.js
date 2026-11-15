@@ -116,6 +116,10 @@ const messages = {
   missing_port: ['Enter the TLS port.', '请填写 TLS 端口。'],
   missing_timezone: ['Enter the calendar time zone.', '请填写日历时区。'],
   invalid_permission_effect: ['Choose Deny, Allow, or Require approval.', '请选择拒绝、允许或需要审批。'],
+  admin_confirmation_required: ['Confirm this change with your administrator passkey.', '请用管理员通行密钥确认这次变更。'],
+  admin_confirmation_changed: ['This operation or the configuration changed. Refresh and confirm the new change.', '操作内容或配置版本已变化，请刷新后确认新的变更。'],
+  admin_confirmation_expired: ['This confirmation expired or was already used. Start the operation again.', '本次确认已过期或已使用，请重新发起操作。'],
+  invalid_mail_send_permission: ['Choose a valid sending permission for a mail connection with sending enabled.', '请为已启用发信的邮箱连接选择有效的发信权限。'],
   invalid_connection_access: ['Choose a valid access scope and read/write approval settings.', '请选择有效的访问范围及读取、写入审批设置。'],
   connection_readonly: ['This connector has no write tools. Choose Read only.', '此连接器没有写入工具，请选择只读。'],
   connection_tools_update_required: ['New write tools are available for this connection. Review and enable them before choosing Read and write.', '此连接有新增写入工具，请先审阅并启用，再选择读写。'],
@@ -251,6 +255,11 @@ async function api(path, body, timeoutMs = 45000) {
     throw failure;
   } finally { clearTimeout(timer); }
   if (!response.ok) {
+    if (data?.error === 'admin_confirmation_required' && data.confirmation && body && !Object.hasOwn(body, 'confirmation')) {
+      notify(tr('Confirm this change with your administrator passkey.', '请用管理员通行密钥确认这次变更。'));
+      const confirmation = await passkeyResponse(data.confirmation);
+      return api(path, {...body, confirmation}, timeoutMs);
+    }
     if (response.status === 401 && data?.error === 'login_required') { csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); }
     throw serverError(data, response.status);
   }
@@ -335,17 +344,22 @@ async function confirmAction(title, explanation, action) {
 }
 const fromB64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
 const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-async function authenticate(action, code = '') {
+async function passkeyResponse(start, registration = false) {
   if (!window.PublicKeyCredential) throw new Error(tr('This browser does not support passkeys.', '此浏览器不支持通行密钥。'));
-  const start = await api('auth/begin', {action, code}); const options = start.options.publicKey;
+  const options = start.options.publicKey;
   options.challenge = fromB64(options.challenge);
   for (const key of ['allowCredentials', 'excludeCredentials']) if (options[key]) options[key] = options[key].map(c => ({...c, id: fromB64(c.id)}));
   if (options.user) options.user.id = fromB64(options.user.id);
-  const credential = await navigator.credentials[action === 'setup' ? 'create' : 'get']({publicKey: options});
+  const credential = await navigator.credentials[registration ? 'create' : 'get']({publicKey: options});
+  if (!credential) throw new Error(tr('Passkey confirmation was cancelled.', '通行密钥确认已取消。'));
   const response = {clientDataJSON: toB64(credential.response.clientDataJSON)};
   for (const key of ['attestationObject', 'authenticatorData', 'signature', 'userHandle']) if (credential.response[key]) response[key] = toB64(credential.response[key]);
-  const result = await api('auth/finish', {ceremony_id: start.ceremony_id, response: {
-    id: credential.id, rawId: toB64(credential.rawId), type: credential.type, response, clientExtensionResults: credential.getClientExtensionResults()}});
+  return {ceremony_id: start.ceremony_id, response: {
+    id: credential.id, rawId: toB64(credential.rawId), type: credential.type, response, clientExtensionResults: credential.getClientExtensionResults()}};
+}
+async function authenticate(action, code = '') {
+  const start = await api('auth/begin', {action, code});
+  const result = await api('auth/finish', await passkeyResponse(start, action === 'setup'));
   csrf = result.csrf; setupCode = ''; await refresh(); await resumeGoogle();
 }
 async function welcome(initialized) {
@@ -377,7 +391,8 @@ function permissionMatches(path, data, current) {
   if (!conn) return false;
   if (path === 'permissions/save') return conn.tools.find(t => t.name === data.tool)?.permissions[data.client] === data.effect;
   return path === 'permissions/connection' && conn.access[data.client] === data.access &&
-    (data.approver === undefined || conn.approver === data.approver);
+    (data.approver === undefined || conn.approver === data.approver) &&
+    (data.mail_send === undefined || data.mail_send === 'keep' || mailSendEffect(conn, data.client) === data.mail_send);
 }
 async function mutate(path, data) {
   const revision = state.revision, permission = path.startsWith('permissions/');
@@ -1021,6 +1036,14 @@ async function resumeGoogle() {
     }
   }
 }
+function mailSendEffect(conn, client) {
+  const choices = new Set(conn.tools.filter(t => t.mail_send).map(t => t.permissions[client]));
+  return choices.size > 1 ? 'keep' : choices.values().next().value;
+}
+function mailSendChoices() {
+  return [['approval_required', tr('Approve every send', '每次发信都审批')],
+    ['deny', tr('Sending disabled', '禁止发信')], ['allow', tr('Send without approval', '发信无需审批')]];
+}
 function accessProfile(conn, client) {
   const current = conn.access[client];
   const scope = current.startsWith('read_write') || current === 'read_approval_write_direct' ? 'read_write' :
@@ -1031,17 +1054,20 @@ function accessProfile(conn, client) {
 }
 function accessSummary(parent, conn, client) {
   const {scope, readApprovalRequired, writeApprovalRequired} = accessProfile(conn, client);
+  const send = mailSendEffect(conn, client);
+  const otherWrites = conn.tools.some(t => t.access === 'write' && !t.mail_send);
   const labels = {none: tr('No access', '禁止访问'), read: tr('Read only', '只读'), read_write: tr('Read and write', '读写'), custom: tr('Custom', '自定义')};
   el(parent, 'span', labels[scope], 'badge');
   if (scope === 'read' || scope === 'read_write') {
     const approval = (required) => required ? tr('approval', '需审批') : tr('direct', '无需审批');
     const read = tr('Read: ', '读取：') + approval(readApprovalRequired);
-    const write = tr('Write: ', '写入：') + approval(writeApprovalRequired);
+    const write = (send ? tr('Organize: ', '整理：') : tr('Write: ', '写入：')) + approval(writeApprovalRequired);
     const modes = el(parent, 'small', undefined, 'approval-summary');
     el(modes, 'span', read);
-    if (scope === 'read_write') el(modes, 'span', write);
+    if (scope === 'read_write' && otherWrites) el(modes, 'span', write);
   }
-  if (readApprovalRequired || writeApprovalRequired || (scope === 'custom' && conn.tools.some(tool => tool.permissions[client] === 'approval_required'))) {
+  if (send) el(parent, 'small', tr('Send: ', '发信：') + (mailSendChoices().find(([value]) => value === send)?.[1] || tr('Custom', '自定义')));
+  if (conn.tools.some(tool => tool.permissions[client] === 'approval_required')) {
     const approver = conn.approver === conn.household ? tr('Any household member', '家庭内任意成员') : nameOf(conn.approver);
     el(parent, 'small', tr('Approver: ', '审批人：') + approver);
   }
@@ -1080,6 +1106,7 @@ function permissionEditor(id, client) {
     toolUpdateNotice(card, conn);
     const reads = conn.tools.filter(t => t.access === 'read').length, writes = conn.tools.length - reads;
     const {current, scope, readApprovalRequired, writeApprovalRequired} = accessProfile(conn, client);
+    const mailSend = mailSendEffect(conn, client), otherWrites = conn.tools.some(t => t.access === 'write' && !t.mail_send);
     const options = [['none', tr('No access', '禁止访问')], ['read', tr('Read only', '只读')]];
     if (writes) options.push(['read_write', tr('Read and write', '读写')]);
     if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
@@ -1090,8 +1117,17 @@ function permissionEditor(id, client) {
     const choices = [['allow', tr('No approval', '无需审批')], ['approval_required', tr('Approve every operation', '每次操作都审批')]];
     const readApproval = select(readSettings, tr('Read approval', '读取审批'), 'read_approval', choices,
       readApprovalRequired ? 'approval_required' : 'allow');
-    const writeApproval = select(writeSettings, tr('Write approval', '写入审批'), 'write_approval', choices,
-      scope === 'read_write' && !writeApprovalRequired ? 'allow' : 'approval_required');
+    const writeApproval = select(writeSettings, mailSend ? tr('Mailbox organization approval', '邮箱整理审批') : tr('Write approval', '写入审批'), 'write_approval', choices,
+      scope === 'read_write' && otherWrites && !writeApprovalRequired ? 'allow' : 'approval_required');
+    const sendSettings = el(approvalFields, 'div');
+    let sendApproval, sendWarning;
+    if (mailSend) {
+      const sendChoices = mailSendChoices();
+      if (mailSend === 'keep') sendChoices.push(['keep', tr('Keep current send permissions', '保留现有发信权限')]);
+      sendApproval = select(sendSettings, tr('Sending approval', '发信审批'), 'send_approval', sendChoices,
+        mailSend === 'deny' && scope !== 'read_write' ? 'approval_required' : mailSend);
+      sendWarning = el(sendSettings, 'small', tr('This Agent may send email to any recipient allowed by its argument limits without a prompt.', 'Agent 可以不经确认，向参数限制允许的任何收件人发信。'), 'status-error');
+    }
     const approval = el(card, 'div');
     const members = state.members.filter(m => m.household === conn.household);
     const approver = select(approval, tr('Who can approve?', '由谁审批？'), 'connection_approver',
@@ -1100,13 +1136,17 @@ function permissionEditor(id, client) {
     const enrollment = el(approval, 'p', '', 'muted');
     function feedback() {
       readSettings.hidden = !['read', 'read_write'].includes(mode.value);
-      writeSettings.hidden = mode.value !== 'read_write';
-      const required = (!readSettings.hidden && readApproval.value === 'approval_required') || (!writeSettings.hidden && writeApproval.value === 'approval_required');
+      writeSettings.hidden = mode.value !== 'read_write' || !otherWrites;
+      sendSettings.hidden = !sendApproval || mode.value !== 'read_write';
+      if (sendWarning) sendWarning.hidden = sendApproval.value !== 'allow';
+      const required = (!readSettings.hidden && readApproval.value === 'approval_required') ||
+        (!writeSettings.hidden && writeApproval.value === 'approval_required') ||
+        (!sendSettings.hidden && ['approval_required', 'keep'].includes(sendApproval.value));
       approval.hidden = !required && !(mode.value === 'custom' && conn.tools.some(t => t.permissions[client] === 'approval_required'));
       const eligible = approver.value === conn.household ? members : members.filter(m => m.id === approver.value);
       enrollment.textContent = eligible.some(m => m.passkeys) ? '' : tr('No selected approver has a passkey yet. Register one under Members before approving requests.', '所选审批人尚未注册通行密钥，请先在家庭成员中注册，再处理审批。');
     }
-    for (const input of [mode, readApproval, writeApproval, approver]) input.addEventListener('change', feedback);
+    for (const input of [mode, readApproval, writeApproval, sendApproval, approver]) input?.addEventListener('change', feedback);
     feedback();
     button(card, tr('Save connection access', '保存连接权限'), async () => {
       let access = mode.value;
@@ -1119,6 +1159,7 @@ function permissionEditor(id, client) {
       controls.forEach(control => { control.disabled = true; });
       try {
         await mutate('permissions/connection', {client, connection: conn.id, access,
+          ...(!sendSettings.hidden ? {mail_send: sendApproval.value} : {}),
           ...(!approval.hidden ? {approver: approver.value} : {})});
         populate(); notify(tr('Connection permissions updated.', '连接权限已更新。'));
       } finally { controls.forEach((control, index) => { control.disabled = disabled[index]; }); }
@@ -1143,9 +1184,14 @@ function advancedPermissions(parent, conn, client, populate) {
     if (tool.problem) el(info, 'span', tr('Disabled: ', '已停用：') + tool.problem, 'badge bad');
     if (Object.keys(tool.pin).length) el(info, 'pre', JSON.stringify(tool.pin));
     const settings = el(row, 'td');
-    const choices = [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow without approval', '允许，无需审批')], ['approval_required', tr('Require approval', '需要审批')]];
+    const choices = tool.mail_send ? mailSendChoices() : [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow without approval', '允许，无需审批')], ['approval_required', tr('Require approval', '需要审批')]];
     const effect = select(settings, tr('Effect', '权限效果'), 'effect', choices, tool.permissions[client]);
     el(info, 'span', tool.access === 'read' ? tr('Read', '读取') : tr('Write / unclassified', '写入 / 未分类'), 'badge');
+    if (tool.mail_send) {
+      const warning = el(settings, 'small', tr('The agent can send to any recipient allowed by the argument limits.', 'Agent 可以向参数限制允许的任何收件人发信。'), 'status-error');
+      const explain = () => { warning.hidden = effect.value !== 'allow'; };
+      explain(); effect.addEventListener('change', explain);
+    }
     if (!conn.approvers.some(id => state.members.find(m => m.id === id)?.passkeys)) {
       const warning = el(settings, 'small', tr('No approver has a passkey.', '审批人尚未注册通行密钥。'), 'status-error');
       const showWarning = () => { warning.hidden = effect.value !== 'approval_required'; };

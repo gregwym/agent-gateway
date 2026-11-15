@@ -170,6 +170,11 @@ to connect accounts and grant agent access. Agent tokens cannot access the conso
 See [deployment instructions](docs/deployment.md) for setup, Docker Compose,
 HTTPS, connector credentials, approvals and backups.
 
+
+Sensitive administration changes require a new Passkey confirmation. Built-in
+mail connectors set send approval separately from mailbox organization. Existing
+direct-send grants require approval until explicitly changed.
+
 ## Security boundaries
 
 - The gateway host, administrator and local stdio connectors are trusted. Anyone

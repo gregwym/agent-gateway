@@ -7,14 +7,15 @@
 
 - 提供账号隔离、审批、网页管理和连接器封装。
   协议、传输、鉴权中间件、加密、WebAuthn、IMAP、CalDAV 全部复用成熟库。
-- 身份只来自客户端出示的 Bearer Token：一个 Token 对应一个 client，一个 client 对应一个 principal。
+- 一个 Bearer Token 对应一个 Agent。Agent 属于一个家庭，工具权限逐 Agent 配置。
 - 每个 `(service, account)` 是一条独立的上游连接，只拿到自己账号的凭据。
 - 默认拒绝；工具必须同时出现在连接的 `tools` 和某条 `policy` 规则里才存在。
 - 远程/自定义上游定义经人工审阅写入 lock；定义变化会停用工具。标准内置连接器随安装包同步能力，新工具默认拒绝。
 - 自带统一 IMAP/SMTP 邮件连接、Gmail（REST + OAuth），以及只读 iCloud 日历（CalDAV）和
   Apple 提醒事项（EventKit，实验性）。**Gmail 选择只读时，由 Google 在凭据层强制执行**，见 7.3。
 - 读取和写入分别可选直接允许或逐次 Passkey 审批。需要审批时，由配置的成员或家庭内任意成员核对
-  **那一次调用的确切内容**，批准只能用一次。没有配置审批页面时，`approval_required` 的工具永远不会执行。
+  **那一次调用的确切内容**，批准只能用一次。内置邮件连接的发信权限单独配置，默认逐次审批。
+  没有配置审批页面时，`approval_required` 的工具永远不会执行。
 - 部署必须阻止 Agent 读取凭据或控制 Gateway 主机及运行时。
 - **自动验收使用模拟账号与替身服务**（见第 10 节）。真实 Chromium 加虚拟认证器覆盖注册、管理和审批；
   实际提供方和认证器组合的兼容性需单独验证。检查步骤见 [deployment.md](deployment.md)。
@@ -37,9 +38,9 @@ schema 校验、参数固定、MIME/协议适配、大小限制和密钥脱敏�
 
 ```
 Agent ──HTTP(Streamable)──► /mcp
-                             │ 1 身份      Bearer Token → client → principal（SDK 的鉴权中间件）
+                             │ 1 身份      Bearer Token → Agent（SDK 的鉴权中间件）
                              │ 2 路由      共享工具名 + connection → 内部授权绑定 → 上游工具名
-                             │ 3 策略      (principal, tool) → allow / approval_required / deny，默认 deny
+                             │ 3 策略      (Agent, tool) → allow / approval_required / deny，默认 deny
                              │ 4 定义      工具必须在 lock 里，且与上游当前定义一致
                              │ 5 参数      按给 Agent 看的 schema 校验；pin 的参数由 Gateway 填入
                              │ 6 审批      approval_required → 这一次调用有没有一份未用过的批准（第 8 节）
@@ -316,17 +317,19 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 批准在联系上游**之前**就被用掉。如果上游随后失败，批准不会退回：Gateway 无法知道写操作是否已经发生，所以不会自己重试写操作。
 
-### 8.4 不能靠改配置绕过
+### 8.4 修改权限和审批设置
 
-- 没有 `approvals:` 配置时，`approval_required` = 永不执行。
-- `approvals:` 里只有地址、存储位置和两个期限，没有任何能让请求自动通过的选项；也没有选择「别的审批器」的配置项。
-- 测试覆盖了：各种看起来像开关的配置项都被当作未知字段拒绝。
-- 这句话的边界见 8.5 第 1 条。
+没有 `approvals:` 时，`approval_required` 永不执行。MCP Token 不能修改策略。
+网页管理员需要用 Passkey 再确认权限增授、审批人或参数限制变更、Token 签发或轮换、
+Passkey 邀请或撤销，以及会引入或改变连接凭据和工具的操作。
+确认绑定本次操作、请求内容、当前配置版本和登录会话，最多两分钟，只能使用一次。
+单纯撤销访问可以立即执行。
 
 ### 8.5 限制
 
 1. **能控制 Gateway 主机的人可以绕过审批**：改策略把 `approval_required` 换成 `allow`、直接改 SQLite 文件、
-   或运行 `agw approval enroll` 给自己登记一个 Passkey。「不允许通过修改配置绕过」只对不能修改主机的人成立。
+   或运行 `agw approval enroll` 给自己登记一个 Passkey。受信任的网页管理员在重新验证后也能调整策略；
+   已经签发的审批不能用来批准不同的操作。
 2. **审批服务和 Gateway 在同一个进程里。** `Approver` 是一个两个方法的接口，接一个运行在别的主机上的审批服务
    需要实现并验收独立 adapter；当前仅提供同进程实现。同机实现的代价是：攻破 Gateway 进程 = 攻破审批。
 3. **认证器兼容性。** 服务端用软件 Passkey（真实的 P-256 密钥和签名）测试；
@@ -398,6 +401,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 注册码和会话 Cookie 在数据库中只保存哈希。管理员身份固定在 YAML 中，家庭成员邀请只注册该成员的审批 Passkey。
 HTTPS 管理会话使用 `__Host-`、Secure、HttpOnly、SameSite=Strict Cookie，最多一小时；每个 POST 需要精确 Origin、JSON，
 已登录操作还需要会话专属 CSRF Token。MCP Bearer Token 不被管理入口接受。
+在 Agent 无法控制的设备或浏览器中打开 `/admin/`。
 
 网页提供内置 Connector 和远程 HTTPS MCP 配置，不能上传脚本或任意设置命令。新增或编辑连接器先生成绑定当前会话和配置版本的临时预览，
 用户确认工具定义后才持久化。预览和 OAuth 中间凭据仅在内存保留，10 分钟过期并定期清理；Token 留在服务端。

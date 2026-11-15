@@ -7,14 +7,14 @@ from agent_gateway.admin_config import tool_access
 from agent_gateway.config import ConnectionCfg, ToolCfg
 from helpers import TOKEN_A, TOKEN_HOUSE
 from passkey_helpers import Authenticator, Page, request_id_in
-from test_admin import change, rpc, setup, state, web_gateway
+from test_admin import admin_post, change, rpc, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
 
 
 async def enroll(http, origin, member):
     key = Authenticator()
-    url = (await http.post('/admin/api/members/enroll', json={'id': member})).json()['url']
+    url = (await admin_post(http, 'members/enroll', json={'id': member})).json()['url']
     ceremony = (await http.post('/approvals/api/begin', json={'action': 'enroll', 'target': url.split('#')[1]})).json()
     reply = await http.post('/approvals/api/finish', json={'ceremony_id': ceremony['ceremony_id'], 'response': key.response(ceremony, origin=origin)})
     assert reply.status_code == 200

@@ -37,6 +37,7 @@ async def login(http, key, origin, action="login", code=""):
                                                          "response": key.response(ceremony, origin=origin)})
     assert reply.status_code == 200, reply.text
     http.headers['X-CSRF-Token'] = reply.json()['csrf']
+    http.test_passkey = key, origin
     return reply
 
 
@@ -56,9 +57,20 @@ async def state(http):
     return reply.json()
 
 
+async def admin_post(http, operation, *, json):
+    path = '/admin/api/' + operation
+    response = await http.post(path, json=json)
+    if response.status_code != 403 or response.json().get('error') != 'admin_confirmation_required':
+        return response
+    key, origin = http.test_passkey
+    confirmation = response.json()['confirmation']
+    proof = {'ceremony_id': confirmation['ceremony_id'], 'response': key.response(confirmation, origin=origin)}
+    return await http.post(path, json={**json, 'confirmation': proof})
+
+
 async def change(http, operation, **kwargs):
     current = await state(http)
-    return await http.post('/admin/api/' + operation, json={'revision': current['revision'], **kwargs})
+    return await admin_post(http, operation, json={'revision': current['revision'], **kwargs})
 
 
 async def rpc(origin, token, name='tools/list', params=None):
@@ -101,14 +113,14 @@ async def test_sessions_csrf_logout_and_member_cannot_become_admin(tmp_path):
         assert (await http.post('/admin/api/members/add', json={'id': 'alice', 'revision': 0}, headers={'Origin': 'https://evil.invalid'})).status_code == 403
         assert (await http.post('/admin/api/members/add', content='x' * 256001, headers={'Content-Type': 'application/json'})).status_code == 413
         assert (await change(http, 'members/add', id='alice')).status_code == 200
-        link = (await http.post('/admin/api/members/enroll', json={'id': 'alice'})).json()['url']
+        link = (await admin_post(http, 'members/enroll', json={'id': 'alice'})).json()['url']
         member = Authenticator()
         start = (await http.post('/approvals/api/begin', json={'action': 'enroll', 'target': link.split('#')[1]})).json()
         assert (await http.post('/approvals/api/finish', json={'ceremony_id': start['ceremony_id'], 'response': member.response(start, origin=origin)})).status_code == 200
         start = (await http.post('/admin/api/auth/begin', json={'action': 'login'})).json()
         assert (await http.post('/admin/api/auth/finish', json={'ceremony_id': start['ceremony_id'], 'response': member.response(start, origin=origin)})).status_code == 403
         owner_key = next(k['id'] for k in (await state(http))['passkeys'] if k['principal'] == 'person_a')
-        assert (await http.post('/admin/api/passkeys/remove', json={'id': owner_key})).status_code == 409
+        assert (await admin_post(http, 'passkeys/remove', json={'id': owner_key})).status_code == 409
         assert (await http.post('/admin/api/auth/logout', json={})).status_code == 200
         assert (await http.get('/admin/api/state')).status_code == 401
         reply = await login(http, key, origin)

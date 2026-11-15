@@ -11,7 +11,7 @@ import sys
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .config import Config, ConnectionCfg, allocate_tool_name, validate_name
+from .config import Config, ConnectionCfg, allocate_tool_name, is_mail_send, validate_name
 from .credentials import EncryptedFileStore
 from .gmail_scopes import ORGANIZE_TOOLS, SCOPES, tool_enabled
 from .lock import Lock, digest_of
@@ -121,7 +121,8 @@ class ManagedStore:
         raw["shared"] = [home]
         for client in raw["clients"]:
             client["household"] = home
-        raw["policy"] = [{"clients": [c.id], "connection": conn.id, "tools": [tool.name], "effect": effect}
+        raw["policy"] = [{"clients": [c.id], "connection": conn.id, "tools": [tool.name], "effect": effect,
+                          "mail_send_direct": effect == "allow" and is_mail_send(conn, tool)}
                          for c in cfg.clients for conn in cfg.connections for tool in conn.tools
                          if (effect := policy.effect(c.subject, tool.name, c.id)) != "deny"]
         result.update(schema=2, config=raw)
@@ -273,8 +274,13 @@ def extend_catalog_tools(conn, cfg):
 
 
 def connection_access(policy, client, conn):
-    effects = [(tool_access(conn, t), policy.effect(client.subject, t.name, client.id)) for t in conn.tools]
+    effects = [(tool_access(conn, t), policy.effect(client.subject, t.name, client.id))
+               for t in conn.tools if not is_mail_send(conn, t)]
+    has_send = any(policy.effect(client.subject, t.name, client.id) != "deny"
+                   for t in conn.tools if is_mail_send(conn, t))
     for name, settings in CONNECTION_ACCESS.items():
+        if has_send and settings["write"] == "deny":
+            continue
         if all(effect == settings[access] for access, effect in effects):
             return name
     return "custom"

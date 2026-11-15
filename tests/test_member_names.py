@@ -5,7 +5,7 @@ import pytest
 from helpers import TOKEN_A
 from passkey_helpers import request_id_in
 from service_helpers import free_port
-from test_admin import change, login, rpc, setup, state, web_gateway
+from test_admin import admin_post, change, login, rpc, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
 
@@ -48,7 +48,7 @@ async def test_rename_preserves_identity_sessions_open_approval_and_restart(tmp_
     async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
         await login(http, key, origin)
         assert next(m for m in (await state(http))['members'] if m['id'] == 'person_a')['name'] == 'Greg 林'
-        link = (await http.post('/admin/api/members/enroll', json={'id': 'person_a'})).json()['url']
+        link = (await admin_post(http, 'members/enroll', json={'id': 'person_a'})).json()['url']
         begin = (await http.post('/approvals/api/begin', json={'action': 'enroll', 'target': link.split('#')[1]})).json()
         assert begin['options']['publicKey']['user']['displayName'] == 'Greg 林'
         assert begin['options']['publicKey']['user']['name'] == 'Greg 林'

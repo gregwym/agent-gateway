@@ -21,11 +21,23 @@ from .admin_config import (
 )
 from .auth import hash_token, new_token
 from .catalog_sync import bundled_kind
-from .config import NAME, ToolCfg
+from .config import NAME, ToolCfg, is_mail_send
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .upstream import list_all_tools, open_client
 from .web_errors import connector_failure, failure_response, probe_error
+
+
+def needs_admin_confirmation(operation, body):
+    if operation == "permissions/save":
+        return body.get("effect") != "deny"
+    if operation == "permissions/connection":
+        return body.get("access") != "none" or "approver" in body
+    # OAuth callbacks can only save drafts started by an authorized, session-bound request.
+    return operation in {
+        "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
+        "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
+    }
 
 
 class AdminController:
@@ -145,7 +157,8 @@ class AdminController:
             tools = []
             for tool in conn.tools:
                 route = gw.routes[tool.name]
-                tools.append({"name": tool.name, "upstream": tool.upstream, "access": tool_access(conn, tool), "pin": tool.pin,
+                tools.append({"name": tool.name, "upstream": tool.upstream, "access": tool_access(conn, tool),
+                              "mail_send": is_mail_send(conn, tool), "pin": tool.pin,
                               "allow_values": tool.allow_values, "problem": gw.problem(route),
                               "permissions": {c.id: gw.policy.effect(c.subject, tool.name, c.id) for c in gw.cfg.clients}})
             connections.append({"id": conn.id, "kind": kind_of(conn), "owner": conn.owner,
@@ -553,6 +566,11 @@ class AdminController:
                 raise Refused("outside_household", 400)
             if mode != "custom" and CONNECTION_ACCESS[mode]["write"] != "deny" and not any(tool_access(conn, t) == "write" for t in conn.tools):
                 raise Refused("connection_tools_update_required" if any(tool_access(conn, ToolCfg.model_validate(t)) == "write" for t in catalog_additions(conn, cfg)) else "connection_readonly", 400)
+            send_effect = body.get("mail_send")
+            if "mail_send" in body and (mode == "custom" or CONNECTION_ACCESS[mode]["write"] == "deny"
+                    or send_effect not in ("deny", "approval_required", "allow", "keep")
+                    or not any(is_mail_send(conn, tool) for tool in conn.tools)):
+                raise Refused("invalid_mail_send_permission", 400)
             if "approver" in body:
                 approver = body["approver"]
                 if not isinstance(approver, str) or approver not in cfg.principals or cfg.household_of(approver) != client.household:
@@ -569,7 +587,16 @@ class AdminController:
                         raw["policy"].append({**rule, "clients": other})
             for tool in conn.tools:
                 effect = CONNECTION_ACCESS[mode][tool_access(conn, tool)]
-                raw["policy"].append({"clients": [client_id], "connection": name, "tools": [tool.name], "effect": effect})
+                send = is_mail_send(conn, tool)
+                if send:
+                    if CONNECTION_ACCESS[mode]["write"] == "deny":
+                        effect = "deny"
+                    elif send_effect == "keep":
+                        effect = self.runtime.gateway.policy.effect(client.subject, tool.name, client.id)
+                    else:
+                        effect = send_effect or "approval_required"
+                raw["policy"].append({"clients": [client_id], "connection": name, "tools": [tool.name], "effect": effect,
+                                      "mail_send_direct": send and effect == "allow"})
             return await self._commit(state, operation)
         if operation == "permissions/save":
             client_id, name, tool = body.get("client"), body.get("connection"), body.get("tool")
@@ -593,7 +620,10 @@ class AdminController:
                         raw["policy"].append({**rule, "clients": other_agents})
                     if other_tools:
                         raw["policy"].append({**rule, "clients": [client_id], "tools": other_tools})
-            raw["policy"].append({"connection": name, "clients": [client_id], "tools": [tool], "effect": body["effect"]})
+            current_conn = cfg.connection(name)
+            selected = next(t for t in current_conn.tools if t.name == tool)
+            raw["policy"].append({"connection": name, "clients": [client_id], "tools": [tool], "effect": body["effect"],
+                                  "mail_send_direct": body["effect"] == "allow" and is_mail_send(current_conn, selected)})
             return await self._commit(state, operation)
         if operation == "tools/restrict":
             conn = next((c for c in raw["connections"] if c["id"] == body.get("connection")), None)
@@ -681,7 +711,14 @@ class AdminController:
                 if operation == "registry/search":
                     return _json(await registry.search(body), 200)
                 async with self.editing():
-                    self.auth.session(token)  # may have expired while waiting for another change
+                    session = self.auth.session(token)  # may have expired while waiting
+                    if needs_admin_confirmation(operation, body):
+                        revision = self.store.state["revision"]
+                        if "confirmation" not in body:
+                            ceremony = self.auth.begin_confirmation(session, operation, body, revision)
+                            return _json({"error": "admin_confirmation_required", "confirmation": ceremony}, 403)
+                        proof = body.pop("confirmation")
+                        self.auth.confirm(session, operation, body, revision, proof)
                     result = await self.operate(operation, body, session)
                 return _json(result, 200)
             except Refused as exc:

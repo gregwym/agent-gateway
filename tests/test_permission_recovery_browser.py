@@ -17,7 +17,7 @@ async def test_permission_save_reports_actual_status_without_repeating_post(tmp_
           window.savePosts = 0;
           let failRefresh = false;
           window.fetch = async (url, options) => {
-            if (String(url).endsWith('/permissions/connection')) {
+            if (String(url).endsWith('/permissions/connection') && JSON.parse(options.body).confirmation) {
               window.savePosts++;
               if (failure === 'not_sent') throw new TypeError('simulated network loss');
               const response = await original(url, options);

@@ -73,7 +73,7 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
             conn = extended_connection(account)
             conn['env'].update(SMTP_HOST='localhost', SMTP_PORT=str(smtp_port), SMTP_SECURITY='starttls')
             raw['connections'].append(conn)
-            raw['policy'].append({'principals': ['person_a'], 'connection': conn['id'], 'tools': ['mail_send_message'], 'effect': 'approval_required'})
+            raw['policy'].append({'principals': ['person_a'], 'connection': conn['id'], 'tools': ['mail_send_message'], 'effect': 'allow'})
             path = await prepare(tmp_path / 'gateway', raw, secrets={**SECRETS, 'mail_password': account.password})
             async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
                 key, _ = await setup(http, origin, path)
@@ -89,6 +89,7 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 args = {'to': ['ok@example.test'], 'subject': 'approved fake message', 'text': 'simulated content'}
                 async def send(arguments):
                     return (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'mail_send_message', 'arguments': arguments})).json()['result']
+                # An allow rule from before sending had a separate permission must fail closed.
                 pending = await send(args)
                 request_id = request_id_in(pending['content'][0]['text'])
                 page = Page(origin, origin)
@@ -105,3 +106,19 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 assert len(messages) == 1
                 repeat = await send(args)
                 assert request_id_in(repeat['content'][0]['text']) != request_id and len(messages) == 1
+
+                updated = await change(http, 'permissions/connection', client='agent-a', connection=conn['id'],
+                                       access='read_write_direct')
+                assert updated.status_code == 200
+                mail = next(c for c in (await state(http))['connections'] if c['id'] == conn['id'])
+                assert next(t for t in mail['tools'] if t['upstream'] == 'archive_messages')['permissions']['agent-a'] == 'allow'
+                still_pending = await send(args)
+                assert still_pending['isError'] and len(messages) == 1
+                direct = await change(http, 'permissions/connection', client='agent-a', connection=conn['id'],
+                                      access='read_write_direct', mail_send='allow')
+                assert direct.status_code == 200
+                assert not (await send(args)).get('isError') and len(messages) == 2
+                await change(http, 'permissions/connection', client='agent-a', connection=conn['id'],
+                             access='read_write_direct', mail_send='deny')
+                denied = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'mail_send_message', 'arguments': args})).json()
+                assert denied['error']['code'] == -32602 and len(messages) == 2

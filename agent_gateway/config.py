@@ -40,6 +40,11 @@ def allocate_tool_name(connection, upstream, suffix, occupied):
     return name
 
 
+def is_mail_send(conn, tool):
+    return (tool.upstream == "send_message" and conn.transport == "stdio"
+            and any(arg in ("agent_gateway.connectors.imap_mail", "agent_gateway.connectors.gmail") for arg in conn.command))
+
+
 class ConfigError(Exception):
     """The configuration is invalid. The message never contains secret values."""
 
@@ -243,6 +248,7 @@ class RuleCfg(_Model):
     connection: str
     tools: list[str] = Field(min_length=1)  # exposed names; no wildcards
     effect: Effect
+    mail_send_direct: bool = False  # explicit exception for built-in mail send tools
     # Must be set to grant a principal access to an account it does not own
     # (unless the owner is listed under `shared`). Guards against copy-paste grants.
     cross_account: bool = False
@@ -350,10 +356,12 @@ class Config(_Model):
                     raise ValueError(f"{where}: unknown Agent {client_id!r}")
                 if homes and client.household != self.household_of(conn.owner) and rule.effect != "deny":
                     raise ValueError(f"{where}: cannot grant access outside the Agent's household")
-            exposed = {t.name for t in conn.tools}
+            exposed = {t.name: t for t in conn.tools}
             for tool in rule.tools:
                 if tool not in exposed:
                     raise ValueError(f"{where}: {tool!r} is not a tool of connection {conn.id}")
+                if rule.mail_send_direct and (rule.effect != "allow" or not is_mail_send(conn, exposed[tool])):
+                    raise ValueError(f"{where}: mail_send_direct is only valid on allow rules for built-in send tools")
             for principal in rule.principals:
                 if principal not in known:
                     raise ValueError(f"{where}: unknown principal {principal!r}")
