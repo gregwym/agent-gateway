@@ -41,6 +41,7 @@ class Tool:
     handler: Callable[[dict[str, Any]], Any]
     properties: dict[str, Any] = field(default_factory=dict)
     required: tuple[str, ...] = ()
+    read_only: bool = True
 
     @property
     def schema(self) -> dict[str, Any]:
@@ -130,7 +131,7 @@ def build_server(name: str, tools: list[Tool]) -> Server[Any]:
                     name=tool.name,
                     description=tool.description,
                     input_schema=tool.schema,
-                    annotations=types.ToolAnnotations(read_only_hint=True),
+                    annotations=types.ToolAnnotations(read_only_hint=tool.read_only),
                 )
                 for tool in tools
             ]

@@ -219,7 +219,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 | | 凭据本身能做什么 | Connector 实际发出什么 | 结论 |
 |---|---|---|---|
 | Gmail | 只能读邮件。Token 的 scope 是 `gmail.readonly`，用它发写请求会被 Google 拒绝 | 对 `gmail.googleapis.com` 的 GET，和对 `oauth2.googleapis.com` 的 Token 刷新 | **凭据层只读。** Connector 每次刷新都检查 Google 报告的 scope，只要不是恰好这一个就拒绝工作 |
-| iCloud Mail | App 专用密码**能收发邮件、删除邮件，也能访问日历和通讯录**。Apple 不提供只读的、或只限某一项服务的密码 | 邮箱用 `EXAMINE` 打开（协议层面的只读打开，读信不会标记已读），正文用 `BODY.PEEK` 取；不发任何修改命令 | **只是这段代码不写。** 拿到这份密码的人、或被改过的 Connector 进程，不受工具列表限制 |
+| iCloud Mail | App 专用密码**能收发邮件、删除邮件，也能访问日历和通讯录**。Apple 不提供只读的、或只限某一项服务的密码 | 读取工具用 `EXAMINE` 和 `BODY.PEEK`；0.5 起同一连接另有状态修改、移动及 SMTP 发信工具，由 Gateway 的 write 权限控制 | **工具白名单层只读。** write 可逐次审批或明确免审批；拿到密码或控制进程的人不受工具列表限制 |
 | iCloud 日历 | 同上，是同一种密码 | 只有 PROPFIND 和 REPORT | 同上 |
 | 提醒事项 | macOS 对提醒事项只有「完全访问」一种授权，没有只读；授权是给**应用**的，同一个应用名下启动的任何程序都有 | 只调用读取接口 | 同上，而且见 7.6 |
 

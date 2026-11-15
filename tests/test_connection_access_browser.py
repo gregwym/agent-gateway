@@ -81,7 +81,7 @@ async def test_agent_rename_simple_permissions_and_household_approval(tmp_path, 
         await page.get_by_role('button', name=t('Approve with passkey', '用通行密钥批准'), exact=True).click()
         await playwright.expect(page.locator('h1')).to_have_text(t('Approved', '已批准'))
         assert not (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'a_add_note', 'arguments': args})).json()['result'].get('isError')
-        # An IMAP connector lists read capabilities only; never offer a fictitious write mode.
+        # IMAP exposes real write tools, but read-only access still hides write approval.
         await page.goto(origin + '/admin/')
         await page.get_by_role('button', name=t('Permissions', '权限'), exact=True).click()
         await page.evaluate("""async () => {
@@ -90,8 +90,7 @@ async def test_agent_rename_simple_permissions_and_household_approval(tmp_path, 
           await mutate('connections/apply', {draft:preview.draft,reviewed:true});
         }""")
         mail = page.locator('.permission-card[data-connection=mail]')
-        await playwright.expect(mail).to_contain_text(t('only provides read operations', '只提供读取操作'))
-        assert await mail.locator('select[name=connection_access] option[value=read_write]').count() == 0
+        assert await mail.locator('select[name=connection_access] option[value=read_write]').count() == 1
         assert await mail.locator('select[name=connection_access] option[value=read_write_direct]').count() == 0
         await mail.get_by_label(t('Connection access', '连接权限'), exact=True).select_option('read')
         await mail.get_by_role('button', name=t('Save connection access', '保存连接权限'), exact=True).click()

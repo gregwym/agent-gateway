@@ -1,4 +1,4 @@
-"""Mail over IMAP (iCloud Mail and others), read-only in what it sends.
+"""Mail over IMAP (iCloud Mail and others), with separate read and write tools.
 
     IMAP_HOST      default imap.mail.me.com (iCloud)
     IMAP_PORT      default 993
@@ -6,20 +6,21 @@
     IMAP_PASSWORD  secret. For iCloud: an app-specific password, not the Apple ID password.
 
 The connection is always TLS with certificate verification; there is no option to
-turn that off. Mailboxes are opened with EXAMINE (read-only at the protocol level,
+turn that off. Reading opens mailboxes with EXAMINE (read-only at the protocol level,
 so reading does not mark anything as seen) and messages are fetched with BODY.PEEK.
-This module sends no command that changes anything.
+Only explicit write tools open a writable mailbox and change flags or move mail.
 
 That does not make the credential read-only. An iCloud app-specific password can
 also send mail and reach contacts and calendars; whoever obtains it, or changes
 this process, is not limited by the list of tools below.
 
-Nothing is indexed or stored: every call is a search or fetch against the server.
+Pagination keeps a bounded, temporary UID snapshot in memory, never message bodies.
 """
 
 from __future__ import annotations
 
 import imaplib
+import os
 import socket
 import ssl
 from collections.abc import Callable
@@ -62,7 +63,7 @@ class Mailbox:
             raise
         return client
 
-    def run(self, action: Callable[[IMAPClient], T]) -> T:
+    def run(self, action: Callable[[IMAPClient], T], *, retry: bool = True) -> T:
         """Run `action` on the connection; if the connection turns out to be dead, reconnect once."""
         for attempt in (1, 2):
             try:
@@ -79,7 +80,7 @@ class Mailbox:
                 raise ConnectorError(_UNREACHABLE + " The server hostname could not be resolved.", "connector_dns_failed") from None
             except (imaplib.IMAP4.abort, OSError, EOFError):
                 self._drop()
-                if attempt == 2:
+                if attempt == 2 or not retry:
                     raise ConnectorError(_UNREACHABLE, "imap_server_unreachable") from None
             except imaplib.IMAP4.error:
                 # The server answered NO or BAD: a mailbox that does not exist, a search it cannot parse.
@@ -117,7 +118,7 @@ def _summary(mailbox: str, uid: int, data: dict[bytes, Any], message: Any = None
     }
 
 
-def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int) -> list[Tool]:
+def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int, submission=None) -> list[Tool]:
     def list_mailboxes(args: dict[str, Any]) -> Any:
         folders = mail.run(lambda c: c.list_folders())
         return [{"name": name, "flags": _flags(flags)} for flags, _delimiter, name in folders]
@@ -180,6 +181,11 @@ def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int
 
     mailbox = string("Mailbox name as returned by list_mailboxes. Default: INBOX.")
     uid = integer("The message's uid, from search_messages.", 1, 4_294_967_295)
+    from ._imap_ops import additional_tools
+    from ._smtp import Submission, tools as smtp_tools
+    if submission is None:
+        submission = Submission("", 587, "starttls", "", "", "")
+
     return [
         Tool("list_mailboxes", "List the mailboxes (folders) of this mail account.", list_mailboxes),
         Tool(
@@ -222,15 +228,24 @@ def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int
             {"mailbox": mailbox, "uid": uid, "index": integer("Index from get_message's attachment list.", 0, 999)},
             ("uid", "index"),
         ),
-    ]
+    ] + additional_tools(mail, max_message_bytes, _summary, _HEADER_FETCH) + smtp_tools(submission)
 
 
 def main() -> None:
+    from ._smtp import Submission
+
+    host, username = setting("IMAP_HOST", "imap.mail.me.com"), setting("IMAP_USERNAME")
+    password = setting("IMAP_PASSWORD")
+    icloud = host.lower() == "imap.mail.me.com"
+    sender = os.environ.get("SMTP_SENDER") or (username + "@icloud.com" if icloud and "@" not in username else username)
+    submission = Submission(os.environ.get("SMTP_HOST", "smtp.mail.me.com" if icloud else ""),
+                            int(setting("SMTP_PORT", "587")), setting("SMTP_SECURITY", "starttls"),
+                            os.environ.get("SMTP_USERNAME") or (sender if icloud else username), password, sender)
     mail = Mailbox(
-        host=setting("IMAP_HOST", "imap.mail.me.com"),
+        host=host,
         port=int(setting("IMAP_PORT", "993")),
-        username=setting("IMAP_USERNAME"),
-        password=setting("IMAP_PASSWORD"),
+        username=username,
+        password=password,
     )
     serve(
         "imap-mail",
@@ -238,6 +253,7 @@ def main() -> None:
             mail,
             max_message_bytes=int(setting("IMAP_MAX_MESSAGE_BYTES", "40000000")),
             max_attachment_bytes=int(setting("IMAP_MAX_ATTACHMENT_BYTES", "5000000")),
+            submission=submission,
         ),
     )
 

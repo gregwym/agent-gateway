@@ -109,6 +109,16 @@ const messages = {
   invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
   invalid_connector: ['Some connector fields are invalid. Check the form.', '连接器字段无效，请检查表单。'],
   invalid_imap_server: ['Check the IMAP server name and TLS port (1–65535).', '请检查 IMAP 服务器地址及 TLS 端口（1–65535）。'],
+  invalid_smtp_server: ['Check the SMTP server name and port (1–65535).', '请检查 SMTP 服务器地址及端口（1–65535）。'],
+  smtp_invalid_security: ['Choose STARTTLS or TLS for SMTP.', 'SMTP 加密方式请选择 STARTTLS 或 TLS。'],
+  smtp_invalid_address: ['Enter a full sender email address, without a display name.', '请填写完整的发件邮箱地址，不要包含显示名称。'],
+  smtp_credentials_rejected: ['SMTP rejected the username or app-specific password. Check the SMTP username in this connection; iCloud requires the full email address.', 'SMTP 拒绝了用户名或 App 专用密码。请核对本连接的 SMTP 用户名；iCloud 需要完整邮箱地址。'],
+  smtp_not_configured: ['Set an SMTP server in this mail connection to enable sending.', '请在本邮箱连接中设置 SMTP 服务器以启用发信。'],
+  smtp_tls_failed: ['SMTP TLS verification failed. Check the server, security mode and gateway clock.', 'SMTP TLS 验证失败，请检查服务器、加密方式和网关时间。'],
+  smtp_dns_failed: ['The SMTP server hostname could not be resolved.', '无法解析 SMTP 服务器地址。'],
+  smtp_not_supported: ['The SMTP server does not support the required TLS or authentication method. Check its port and security mode.', 'SMTP 服务器不支持所需的 TLS 或认证方式，请检查端口和加密方式。'],
+  smtp_request_rejected: ['SMTP refused the connection or authentication request. Check server settings and account access.', 'SMTP 拒绝了连接或认证请求，请检查服务器设置及账号权限。'],
+  smtp_unreachable: ['The SMTP server could not be reached or disconnected before submission. Check its server, port and network.', '无法连接 SMTP 服务器，或提交邮件前连接已断开，请检查服务器、端口和网络。'],
   missing_username: ['Enter the account email or username.', '请填写账号邮箱或用户名。'],
   missing_password: ['Enter the app-specific password.', '请填写 App 专用密码。'],
   missing_client_id: ['Enter the Google OAuth client ID.', '请填写 Google OAuth 客户端 ID。'],
@@ -464,14 +474,17 @@ function connectorForm(existing) {
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
   const dynamic = el(form, 'div'); let settings = {}, credentials = {};
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
+    smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
+    smtp_security: tr('SMTP encryption', 'SMTP 加密方式'), smtp_username: tr('SMTP username (optional override)', 'SMTP 用户名（可选覆盖）'),
+    smtp_sender: tr('Sender email (defaults to account email)', '发件邮箱（默认账号邮箱）'),
     url: tr('HTTPS service URL', '服务 HTTPS 地址'), timezone: tr('Time zone', '时区'), password: tr('App-specific password', 'App 专用密码'),
     client_id: tr('Google OAuth client ID', 'Google OAuth 客户端 ID'), client_secret: tr('Google OAuth client secret', 'Google OAuth 客户端密钥'),
     refresh_token: tr('Google refresh token', 'Google 刷新令牌'), token: tr('Helper bearer token', '辅助服务 Bearer Token')};
   function fields() {
     dynamic.replaceChildren(); settings = {}; credentials = {};
     const spec = state.catalog[kind.value];
-    const defaults = {host: 'imap.mail.me.com', port: '993', url: kind.value === 'caldav' ? 'https://caldav.icloud.com' : '', timezone: 'UTC'};
-    for (const key of spec.fields) settings[key] = field(dynamic, labels[key], key, existing?.settings[key] || defaults[key] || '');
+    const defaults = {host: 'imap.mail.me.com', port: '993', smtp_host: !existing || (existing.settings.host || 'imap.mail.me.com') === 'imap.mail.me.com' ? 'smtp.mail.me.com' : '', smtp_port: '587', smtp_security: 'starttls', url: kind.value === 'caldav' ? 'https://caldav.icloud.com' : '', timezone: 'UTC'};
+    for (const key of spec.fields) settings[key] = key === 'smtp_security' ? select(dynamic, labels[key], key, [['starttls', 'STARTTLS (587)'], ['tls', 'TLS (465)']], existing?.settings[key] ?? defaults[key]) : field(dynamic, labels[key], key, existing?.settings[key] ?? defaults[key] ?? '');
     for (const key of spec.secrets) credentials[key] = field(dynamic, labels[key], key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
     if (kind.value === 'demo') el(dynamic, 'p', tr('No real account needed. Includes read tools and a demo write that requires passkey approval.', '无需真实账号。包含只读工具，以及一个需要通行密钥审批的模拟写入工具。'), 'hint');
     if (kind.value === 'gmail') {
@@ -483,8 +496,11 @@ function connectorForm(existing) {
         location.assign(result.url);
       }, 'primary');
     }
-    if (['imap', 'caldav'].includes(kind.value)) el(dynamic, 'p', tr('iCloud uses an app-specific password. The connector exposes read operations only.', 'iCloud 使用 App 专用密码。连接器只提供读取操作。'), 'hint');
-    if (kind.value === 'imap') el(dynamic, 'p', tr('For iCloud Mail, use the mailbox username (the part before @icloud.com), or try the full iCloud Mail address.', 'iCloud Mail 用户名通常为邮箱地址中 @icloud.com 前面的部分；也可以尝试完整的 iCloud 邮箱地址。'), 'muted');
+    if (kind.value === 'caldav') el(dynamic, 'p', tr('iCloud uses an app-specific password. The calendar connector exposes read operations only.', 'iCloud 使用 App 专用密码。日历连接器只提供读取操作。'), 'hint');
+    if (kind.value === 'imap') {
+      el(dynamic, 'p', tr('One mail account: IMAP reads and organizes mail; SMTP sends it. Both use the same saved password. Enable write access and choose approval settings in Permissions. Test connection checks IMAP and configured SMTP authentication without sending mail.', '一个邮箱账号：IMAP 读取和整理邮件，SMTP 发信，两者共用已保存的密码。请在「权限」中启用写入并选择审批方式。「测试连接」会检查 IMAP 及已配置的 SMTP 登录，不会发出邮件。'), 'hint');
+      el(dynamic, 'p', tr('iCloud requires an app-specific password. SMTP uses the full email address; when the IMAP username has no domain, @icloud.com is added for SMTP. Other providers: enter their SMTP server or leave it blank.', 'iCloud 需要 App 专用密码。SMTP 使用完整邮箱地址；IMAP 用户名不带域名时，SMTP 自动补上 @icloud.com。其他服务商请填写对应的 SMTP 服务器，或留空关闭发信。'), 'muted');
+    }
   }
   kind.addEventListener('change', fields); fields();
   function values() {
@@ -505,7 +521,7 @@ function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
   el(review, 'p', result.connection + ' · ' + identityLabel(result.owner), 'muted');
   if (result.google_account) el(review, 'p', tr('Authorized Google account: ', '已授权的 Google 账号：') + result.google_account, 'hint');
-  el(review, 'p', tr('These descriptions and schemas are what authorized agents will see. New connectors grant no access until you assign tools to an Agent.', '已获授权的 Agent 将看到这些描述和参数定义。新连接器默认不开放工具，需要逐个授予 Agent 权限。'), 'hint');
+  el(review, 'p', tr('These descriptions and schemas are what authorized agents will see. New connectors and newly added tools grant no access. After applying, choose the connection access and approval settings for each Agent in Permissions. Existing tool permissions are preserved.', '已获授权的 Agent 将看到这些描述和参数定义。新连接器和新增工具默认不开放访问。应用后，请在「权限」中为每个 Agent 选择连接权限及审批设置。原有工具权限会保留。'), 'hint');
   for (const definition of result.definitions) { el(review, 'h3', definition.name); el(review, 'pre', JSON.stringify(definition, null, 2)); }
   const checked = checkbox(review, tr('I reviewed these definitions and permissions.', '我已审阅这些工具定义和权限。'));
   const apply = button(review, tr('Apply connector', '应用连接器'), async () => {

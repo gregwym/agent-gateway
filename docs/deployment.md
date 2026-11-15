@@ -77,7 +77,7 @@ docker compose build
   开启 `/mcp` 的 Host 头校验并拒绝带 `Origin` 的浏览器请求（防 DNS rebinding）。填的值必须和客户端实际发来的 Host 头一致，
   包括端口；填错的表现是所有 `/mcp` 请求都被拒绝。
 - Gateway 不需要入站公网访问。出站只需要到各上游服务（`imap.mail.me.com:993`、`caldav.icloud.com` 及其跳转到的
-  `*.icloud.com` 主机、`gmail.googleapis.com`、`oauth2.googleapis.com`）。
+  `*.icloud.com` 主机、`smtp.mail.me.com:587`、`gmail.googleapis.com`、`oauth2.googleapis.com`）。
 
 **启用审批时需要 HTTPS。** 浏览器只在 HTTPS 页面（或 `http://localhost`）上允许使用 Passkey。Gateway 自己不做 TLS，
 由 Tailscale 提供证书是最省事的办法：
@@ -100,7 +100,7 @@ Gmail 的完整配置。复制成 `data/config/gateway.yaml`，把所有大写�
 所以凭据是否正确要到第一次调用才知道。
 
 **只读的真实范围**（详见 [design.md](design.md) 7.3）：Gmail 的 Token 由 Google 强制只读。iCloud 的 App 专用密码
-**没有只读版本**，它能收发邮件、改日历；只读靠的是 Connector 只发读请求，以及这些密码只存在 Gateway 主机上。
+**没有只读版本**，它能收发邮件、改日历；只读靠 Gateway 仅开放已审阅的读取工具，读取工具使用 `EXAMINE` 和 `BODY.PEEK`，密码只存在 Gateway 主机上。
 
 ### 5.1 iCloud 邮件
 
@@ -112,6 +112,35 @@ Gmail 的完整配置。复制成 `data/config/gateway.yaml`，把所有大写�
 
 「隐藏邮件地址」和「通过 Apple 登录」转发来的邮件就在这个邮箱里，按收件地址搜索用 `to` 参数；
 `get_message` 返回 `Delivered-To`、`To`、`Reply-To` 等头，可以看出是哪个中转地址收的。
+
+从 0.5 起，**一个邮箱只有一个 connection**，同时包含 IMAP 收取／整理和 SMTP 发信，保存一次 App 专用密码。
+网页服务名称为「Mail / 邮箱 (iCloud, IMAP + SMTP)」。iCloud 默认 IMAP 993，SMTP `smtp.mail.me.com:587` + STARTTLS；
+SMTP 使用完整邮箱地址，IMAP 用户名只有本地部分时自动补 `@icloud.com`。可填写 SMTP 用户名覆盖值及发件邮箱。
+其他邮件服务填写其 SMTP 服务器；留空可以关闭发信。支持 TLS 465 或 STARTTLS，不支持明文 SMTP。
+「验证连接」只列出邮箱并验证已配置的 SMTP 登录，不发邮件。
+
+已有连接升级：**连接器 → 编辑并审阅 → 预览工具 → 应用连接器**，再到 **权限** 为 Agent 保存连接权限。
+原有工具名称、固定参数和权限保留；新增工具默认无权限，读写审批分别可选「每次审批」或「不审批」。
+不需要重新输入已保存的密码，也不需要新增第二个 SMTP connection。
+
+新增工具后缀及用法：
+
+| 后缀 | 用法 |
+|---|---|
+| `_list` | `list_messages`，按邮箱及过滤条件建立 UID 快照；后续只传 `next_cursor`，直到为 null。每页最多 100 条，删除项也返回结果 |
+| `_get_batch` | `get_messages`，传 `mailbox`、`uidvalidity` 和最多 50 个 `uids`；每封独立结果，正文分段用 `next_offset` |
+| `_set_state` | `set_message_state`，`read: true/false` 标记已读／未读，`starred: true/false` 加星／取消加星；保留其他标志 |
+| `_move` / `_archive` / `_trash` | 移动／归档／移入废纸篓，批量输入同上。归档和废纸篓优先用服务端特殊文件夹；无法唯一识别时明确填写 `destination` |
+| `_send` | `send_message`，`to` 数组、`subject`、`text`，可选 `cc`、`bcc`、`html`；发件地址来自连接设置 |
+
+`uidvalidity` 从 `_list` 获取；邮箱 UID 世代变化时拒绝操作，需重新列出。
+分页快照有效期最多一小时，连接进程重启即失效；遍历起点之后的新邮件需重新列出。
+最多 16 份活动快照、合计一百万 UID；超限会明确报错，可用互不重叠的 `since` / `before` 日期范围遍历。
+批量读取最多取 40 MB 原始邮件，并限制响应大小；超限项明确提示缩小批次或正文片段，不会悄悄省略。
+批量结果逐封为 `success`、`error`、`unknown` 或 `not_attempted`；时间预算耗尽时剩余项标为未执行。
+服务器中途断线不会自动重放写入；`unknown` 先核对当前状态再决定重试。移动回退使用 UIDPLUS，绝不清除未选中的已删除邮件。
+SMTP 返回每个收件人的 `accepted`／`rejected`／`unknown`，accepted 仅指服务器接收提交。
+当前发信支持文本／HTML，无附件；不额外写入「已发送」，由邮件服务商决定是否自动保存。发信内容和收件人均绑定到一次审批。
 
 ### 5.2 iCloud 日历
 

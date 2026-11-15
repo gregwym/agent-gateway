@@ -157,6 +157,10 @@ class AdminController:
                             result = await client.call_tool(probe, arguments)
                             if result.is_error:
                                 problem = probe_error(kind_of(conn), result)
+                            elif kind_of(conn) == "imap" and conn.env.get("SMTP_HOST", "smtp.mail.me.com" if conn.env.get("IMAP_HOST", "imap.mail.me.com").lower() == "imap.mail.me.com" else ""):
+                                result = await client.call_tool("check_smtp", {})
+                                if result.is_error:
+                                    problem = probe_error("imap", result)
             except Exception as exc:
                 problem = connector_failure(exc, conn.transport)
             # Raise after leaving MCP's task groups. A Refused raised inside the

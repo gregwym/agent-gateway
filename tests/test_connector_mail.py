@@ -325,9 +325,11 @@ async def test_the_connector_refuses_what_could_break_out_of_a_command(accounts)
     a.front.commands.clear()
     async with Client(stdio_client(params), cache=None) as client:
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-        assert set(tools) == set(TOOLS)
+        writes = {"set_message_state", "move_messages", "archive_messages", "trash_messages", "send_message"}
+        assert set(tools) == set(TOOLS) | {"list_messages", "get_messages", "check_smtp"} | writes
         for tool in tools.values():
-            assert tool.annotations.read_only_hint and tool.input_schema["additionalProperties"] is False
+            assert tool.annotations.read_only_hint == (tool.name not in writes)
+            assert tool.input_schema["additionalProperties"] is False
             # No tool takes an account, a user or a credential.
             assert not {"account", "user", "username", "password", "host"} & set(tool.input_schema["properties"])
         for arguments in (

@@ -30,8 +30,12 @@ CATALOG = {
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
              "probe": ("list_notes", {"folder": "inbox"})},
-    "imap": {"label": "iCloud Mail / IMAP", "fields": ["username", "host", "port"], "secrets": ["password"],
-             "tools": [("list_mailboxes", "mailboxes"), ("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment")],
+    "imap": {"label": "Mail / 邮箱 (iCloud, IMAP + SMTP)",
+             "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender"], "secrets": ["password"],
+             "tools": [("list_mailboxes", "mailboxes"), ("search_messages", "search"), ("get_message", "get"), ("get_attachment", "attachment"),
+                       ("list_messages", "list"), ("get_messages", "get_batch"), ("set_message_state", "set_state"),
+                       ("move_messages", "move"), ("archive_messages", "archive"), ("trash_messages", "trash"), ("send_message", "send")],
+             "writes": {"set_message_state", "move_messages", "archive_messages", "trash_messages", "send_message"},
              "probe": ("list_mailboxes", {})},
     "caldav": {"label": "iCloud Calendar / CalDAV", "fields": ["username", "url", "timezone"], "secrets": ["password"],
                "tools": [("list_calendars", "calendars"), ("list_events", "events"), ("get_event", "event"), ("check_conflicts", "conflicts")],
@@ -168,6 +172,8 @@ def kind_of(conn):
 
 def settings_of(conn):
     names = {"IMAP_USERNAME": "username", "IMAP_HOST": "host", "IMAP_PORT": "port",
+             "SMTP_HOST": "smtp_host", "SMTP_PORT": "smtp_port", "SMTP_SECURITY": "smtp_security",
+             "SMTP_USERNAME": "smtp_username", "SMTP_SENDER": "smtp_sender",
              "CALDAV_USERNAME": "username", "CALDAV_URL": "url", "CALDAV_TIMEZONE": "timezone",
              "GMAIL_CLIENT_ID": "client_id"}
     result = {names[key]: value for key, value in conn.env.items() if key in names}
@@ -185,7 +191,8 @@ def tool_access(conn, tool):
         return tool.access
     kind = kind_of(conn)
     if kind in CATALOG and tool.upstream in {name for name, _ in CATALOG[kind]["tools"]}:
-        return "write" if kind == "demo" and tool.upstream == "add_note" else "read"
+        return "write" if ((kind == "demo" and tool.upstream == "add_note") or
+                           tool.upstream in CATALOG[kind].get("writes", ())) else "read"
     return "write"
 
 
@@ -254,6 +261,22 @@ def make_connection(body, cfg, values):
             raise Refused("invalid_imap_server", 400)
         raw["env"] = {"IMAP_USERNAME": field("username"), "IMAP_HOST": host, "IMAP_PORT": port}
         raw["secret_env"] = {"IMAP_PASSWORD": secret("password", "IMAP_PASSWORD")}
+        smtp_host = settings.get("smtp_host", "smtp.mail.me.com" if host.lower() == "imap.mail.me.com" else "").strip()
+        smtp_port = settings.get("smtp_port", "587").strip() or "587"
+        security = settings.get("smtp_security", "starttls").strip() or "starttls"
+        if any(c in smtp_host for c in "/@?# \t\r\n") or not smtp_port.isdecimal() or not 1 <= int(smtp_port) <= 65535:
+            raise Refused("invalid_smtp_server", 400)
+        if security not in ("starttls", "tls"):
+            raise Refused("smtp_invalid_security", 400)
+        raw["env"].update(SMTP_HOST=smtp_host, SMTP_PORT=smtp_port, SMTP_SECURITY=security,
+                          SMTP_USERNAME=settings.get("smtp_username", "").strip(), SMTP_SENDER=settings.get("smtp_sender", "").strip())
+        if raw["env"]["SMTP_SENDER"]:
+            from .connectors._smtp import address
+            from .connectors._base import ConnectorError
+            try:
+                address(raw["env"]["SMTP_SENDER"])
+            except ConnectorError:
+                raise Refused("smtp_invalid_address", 400) from None
     elif kind == "caldav":
         url = field("url", "https://caldav.icloud.com")
         parts = urlsplit(url)
@@ -277,7 +300,10 @@ def make_connection(body, cfg, values):
             raise Refused("https_url_required", 400)
         # Plain HTTP helpers must be exposed through an HTTPS reverse proxy. The
         # existing YAML-only escape hatch remains unavailable to web input.
-    raw["tools"] = ([t.model_dump(mode="json") for t in previous.tools] if previous else
-                    [{"upstream": upstream, "name": name.replace("-", "_") + "_" + suffix}
-                     for upstream, suffix in CATALOG[kind]["tools"]])
+    # Keep reviewed restrictions and names, and present newly bundled tools for
+    # explicit review. No policy rule is added, so additions start denied.
+    raw["tools"] = [t.model_dump(mode="json") for t in previous.tools] if previous else []
+    existing = {t["upstream"] for t in raw["tools"]}
+    raw["tools"] += [{"upstream": upstream, "name": name.replace("-", "_") + "_" + suffix}
+                     for upstream, suffix in CATALOG[kind]["tools"] if upstream not in existing]
     return ConnectionCfg.model_validate(raw), fresh

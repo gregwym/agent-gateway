@@ -62,7 +62,9 @@ def probe_error(kind, result):
     # text may echo credentials, so an unrecognized response is never displayed.
     allowed = {"imap_credentials_rejected", "imap_server_unreachable", "caldav_credentials_rejected",
                "gmail_authorization_rejected", "connector_timeout", "connector_tls_failed", "connector_dns_failed",
-               "connector_network_failed", "connector_internal_error"}
+               "connector_network_failed", "connector_internal_error", "smtp_credentials_rejected", "smtp_not_configured",
+               "smtp_invalid_security", "smtp_invalid_address", "smtp_tls_failed", "smtp_dns_failed", "smtp_not_supported",
+               "smtp_request_rejected", "smtp_unreachable"}
     code = result.meta.get("agw_error") if isinstance(result.meta, dict) else None
     if isinstance(code, str) and code in allowed:
         return code

@@ -46,11 +46,13 @@ async def test_connection_presets_are_atomic_isolated_and_do_not_invent_writes(t
                                settings={'username': 'fake@example.test', 'host': '127.0.0.1', 'port': '1'}, credentials={'password': 'fake-password-for-classification'})
         assert preview.status_code == 200
         assert (await change(http, 'connections/apply', draft=preview.json()['draft'], reviewed=True)).status_code == 200
-        assert (await change(http, 'permissions/connection', client='shared-agent', connection='mail', access='read_write')).json()['error'] == 'connection_readonly'
-        assert (await change(http, 'permissions/connection', client='shared-agent', connection='mail', access='read_write_direct')).json()['error'] == 'connection_readonly'
+        assert (await change(http, 'permissions/connection', client='shared-agent', connection='mail', access='read_write')).status_code == 200
+        assert (await change(http, 'permissions/connection', client='shared-agent', connection='mail', access='read_write_direct')).status_code == 200
         assert (await change(http, 'permissions/connection', client='shared-agent', connection='mail', access='read')).status_code == 200
         mail = next(c for c in (await state(http))['connections'] if c['id'] == 'mail')
-        assert mail['access']['shared-agent'] == 'read' and all(t['access'] == 'read' for t in mail['tools'])
+        assert mail['access']['shared-agent'] == 'read'
+        assert {t['upstream'] for t in mail['tools'] if t['access'] == 'write'} == {'set_message_state', 'move_messages', 'archive_messages', 'trash_messages', 'send_message'}
+        assert all(t['permissions']['shared-agent'] == ('allow' if t['access'] == 'read' else 'deny') for t in mail['tools'])
 
 
 async def test_direct_write_mode_needs_no_approval_and_is_scoped_to_one_agent(tmp_path):

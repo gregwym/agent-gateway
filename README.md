@@ -21,13 +21,13 @@ passkey administrator login, family onboarding, agent tokens, connector setup,
 and permission checks. Web-managed configuration and credentials are encrypted;
 the host's YAML, key and original secret store stay read-only.
 
-**Status.** The gateway core, passkey approval and read-only connectors for iCloud
-Mail, iCloud Calendar and Gmail are implemented and tested against local stand-ins
-(a real IMAP server, a real CalDAV server, a fake Google, and software passkeys).
+**Status.** The gateway core, passkey approval, unified IMAP/SMTP mail connection,
+and read-only iCloud Calendar and Gmail connectors are implemented and tested against local stand-ins
+(a real IMAP server, a TLS/STARTTLS SMTP simulator, a real CalDAV server, a fake Google, and software passkeys).
 The approval page also runs in real Chromium with a virtual WebAuthn authenticator;
 Reminders is exercised through two gateway helpers with an EventKit substitute.
-**Nothing here has been run against a real iCloud or Google account or a real
-authenticator yet.** The Reminders connector is experimental. See
+Automated acceptance uses simulated accounts; provider-specific mail behavior still
+needs verification with your own account. The Reminders connector is experimental. See
 [what it does not do](#what-it-does-not-do), and the checklist of what to verify
 yourself in [docs/deployment.md](docs/deployment.md) (中文).
 
@@ -66,9 +66,11 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
   a configured approver approves that exact call (same client, account, tool and
   arguments) with a passkey, runs once, and needs a new approval the next time.
   Without an `approvals:` section such a tool is visible and **never runs**.
-- **Read-only connectors included.** iCloud Mail (IMAP), iCloud Calendar (CalDAV) and
-  Gmail, one process per account, searching and reading on demand: no mailbox is
-  synchronised or indexed. See [bundled connectors](#bundled-connectors).
+- **Mail in one connection.** IMAP searches, pages, reads in batches, changes read/star
+  flags and moves/archives/trashes messages; SMTP sends using the same account credential.
+  Reads never mark mail seen. Each write tool follows that Agent's approval setting.
+  Calendar and Gmail connectors remain read-only. No mailbox bodies are synchronized or indexed.
+  See [bundled connectors](#bundled-connectors).
 - **Browser onboarding and administration.** A private, one-time setup link creates
   the administrator passkey. Sign in to add members, invite their passkeys, issue,
   rename Agents, rotate or revoke tokens, review connector definitions, test read access,
@@ -184,7 +186,7 @@ approver setting applies to every Agent using that connection. Existing custom
 tool rules remain intact until you save a preset; individual tools and argument
 limits are under **Advanced**. Only known catalog reads or host-reviewed `tools[].access: read` tools enter the read
 preset; unknown tools are treated as writes, regardless of upstream MCP hints.
-Connectors without write tools, including the bundled mail and calendar readers,
+Connectors without write tools, including the Gmail and calendar readers,
 offer read-only access. Changing a setting does not add unsupported connector operations.
 A zero-tool Agent explicitly explains why MCP returns
 an empty list. Being in the same household does not identify the current human
@@ -355,13 +357,42 @@ Each is a small stdio MCP server, started by the gateway as
 
 | Module | Service | Tools | Credential | Read-only is enforced by |
 |---|---|---|---|---|
-| `imap_mail` | iCloud Mail (any IMAP over TLS) | `list_mailboxes`, `search_messages`, `get_message`, `get_attachment` | app-specific password | the connector only (`EXAMINE`, `BODY.PEEK`); the password itself can write |
+| `imap_mail` | iCloud Mail / IMAP + SMTP, one connection | `list_mailboxes`, `search_messages`, `get_message`, `get_attachment`, `list_messages`, `get_messages`, `set_message_state`, `move_messages`, `archive_messages`, `trash_messages`, `send_message` | one app-specific password for both protocols | read tools use `EXAMINE` and `BODY.PEEK`; explicit write tools require the Agent's configured write permission |
 | `caldav_calendar` | iCloud Calendar (any CalDAV) | `list_calendars`, `list_events`, `get_event`, `check_conflicts` | app-specific password | the connector only (`PROPFIND`, `REPORT`); the password itself can write |
 | `gmail` | Gmail REST API | `search_messages`, `get_message`, `get_attachment` | OAuth refresh token | Google (scope `gmail.readonly`); the connector refuses to use a token with any other scope |
 | `reminders_eventkit` | Apple Reminders, macOS only, **experimental** | `list_lists`, `list_reminders`, `get_reminder` | none (a macOS permission) | the connector only; macOS grants full access |
 
-Messages are searched on the server and fetched one at a time; long bodies are
-returned in pages and attachments up to a size limit. A refused credential produces a
+IMAP `list_messages` snapshots matching UIDs and pages without offset shifts from new
+arrivals, deletions, or flag changes. Follow `next_cursor` until null; deleted UIDs have
+explicit error entries. Snapshots last up to one hour, are held in connector memory,
+and expire on restart; new arrivals need a new listing. Limits are 16 active snapshots
+and one million total UIDs; use disjoint date ranges if a mailbox exceeds that limit.
+Completed snapshots may be reclaimed when a new listing starts. UID snapshots do not
+freeze message flags or contents on the provider.
+
+`get_messages` reads up to 50 UIDs in two batch fetches, using `BODY.PEEK`; bodies have
+`truncated`/`next_offset`. Pass the mailbox's `uidvalidity` from `list_messages` to batch
+reads and writes. Each UID gets success, error, unknown, or not_attempted; byte/response
+limits report which UIDs need smaller batches. Writes have a time budget and do not
+retry automatically. Unknown results require inspecting the current state before retrying.
+Moves use UID MOVE or COPY + STORE + UID EXPUNGE, never unscoped EXPUNGE; a failed fallback
+may leave a copy in the destination and reports its completed steps. Archive/Trash use
+server special-use folders or an explicit destination; folders are not guessed or created.
+
+SMTP supports text and optional HTML with To/Cc/Bcc, without attachments. It uses a
+configured sender, TLS/STARTTLS and the same saved mail password. It reports SMTP
+acceptance/refusal per recipient; acceptance is not confirmed delivery. Disconnects
+during submission return unknown and are never automatically retried. It does not append
+an extra copy to Sent; that depends on the provider. The administrator's connection
+test checks IMAP plus configured SMTP authentication without sending email.
+
+For an existing mail connection, **Edit & review → Preview tools → Apply connector**
+adds the new tools while preserving existing names, restrictions, credentials and grants.
+New tools start denied. Then save that Agent's desired connection access and separate
+read/write approval settings in **Permissions**. New mail connections also start denied.
+The original four IMAP definitions remain compatible with existing tool locks.
+
+Long bodies are returned in pages and attachments up to a size limit. A refused credential produces a
 fixed message telling the agent that a person has to act, and the connector stops
 presenting that credential for a while. `gmail_auth` is the one-time consent helper
 that produces the Gmail token. Setup for each service, and what the Reminders

@@ -65,6 +65,10 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         await page.get_by_role('button', name=t('Add connector', '添加连接器'), exact=True).click()
         box = page.get_by_role('dialog')
         await page.get_by_label(t('Service', '服务'), exact=True).select_option('imap')
+        assert await box.locator('input[type=password]').count() == 1
+        await playwright.expect(box.locator('input[name=smtp_host]')).to_have_value('smtp.mail.me.com')
+        await playwright.expect(box.locator('input[name=smtp_port]')).to_have_value('587')
+        await playwright.expect(box.locator('select[name=smtp_security]')).to_have_value('starttls')
         name = page.get_by_label(t('Connector name', '连接器名称'), exact=True)
         await name.fill('iCloud Mail')
         preview = page.get_by_role('button', name=t('Preview tools', '预览工具'), exact=True)
@@ -101,5 +105,7 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
             release.set()
         await playwright.expect(page.get_by_role('heading', name=t('Review tool definitions', '审阅工具定义'), exact=True)).to_be_visible()
         await playwright.expect(page.get_by_role('heading', name='list_mailboxes', exact=True)).to_be_visible()
+        await playwright.expect(page.get_by_role('heading', name='send_message', exact=True)).to_have_count(1)
+        await playwright.expect(page.get_by_role('heading', name='list_messages', exact=True)).to_have_count(1)
         if directory := os.environ.get('AGW_TEST_ARTIFACTS'):
             await page.screenshot(path=str(Path(directory) / f'imap-preview-review-{locale}.png'))
