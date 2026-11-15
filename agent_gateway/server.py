@@ -41,7 +41,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -456,17 +456,8 @@ def build_app(gateway: Gateway) -> Starlette:
         async def verify_token(self, token):
             return await StaticTokenVerifier(list(runtime.gateway.cfg.clients)).verify_token(token)
 
-    transport = StreamableHTTPASGIApp(manager)
-
-    async def mcp_request(scope, receive, send):
-        if scope["method"] == "GET":
-            # The gateway has no standalone notifications or session to resume.
-            await Response(status_code=405, headers={"Allow": "POST, DELETE"})(scope, receive, send)
-            return
-        await transport(scope, receive, send)
-
     authenticated = AuthenticationMiddleware(
-        RequireAuthMiddleware(mcp_request, required_scopes=[]),
+        RequireAuthMiddleware(StreamableHTTPASGIApp(manager), required_scopes=[]),
         backend=BearerAuthBackend(Verifier()),
     )
 

@@ -58,8 +58,6 @@ async def test_connector_saves_with_mcp_listener_and_stalled_post(tmp_path):
     async with web_gateway(tmp_path) as (gw, http, origin, path):
         await setup(http, origin, path)
         headers = {'Authorization': 'Bearer ' + TOKEN_A, 'Accept': 'text/event-stream'}
-        listener = await http.get('/mcp', headers=headers, timeout=3)
-        assert listener.status_code == 405
 
         started, release = anyio.Event(), anyio.Event()
         responses = []
@@ -75,15 +73,19 @@ async def test_connector_saves_with_mcp_listener_and_stalled_post(tmp_path):
                     **headers, 'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json'}))
 
         with anyio.fail_after(10):
-            async with anyio.create_task_group() as tasks:
-                tasks.start_soon(stalled_request)
-                await started.wait()
-                saved = await change(http, 'connections/save', kind='imap', id='mail', owner='person_a',
-                                     settings={'username':'demo@example.test'}, credentials={'password':'fake-password'})
-                assert saved.status_code == 200 and saved.json()['saved'], saved.text
-                rotated = await change(http, 'clients/rotate', id='agent-a')
-                assert rotated.status_code == 200, rotated.text
-                release.set()
+            async with httpx2.AsyncClient(base_url=origin, trust_env=False) as listener:
+                async with listener.stream('GET', '/mcp', headers=headers) as stream:
+                    assert stream.status_code == 200
+                    assert stream.headers['content-type'].startswith('text/event-stream')
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(stalled_request)
+                        await started.wait()
+                        saved = await change(http, 'connections/save', kind='imap', id='mail', owner='person_a',
+                                             settings={'username':'demo@example.test'}, credentials={'password':'fake-password'})
+                        assert saved.status_code == 200 and saved.json()['saved'], saved.text
+                        rotated = await change(http, 'clients/rotate', id='agent-a')
+                        assert rotated.status_code == 200, rotated.text
+                        release.set()
         assert responses[0].json()['error']['message'] == 'Not authenticated'
         assert (await rpc(origin, TOKEN_A)).status_code == 401
         assert (await rpc(origin, rotated.json()['token'])).status_code == 200
