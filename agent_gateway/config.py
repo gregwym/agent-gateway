@@ -136,6 +136,8 @@ class ToolCfg(_Model):
     upstream: str = Field(min_length=1, max_length=128)
     name: str = Field(pattern=TOOL_NAME)
     description: str | None = None
+    # A host-reviewed classification. Unknown/custom tools are treated as writes.
+    access: Literal["read", "write"] | None = None
     # Arguments the gateway always sets. They disappear from the schema the agent sees.
     pin: dict[str, Any] = {}
     # Arguments the agent must supply, restricted to these values.
@@ -159,6 +161,8 @@ class ConnectionCfg(_Model):
     service: str = Field(pattern=NAME)
     account: str = Field(pattern=NAME)
     owner: str
+    # Approval authority is separate from ownership: a member or their household.
+    approver: str | None = None
     transport: Literal["stdio", "http"]
 
     # stdio
@@ -294,6 +298,11 @@ class Config(_Model):
         for conn in self.connections:
             if conn.owner not in known:
                 raise ValueError(f"connection {conn.id}: unknown owner {conn.owner!r}")
+            if conn.approver is not None:
+                if conn.approver not in known:
+                    raise ValueError(f"connection {conn.id}: unknown approver")
+                if homes and self.household_of(conn.approver) != self.household_of(conn.owner):
+                    raise ValueError(f"connection {conn.id}: approver must belong to the account's household")
             if conn.secret_names() and self.secrets is None:
                 raise ValueError(f"connection {conn.id} references secrets but no `secrets:` store is configured")
 
@@ -330,12 +339,13 @@ class Config(_Model):
         return next(c for c in self.connections if c.id == conn_id)
 
     def approvers_of(self, conn: ConnectionCfg) -> tuple[str, ...]:
-        """Whose decision counts for a call on this account: its owner, or every person if it is shared."""
-        if conn.owner in self.shared:
+        """Resolve the selected member/household, defaulting to the account owner."""
+        approver = conn.approver or conn.owner
+        if approver in self.shared:
             if self.households:
-                return tuple(m.id for m in self.members if m.household == conn.owner)
+                return tuple(m.id for m in self.members if m.household == approver)
             return tuple(p for p in self.principals if p not in self.shared)
-        return (conn.owner,)
+        return (approver,)
 
     def household_of(self, owner: str) -> str | None:
         if any(h.id == owner for h in self.households):

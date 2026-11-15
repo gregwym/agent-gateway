@@ -76,7 +76,9 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
 
                 await page.get_by_role('button', name=t('Permissions','权限'), exact=True).click()
                 await page.get_by_label(t('Agent','Agent'), exact=True).select_option('shared-agent')
-                row = page.get_by_role('row').filter(has_text='browser_notes_list')
+                card = page.locator('.permission-card[data-connection=browser-notes]')
+                await card.locator('summary').click()
+                row = card.get_by_role('row').filter(has_text='browser_notes_list')
                 await row.get_by_label(t('Effect','权限效果'), exact=True).select_option('allow')
                 await row.get_by_role('button', name=t('Save access','保存权限'), exact=True).click()
                 await playwright.expect(row.get_by_label(t('Effect','权限效果'), exact=True)).to_have_value('allow')

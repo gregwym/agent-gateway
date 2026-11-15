@@ -37,9 +37,9 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
   and Agents belong to a household. A connector is owned by a member or by the
   household. Only individual Agents receive tool permissions; household membership
   and account ownership grant no tool access. New Agents and connectors start denied.
-  A shared Agent has one permission set for every person using it. Personal-account
-  approval requires its owner's passkey; a household account can be approved by a
-  member of that household. The legacy YAML identity rules below remain supported
+  A shared Agent has one permission set for every person using it. Each connection
+  has an independent approver setting: a household member or any member of its
+  household, defaulting to its owner. The legacy YAML identity rules below remain supported
   for deployments without web administration.
 - **Identity from the token, nothing else.** Each client has its own bearer token,
   bound to exactly one principal (`person_a`, `person_b`, `household`). Tool
@@ -63,7 +63,7 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
 - **Audit without content.** One JSON line per call and per failed login: who, which
   tool, which account, outcome, sizes, argument *names*. No argument values, no results.
 - **Approval by passkey.** A rule can say `approval_required`. Such a call waits until
-  the account's owner approves that exact call (same client, account, tool and
+  a configured approver approves that exact call (same client, account, tool and
   arguments) with a passkey, runs once, and needs a new approval the next time.
   Without an `approvals:` section such a tool is visible and **never runs**.
 - **Read-only connectors included.** iCloud Mail (IMAP), iCloud Calendar (CalDAV) and
@@ -71,8 +71,8 @@ yourself in [docs/deployment.md](docs/deployment.md) (中文).
   synchronised or indexed. See [bundled connectors](#bundled-connectors).
 - **Browser onboarding and administration.** A private, one-time setup link creates
   the administrator passkey. Sign in to add members, invite their passkeys, issue,
-  rotate or revoke agent tokens, review connector definitions, test read access,
-  and edit per-tool permissions and argument limits. Agent bearer tokens cannot
+  rename Agents, rotate or revoke tokens, review connector definitions, test read access,
+  and configure connection access. Agent bearer tokens cannot
   access the console. Gmail offers browser OAuth with read-only consent.
 
 ## What it does not do
@@ -174,11 +174,26 @@ ownership keys stay stable and are not shown as a second name. Passkeys, session
 permissions, and pending approvals survive a rename. Names support Unicode and
 spaces; duplicate member names are rejected.
 
-In **Agents → Configure permissions**, select the specific Agent and grant each
-tool **Allow**, **Require approval**, or **Deny**. The page identifies the account
-owner and who must approve. A zero-tool Agent explicitly explains why MCP returns
+In **Agents → Configure permissions**, select an Agent and choose **No access**,
+**Read only**, or **Read and write** for each connection. Configure **Read approval**
+and, when writes are enabled, **Write approval** independently: either no approval
+or a separate one-use passkey decision for every operation. Read-only access can
+therefore require approval too. When either operation requires approval, select a
+member or **Any household member** as approver; ownership stays unchanged. The
+approver setting applies to every Agent using that connection. Existing custom
+tool rules remain intact until you save a preset; individual tools and argument
+limits are under **Advanced**. Only known catalog reads or host-reviewed `tools[].access: read` tools enter the read
+preset; unknown tools are treated as writes, regardless of upstream MCP hints.
+Connectors without write tools, including the bundled mail and calendar readers,
+offer read-only access. Changing a setting does not add unsupported connector operations.
+A zero-tool Agent explicitly explains why MCP returns
 an empty list. Being in the same household does not identify the current human
 speaker or make one Agent inherit another Agent's permissions.
+
+Use **Agents → Rename** to correct an Agent name. The token, endpoint, household,
+and effective tool grants remain unchanged. Agent references in policy are renamed
+atomically. Outstanding approvals must be requested again, and historical audit
+records retain the name used at the time. Reusing the old name grants no access.
 
 Access and connector changes wait up to 30 seconds for active calls to finish, then atomically save and
 apply; busy calls leave the configuration unchanged. These changes invalidate

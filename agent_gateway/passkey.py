@@ -177,6 +177,11 @@ class PasskeyApprover:
             row = db.execute(
                 "SELECT * FROM requests WHERE binding=? ORDER BY created DESC, rowid DESC LIMIT 1", (request.binding,)
             ).fetchone()
+            # Host-file edits do not have a web revision. Re-check the current
+            # approval authority before reusing either a pending request or grant.
+            if row is not None and set(json.loads(row["approvers"])) != set(request.approvers):
+                db.execute("UPDATE requests SET status='cancelled', arguments=NULL WHERE id=? AND status IN ('pending','approved')", (row["id"],))
+                row = None
             if row is not None and row["status"] == "approved":
                 # Spent here, in the transaction that found it: a second call cannot find it again.
                 db.execute("UPDATE requests SET status='used', used=?, arguments=NULL WHERE id=?", (now, row["id"]))

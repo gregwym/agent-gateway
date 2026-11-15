@@ -65,7 +65,8 @@ Agent ──HTTP(Streamable)──► /mcp
 
 网页管理使用家庭模型：`households` 是家庭，`members` 是有姓名和家庭归属的个人，`clients` 是有家庭归属的 Agent。
 连接的 owner 是成员或家庭。`policy.clients × connection × tools` 决定 Agent 的权限；家庭不是被授权主体，成员关系没有权限继承。
-个人连接由 owner 审批，家庭共享连接由该家庭的成员审批。一个 Agent 的授权适用于其全部调用，Token 不证明当前聊天人的身份。
+连接的 `approver` 可选同家庭的一位成员或家庭；不填时默认 owner。家庭表示其中任意成员可批准，不需要全员批准。
+owner 表示账号归属，approver 表示审批权，两者独立。一个 Agent 的授权适用于其全部调用，Token 不证明当前聊天人的身份。
 成员的 `name` 是唯一对外姓名，内部 `id` 仅用来维持凭据和关联关系。
 
 以下是保留兼容的旧版 YAML 模型；启用网页后会按每个现有 Agent 的实际权限转换，不向新 Agent 继承这些规则：
@@ -432,6 +433,13 @@ HTTPS 管理会话使用 `__Host-`、Secure、HttpOnly、SameSite=Strict Cookie�
 旧网页配置迁移时，将 principal 规则的最终效果逐个展开为现有 client 的规则（默认拒绝无需保存），保留 Token hash、
 审计 subject、连接 owner 和审批版本。尚无 Agent 的旧身份授权不会赋予未来创建的 Agent。
 新增连接和新增 Agent 都没有默认授权，撤销 Agent 时同时移除其全部规则，复用名称不会复活旧权限。
+连接权限按当前已审阅工具展开为规则，仅替换选定 Agent 在该连接上的授权。访问范围与审批独立：禁止访问全部 deny；
+只读拒绝 write，read 可选 allow 或 approval_required；读写则分别为 read 和 write 选择 allow 或 approval_required，支持全部组合。
+内置目录的已知读取工具或主机显式标记 `tools[].access: read` 的工具可进入只读集合；
+其他工具按写入处理，不信任上游的 `readOnlyHint` 自动授予读取权。未知工具不会因名字看起来像 get/list 就被放行。
+逐工具规则仍可审阅和调整。升级保留原有自定义授权，网页显示为自定义，不静默改写现有权限。
+连接的 approver 限于账号所属家庭，改变审批人会撤销未使用的网页审批；即使直接修改主机 YAML，消费批准时也核对当前审批人集合。
+编辑连接器凭据保留已有 approver。Agent 改名同步更新全部 policy.clients 引用，Token 哈希不变；改名属于配置变更，旧审批不再可用。
 管理会话意味着能修改权限、登记成员公钥及录入凭据，应只在可信的人用的浏览器中登录。它不属于 Agent 的接入配置。
 
 替身服务和真实服务的差别是这些测试证明不了的部分：Apple 和 Google 的服务器对边界情况的处理（非 ASCII 搜索、

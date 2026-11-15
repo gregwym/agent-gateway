@@ -13,7 +13,7 @@ from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from .admin_auth import AdminAuth, COOKIE
-from .admin_config import CATALOG, ManagedStore, kind_of, make_connection, member_name, settings_of
+from .admin_config import CATALOG, CONNECTION_ACCESS, ManagedStore, connection_access, kind_of, make_connection, member_name, settings_of, tool_access
 from .auth import hash_token, new_token
 from .config import NAME
 from .lock import Lock, definition_of, digest_of
@@ -95,11 +95,13 @@ class AdminController:
             tools = []
             for tool in conn.tools:
                 route = gw.routes[tool.name]
-                tools.append({"name": tool.name, "upstream": tool.upstream, "pin": tool.pin,
+                tools.append({"name": tool.name, "upstream": tool.upstream, "access": tool_access(conn, tool), "pin": tool.pin,
                               "allow_values": tool.allow_values, "problem": gw.problem(route),
                               "permissions": {c.id: gw.policy.effect(c.subject, tool.name, c.id) for c in gw.cfg.clients}})
             connections.append({"id": conn.id, "kind": kind_of(conn), "owner": conn.owner,
                                 "household": gw.cfg.household_of(conn.owner), "approvers": list(gw.cfg.approvers_of(conn)),
+                                "approver": conn.approver or conn.owner,
+                                "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
                                 "settings": settings_of(conn), "tools": tools,
                                 "connected": gw.upstreams[conn.id]._client is not None,
                                 "test": self.tests.get(conn.id)})
@@ -198,6 +200,8 @@ class AdminController:
             name = body.get("id")
             if name == self.auth.owner or not any(m["id"] == name for m in raw["members"]):
                 raise Refused("cannot_remove_member", 400)
+            if any(c.get("approver") == name for c in raw["connections"]):
+                raise Refused("member_is_approver", 409)
             if any(c.get("principal") == name for c in raw["clients"]) or any(c["owner"] == name for c in raw["connections"]):
                 raise Refused("member_in_use", 409)
             raw["principals"].remove(name)
@@ -208,7 +212,7 @@ class AdminController:
             # Delete credentials before publishing the removal, so even a failed
             # persistence attempt cannot leave credentials for a later re-added id.
             return await self._commit(state, operation)
-        if operation in ("clients/create", "clients/rotate", "clients/revoke"):
+        if operation in ("clients/create", "clients/rename", "clients/rotate", "clients/revoke"):
             name = body.get("id")
             client = next((c for c in raw["clients"] if c["id"] == name), None)
             token = None
@@ -226,6 +230,17 @@ class AdminController:
                 raw["clients"].append({"id": name, "household": home, "token_sha256": hash_token(token)})
             elif not client:
                 raise Refused("not_found", 404)
+            elif operation == "clients/rename":
+                renamed = body.get("name")
+                if not isinstance(renamed, str) or not re.fullmatch(NAME, renamed):
+                    raise Refused("invalid_client_name", 400)
+                if renamed == name:
+                    return {"revision": self.store.state["revision"], "id": name}
+                if any(c["id"] == renamed for c in raw["clients"]):
+                    raise Refused("duplicate_client", 400)
+                client["id"] = renamed
+                for rule in raw["policy"]:
+                    rule["clients"] = [renamed if c == name else c for c in rule["clients"]]
             elif operation == "clients/rotate":
                 token = new_token()
                 client["token_sha256"] = hash_token(token)
@@ -234,6 +249,8 @@ class AdminController:
                 raw["policy"] = [{**r, "clients": [c for c in r["clients"] if c != name]}
                                  for r in raw["policy"] if any(c != name for c in r["clients"])]
             result = await self._commit(state, operation)
+            if operation == "clients/rename":
+                result["id"] = client["id"]
             if token:
                 result.update(token=token, fingerprint=hash_token(token)[:12], mcp_url=self.runtime.gateway.cfg.approvals.origin + "/mcp")
             return result
@@ -290,6 +307,39 @@ class AdminController:
             referenced = {n for c in raw["connections"] for n in [*c.get("secret_env", {}).values(),
                           *c.get("secret_headers", {}).values(), c.get("bearer_secret")] if n}
             state["secrets"] = {k: v for k, v in state["secrets"].items() if k in referenced}
+            return await self._commit(state, operation)
+        if operation == "permissions/connection":
+            client_id, name, mode = body.get("client"), body.get("connection"), body.get("access")
+            cfg, _, _ = self.store.effective(state)
+            client = next((c for c in cfg.clients if c.id == client_id), None)
+            conn = next((c for c in cfg.connections if c.id == name), None)
+            if not client:
+                raise Refused("unknown_agent", 400)
+            if not conn:
+                raise Refused("not_found", 404)
+            if not isinstance(mode, str) or mode not in (*CONNECTION_ACCESS, "custom"):
+                raise Refused("invalid_connection_access", 400)
+            if client.household != cfg.household_of(conn.owner):
+                raise Refused("outside_household", 400)
+            if mode != "custom" and CONNECTION_ACCESS[mode]["write"] != "deny" and not any(tool_access(conn, t) == "write" for t in conn.tools):
+                raise Refused("connection_readonly", 400)
+            if "approver" in body:
+                approver = body["approver"]
+                if not isinstance(approver, str) or approver not in cfg.principals or cfg.household_of(approver) != client.household:
+                    raise Refused("invalid_connection_approver", 400)
+                next(c for c in raw["connections"] if c["id"] == name)["approver"] = approver
+            if mode == "custom":
+                return await self._commit(state, operation)
+            # Replace only this Agent's rules on this connection, atomically.
+            for rule in list(raw["policy"]):
+                if rule["connection"] == name and client_id in rule["clients"]:
+                    raw["policy"].remove(rule)
+                    other = [c for c in rule["clients"] if c != client_id]
+                    if other:
+                        raw["policy"].append({**rule, "clients": other})
+            for tool in conn.tools:
+                effect = CONNECTION_ACCESS[mode][tool_access(conn, tool)]
+                raw["policy"].append({"clients": [client_id], "connection": name, "tools": [tool.name], "effect": effect})
             return await self._commit(state, operation)
         if operation == "permissions/save":
             client_id, name, tool = body.get("client"), body.get("connection"), body.get("tool")

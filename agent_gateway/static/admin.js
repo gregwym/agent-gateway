@@ -5,6 +5,7 @@ document.documentElement.lang = zh ? 'zh-CN' : 'en';
 const app = document.getElementById('app');
 const dialogs = document.getElementById('dialogs');
 let csrf = '', state = null, tab = 'overview', subject = '', noticeTimer;
+const advancedConnections = new Set();
 let setupCode = new URLSearchParams(location.hash.slice(1)).get('setup') || '';
 let gmailResult = new URLSearchParams(location.search).get('gmail');
 const navigationError = document.querySelector('meta[name="gateway-error"]');
@@ -59,8 +60,8 @@ const messages = {
   shared_identity_removed: ['A household is not a member. Add a person here; choose the household as owner for shared connections.', '家庭不是成员。请在这里添加个人，共享连接的所有者请选择家庭。'],
   member_limit: ['The gateway has reached its limit of 50 members. Remove an unused member first.', '网关已达到 50 个成员的上限，请先移除不再使用的成员。'],
   cannot_remove_member: ['The administrator identity cannot be removed; other members must still exist.', '不能移除管理员身份；其他待移除成员必须仍然存在。'],
-  invalid_client_name: ['Agent IDs must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', 'Agent ID 须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
-  duplicate_client: ['This Agent ID already exists. Choose another ID or rotate its token.', '此 Agent ID 已存在，请使用其他 ID，或轮换已有 Token。'],
+  invalid_client_name: ['Agent names must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', 'Agent 名称须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
+  duplicate_client: ['This Agent name already exists. Choose another name.', '此 Agent 名称已存在，请使用其他名称。'],
   client_limit: ['The gateway has reached its limit of 100 agents. Revoke an unused agent first.', '网关已达到 100 个 Agent 的上限，请先撤销不再使用的 Agent。'],
   connector_limit: ['The gateway has reached its limit of 50 connectors. Remove an unused connector first.', '网关已达到 50 个连接器的上限，请先移除不再使用的连接器。'],
   unsupported_connector: ['This custom connector has no built-in read check. Configure it on the gateway host.', '此自定义连接器没有内置的读取验证，请在网关主机上配置。'],
@@ -73,6 +74,9 @@ const messages = {
   missing_port: ['Enter the TLS port.', '请填写 TLS 端口。'],
   missing_timezone: ['Enter the calendar time zone.', '请填写日历时区。'],
   invalid_permission_effect: ['Choose Deny, Allow, or Require approval.', '请选择拒绝、允许或需要审批。'],
+  invalid_connection_access: ['Choose a valid access scope and read/write approval settings.', '请选择有效的访问范围及读取、写入审批设置。'],
+  connection_readonly: ['This connector has no write tools. Choose Read only.', '此连接器没有写入工具，请选择只读。'],
+  invalid_connection_approver: ['Choose a member of this household, or any member of the household.', '请选择此家庭的一位成员，或家庭内任意成员。'],
   cross_account_required: ['This grants access to another person’s account. Select the explicit cross-account consent checkbox.', '此操作会开放其他个人账号，请勾选明确的跨账号授权选项。'],
   restrictions_object_required: ['Fixed arguments and allowed values must each be a JSON object.', '固定参数和允许值必须分别为 JSON 对象。'],
   restriction_conflict: ['The same argument cannot be both fixed and restricted to allowed values.', '同一个参数不能同时设为固定参数和允许值限制。'],
@@ -113,6 +117,7 @@ const messages = {
   missing_url: ['Enter the service HTTPS URL.', '请填写服务 HTTPS 地址。'],
   missing_token: ['Enter the helper bearer token.', '请填写辅助服务 Bearer Token。'],
   member_in_use: ['Remove this member’s clients, connectors, and permissions first.', '请先移除此成员的 Agent、连接器和权限。'],
+  member_is_approver: ['This member is a connection approver. Select another approver for those connections before removing the member.', '此成员仍是连接的审批人，请先为这些连接选择其他审批人，再移除成员。'],
   last_admin_passkey: ['Keep at least one administrator passkey.', '必须保留至少一个管理员通行密钥。'],
   tool_definitions_changed: ['Tool definitions changed. Edit and review this connector again.', '工具定义已变化，请编辑并重新审阅此连接器。'],
   draft_expired: ['This review expired. Preview the connector again.', '此次审阅已过期，请重新预览连接器。'],
@@ -366,6 +371,19 @@ function members() {
     button(row, tr('Revoke passkey', '撤销通行密钥'), () => confirmAction(tr('Revoke this passkey?', '撤销此通行密钥？'), tr('Sessions using it will also stop working.', '使用此通行密钥建立的管理会话也会失效。'), async () => { await api('passkeys/remove', {id: key.id}); await refresh(); }), 'danger');
   }
 }
+function renameAgent(client) {
+  const box = modal(tr('Rename Agent', '修改 Agent 名称'));
+  const name = field(box, tr('Agent name', 'Agent 名称'), 'agent_name', client.id, 'text', tr('Start with a lowercase letter; use lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，可使用小写字母、数字、下划线或连字符。'));
+  name.maxLength = 48; name.required = true;
+  el(box, 'p', tr('Your token, MCP address, household, and tool permissions stay the same. Outstanding approvals must be requested again.', 'Token、MCP 地址、所属家庭和工具权限不变。尚未完成的审批需要重新发起。'), 'hint');
+  button(box, tr('Save name', '保存名称'), async () => {
+    name.value = name.value.trim();
+    if (!name.reportValidity()) return;
+    const result = await mutate('clients/rename', {id: client.id, name: name.value});
+    if (subject === client.id) subject = result.id;
+    box.close(); notify(tr('Agent renamed. Keep using the same token.', 'Agent 已改名，继续使用原来的 Token 即可。'));
+  }, 'primary');
+}
 function agents() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Agent access', 'Agent 接入'));
   button(head, tr('Create agent token', '创建 Agent Token'), () => {
@@ -379,7 +397,9 @@ function agents() {
   for (const name of [tr('Agent', 'Agent'), tr('Household / access', '家庭 / 权限'), tr('Credentials', '凭据')]) el(heading, 'th', name);
   const body = el(table, 'tbody');
   for (const client of state.clients) {
-    const row = el(body, 'tr'); el(row, 'td', client.id); const access = el(row, 'td'); el(access, 'div', nameOf(client.household));
+    const row = el(body, 'tr'); const agent = el(row, 'td'); el(agent, 'div', client.id);
+    button(agent, tr('Rename', '改名'), () => renameAgent(client));
+    const access = el(row, 'td'); el(access, 'div', nameOf(client.household));
     el(access, 'p', client.tool_count ? tr(`${client.tool_count} tool(s) granted`, `已授权 ${client.tool_count} 个工具`) : tr('No tools granted. MCP will return an empty tool list.', '尚未授权工具，MCP 将返回空工具列表。'), 'muted');
     button(access, tr('Configure permissions', '配置权限'), () => { subject = client.id; tab = 'permissions'; render(); });
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');
@@ -512,14 +532,71 @@ function permissions() {
   el(app, 'p', tr('Household: ', '所属家庭：') + nameOf(agent.household), 'muted');
   el(app, 'p', tr('These permissions apply to every person using this Agent. An Agent token does not identify the person chatting with it.', '这些权限适用于所有通过此 Agent 发起的调用。Agent Token 不识别当前和它聊天的人。'), 'hint');
   if (!state.connections.some(c => c.household === agent.household)) el(app, 'p', tr('This household has no connections yet. Add a connector first.', '此家庭尚无连接，请先添加连接器。'), 'muted');
-  const table = el(el(app, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
+  for (const conn of state.connections.filter(c => c.household === agent.household)) {
+    const card = el(app, 'section', undefined, 'card permission-card'); card.dataset.connection = conn.id;
+    el(card, 'h2', conn.id);
+    el(card, 'p', tr('Account owner: ', '账号归属：') + nameOf(conn.owner), 'muted');
+    const reads = conn.tools.filter(t => t.access === 'read').length, writes = conn.tools.length - reads;
+    const current = conn.access[subject];
+    const scope = current.startsWith('read_write') || current === 'read_approval_write_direct' ? 'read_write' : current === 'read_approval' ? 'read' : current;
+    const options = [['none', tr('No access', '禁止访问')], ['read', tr('Read only', '只读')]];
+    if (writes) options.push(['read_write', tr('Read and write', '读写')]);
+    if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
+    const mode = select(card, tr('Connection access', '连接权限'), 'connection_access', options, scope);
+    if (!writes) el(card, 'p', tr('This connector only provides read operations.', '此连接器只提供读取操作，不支持写入。'), 'muted');
+    el(card, 'p', tr(`${reads} read tool(s) · ${writes} write or unclassified tool(s)`, `${reads} 个读取工具 · ${writes} 个写入或未分类工具`), 'muted');
+    const approvalFields = el(card, 'div', undefined, 'form-grid');
+    const readSettings = el(approvalFields, 'div'), writeSettings = el(approvalFields, 'div');
+    const choices = [['allow', tr('No approval', '无需审批')], ['approval_required', tr('Approve every operation', '每次操作都审批')]];
+    const readApproval = select(readSettings, tr('Read approval', '读取审批'), 'read_approval', choices,
+      ['read_approval', 'read_write_approval', 'read_approval_write_direct'].includes(current) ? 'approval_required' : 'allow');
+    const writeApproval = select(writeSettings, tr('Write approval', '写入审批'), 'write_approval', choices,
+      ['read_write_direct', 'read_approval_write_direct'].includes(current) ? 'allow' : 'approval_required');
+    const approval = el(card, 'div');
+    const members = state.members.filter(m => m.household === conn.household);
+    const approver = select(approval, tr('Who can approve?', '由谁审批？'), 'connection_approver',
+      [...members.map(m => [m.id, m.name]), [conn.household, tr('Any household member', '家庭内任意成员')]], conn.approver);
+    el(approval, 'p', tr('Operations requiring approval show their exact contents for a one-use passkey decision. This approver setting applies to this connection for all Agents.', '需要审批的操作会展示具体内容，并通过通行密钥单独批准一次。此审批人设置适用于该连接的所有 Agent。'), 'hint');
+    const enrollment = el(approval, 'p', '', 'muted');
+    function feedback() {
+      readSettings.hidden = !['read', 'read_write'].includes(mode.value);
+      writeSettings.hidden = mode.value !== 'read_write';
+      const required = (!readSettings.hidden && readApproval.value === 'approval_required') || (!writeSettings.hidden && writeApproval.value === 'approval_required');
+      approval.hidden = !required && !(mode.value === 'custom' && conn.tools.some(t => t.permissions[subject] === 'approval_required'));
+      const eligible = approver.value === conn.household ? members : members.filter(m => m.id === approver.value);
+      enrollment.textContent = eligible.some(m => m.passkeys) ? '' : tr('No selected approver has a passkey yet. Register one under Members before approving requests.', '所选审批人尚未注册通行密钥，请先在家庭成员中注册，再处理审批。');
+    }
+    for (const input of [mode, readApproval, writeApproval, approver]) input.addEventListener('change', feedback);
+    feedback();
+    button(card, tr('Save connection access', '保存连接权限'), async () => {
+      let access = mode.value;
+      if (access === 'read' && readApproval.value === 'approval_required') access = 'read_approval';
+      if (access === 'read_write') access = readApproval.value === 'approval_required'
+        ? (writeApproval.value === 'approval_required' ? 'read_write_approval' : 'read_approval_write_direct')
+        : (writeApproval.value === 'approval_required' ? 'read_write' : 'read_write_direct');
+      await mutate('permissions/connection', {client: subject, connection: conn.id, access,
+        ...(!approval.hidden ? {approver: approver.value} : {})});
+      notify(tr('Connection permissions updated.', '连接权限已更新。'));
+    }, 'primary');
+    const details = el(card, 'details'); details.open = advancedConnections.has(conn.id);
+    el(details, 'summary', tr('Advanced: individual tools and argument limits', '高级设置：逐工具权限与参数限制'));
+    details.addEventListener('toggle', () => { if (details.open) advancedConnections.add(conn.id); else advancedConnections.delete(conn.id); });
+    advancedPermissions(details, conn);
+  }
+}
+function advancedPermissions(parent, conn) {
+  el(parent, 'p', tr('Changing individual tools may produce a custom connection setting. Unclassified tools are treated as writes.', '逐工具修改后，连接权限可能显示为自定义。未分类工具按写入处理。'), 'muted');
+  const table = el(el(parent, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
   for (const label of [tr('Tool / owner', '工具 / 所有者'), tr('Access', '访问权限'), tr('Changes', '修改')]) el(heading, 'th', label);
   const body = el(table, 'tbody');
-  for (const conn of state.connections.filter(c => c.household === agent.household)) for (const tool of conn.tools) {
+  for (const tool of conn.tools) {
     const row = el(body, 'tr'); const info = el(row, 'td'); el(info, 'strong', tool.name); el(info, 'div', identityLabel(conn.owner) + ' · ' + conn.id, 'muted');
     if (tool.problem) el(info, 'span', tr('Disabled: ', '已停用：') + tool.problem, 'badge bad');
     if (Object.keys(tool.pin).length) el(info, 'pre', JSON.stringify(tool.pin));
-    const settings = el(row, 'td'); const effect = select(settings, tr('Effect', '权限效果'), 'effect', [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow', '允许')], ['approval_required', tr('Require approval', '需要审批')]], tool.permissions[subject]);
+    const settings = el(row, 'td');
+    const choices = [['deny', tr('Deny', '拒绝')], ['allow', tr('Allow without approval', '允许，无需审批')], ['approval_required', tr('Require approval', '需要审批')]];
+    const effect = select(settings, tr('Effect', '权限效果'), 'effect', choices, tool.permissions[subject]);
+    el(info, 'span', tool.access === 'read' ? tr('Read', '读取') : tr('Write / unclassified', '写入 / 未分类'), 'badge');
     el(settings, 'p', tr('If approval is required: ', '需要审批时由以下成员批准：') + conn.approvers.map(nameOf).join(tr(' or ', ' 或 ')), 'hint');
     if (!conn.approvers.some(id => state.members.find(m => m.id === id)?.passkeys)) el(settings, 'p', tr('No approver has a passkey yet. Register one before using approval-required tools.', '审批人尚未注册通行密钥，需要审批的工具暂时无法执行。'), 'hint');
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');

@@ -52,7 +52,7 @@ class ApprovalRequest:
     # Shown to the person deciding. Never logged.
     arguments: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
     owner: str = ""
-    # The principals whose decision counts: the account's owner, or every person for a shared account.
+    # The people allowed to decide, resolved from the connection's approval setting.
     approvers: tuple[str, ...] = ()
     configuration_revision: str = ""
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))

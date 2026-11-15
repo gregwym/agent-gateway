@@ -17,6 +17,15 @@ from .lock import Lock, digest_of
 from .passkey import Refused
 
 SECTIONS = ("principals", "shared", "households", "members", "clients", "connections", "policy")
+CONNECTION_ACCESS = {
+    "none": {"read": "deny", "write": "deny"},
+    "read": {"read": "allow", "write": "deny"},
+    "read_approval": {"read": "approval_required", "write": "deny"},
+    "read_write": {"read": "allow", "write": "approval_required"},
+    "read_write_direct": {"read": "allow", "write": "allow"},
+    "read_write_approval": {"read": "approval_required", "write": "approval_required"},
+    "read_approval_write_direct": {"read": "approval_required", "write": "allow"},
+}
 CATALOG = {
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
@@ -167,6 +176,27 @@ def settings_of(conn):
     return result
 
 
+def tool_access(conn, tool):
+    """Only the reviewed host classification or our fixed catalog can label a read.
+
+    Do not trust upstream MCP readOnlyHint annotations to grant unapproved access.
+    """
+    if tool.access:
+        return tool.access
+    kind = kind_of(conn)
+    if kind in CATALOG and tool.upstream in {name for name, _ in CATALOG[kind]["tools"]}:
+        return "write" if kind == "demo" and tool.upstream == "add_note" else "read"
+    return "write"
+
+
+def connection_access(policy, client, conn):
+    effects = [(tool_access(conn, t), policy.effect(client.subject, t.name, client.id)) for t in conn.tools]
+    for name, settings in CONNECTION_ACCESS.items():
+        if all(effect == settings[access] for access, effect in effects):
+            return name
+    return "custom"
+
+
 def make_connection(body, cfg, values):
     if set(body) - {"kind", "id", "owner", "settings", "credentials", "revision"}:
         raise Refused("invalid_connector", 400)
@@ -204,9 +234,10 @@ def make_connection(body, cfg, values):
 
     service = {"demo": "notes", "imap": "imap-mail", "caldav": "caldav-calendar"}.get(kind, kind)
     # Multiple accounts of one service can belong to a person; account identity is
-    # the connector id, while owner is the person who can approve access.
+    # the connector id. Ownership and approval authority are separate.
     raw = {"id": name, "service": previous.service if previous else service,
            "account": previous.account if previous else name, "owner": owner,
+           "approver": previous.approver if previous else None,
            "transport": "stdio", "timeout_seconds": 60,
            "command": [sys.executable, "-m", "agent_gateway.connectors." + {"imap": "imap_mail", "caldav": "caldav_calendar"}.get(kind, kind)],
            "env": {}, "secret_env": {}}

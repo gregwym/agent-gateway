@@ -120,3 +120,7 @@ def test_household_relationships_bound_grants_and_shared_approvers():
     invalid['clients'][0]['household'] = 'other'
     with pytest.raises(ValidationError):
         Config.model_validate(invalid)
+    invalid = copy.deepcopy(raw)
+    invalid['connections'][0]['approver'] = 'person_b'
+    with pytest.raises(ValidationError):
+        Config.model_validate(invalid)

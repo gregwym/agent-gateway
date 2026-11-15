@@ -84,7 +84,7 @@ def base_config() -> dict[str, Any]:
                     {"upstream": "debug_dump", "name": "a_debug_dump"},
                     {"upstream": "injection", "name": "a_injection"},
                     {"upstream": "crash", "name": "a_crash"},
-                    {"upstream": "slow", "name": "a_slow"},
+                    {"upstream": "slow", "name": "a_slow", "access": "read"},
                     # Resource-level restriction: the same upstream tool, locked to one folder.
                     {"upstream": "list_notes", "name": "a_family_notes", "pin": {"folder": "family"}},
                 ],
