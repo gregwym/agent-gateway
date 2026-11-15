@@ -202,6 +202,38 @@ def tools_for(client, limit=40000000):
     return {t.name: t.handler for t in build_tools(mail, limit, 5000000)}
 
 
+@pytest.mark.anyio
+async def test_gateway_limits_imap_folders_and_blocks_implicit_archive_destination(tmp_path):
+    with mail_account(tmp_path / "server", "limited@example.test", "fake-mail-password") as account:
+        fill(account, message("Inbox only", "a@example.test", account.user, "synthetic"))
+        with direct(account) as inspect:
+            inspect.create_folder("Private")
+        raw = base_config()
+        conn = extended_connection(account)
+        conn["mailbox_access"] = {"agent-a": ["INBOX"]}
+        raw["connections"] = [conn]
+        raw["policy"] = [{"principals": ["person_a"], "connection": conn["id"], "tools": [t["name"] for t in conn["tools"]], "effect": "allow"}]
+        async with running_gateway(await prepare(tmp_path / "gateway", raw, secrets={"mail_password": account.password})) as gw:
+            async with agent(gw.url, TOKEN_A) as client:
+                folders = await client.call_tool("mail_list_mailboxes", {})
+                assert not folders.is_error, text_of(folders)
+                assert [folder["name"] for folder in json.loads(text_of(folders))] == ["INBOX"]
+                listing = json.loads(text_of(await client.call_tool("mail_list_messages", {"mailbox": "inbox"})))
+                uid = listing["results"][0]["uid"]
+                for tool, arguments in (
+                    ("get_attachment", {"mailbox": "Private", "uid": uid, "index": 0}),
+                    ("move_messages", {"destination": "Private", "uids": [uid], "uidvalidity": listing["uidvalidity"]}),
+                    ("list_mailboxes", {"_gateway_mail_scope": ["Private"]}),
+                ):
+                    assert (await client.call_tool("mail_" + tool, arguments)).is_error
+        # An implicit special-use destination is also checked by the connector.
+        from agent_gateway.connectors._mail_scope import ARGUMENT
+        fake = FakeIMAP()
+        result = tools_for(fake)["archive_messages"]({"uidvalidity": 17, "uids": [1], ARGUMENT: frozenset({"INBOX"})})
+        assert result["results"][0]["error"]["code"] == "mail_scope_denied"
+        assert not fake.destinations
+
+
 def test_cursor_tampering_restart_expiry_and_uidvalidity_fail_closed(monkeypatch):
     fake = FakeIMAP()
     tools = tools_for(fake)

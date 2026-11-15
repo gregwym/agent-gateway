@@ -1,12 +1,19 @@
 'use strict';
-const zh = (navigator.language || '').toLowerCase().startsWith('zh');
+const localeKey = 'gateway.ui-language';
+function prefersChinese(language) {
+  return language === 'zh-CN' || (language !== 'en' && (navigator.language || '').toLowerCase().startsWith('zh'));
+}
+function browserLanguage() {
+  try { return localStorage.getItem(localeKey); } catch { return 'auto'; }
+}
+let zh = prefersChinese(browserLanguage());
 const tr = (en, cn) => zh ? cn : en;
 document.documentElement.lang = zh ? 'zh-CN' : 'en';
 const app = document.getElementById('app');
 const dialogs = document.getElementById('dialogs');
 const version = document.getElementById('gateway-version');
 const tabUrls = {overview: '/admin/', members: '/admin/members', agents: '/admin/agents',
-  connections: '/admin/connections', permissions: '/admin/permissions'};
+  connections: '/admin/connections', permissions: '/admin/permissions', settings: '/admin/settings'};
 let csrf = '', state = null, subject = '', dismissNotice;
 const filters = {connections: "", permissions: ""};
 let setupCode = new URLSearchParams(location.hash.slice(1)).get('setup') || '';
@@ -145,6 +152,13 @@ const messages = {
   oauth_profile_unavailable: ['Gmail API was unavailable during the account check. Try authorizing again later.', '验证账号时 Gmail API 不可用，请稍后重新授权。'],
   oauth_profile_forbidden: ['Gmail API denied the account check (403). Check that Gmail API is enabled in the OAuth client’s project and that Workspace allows the app.', 'Gmail API 拒绝了账号验证（403）。请确认 OAuth 客户端所在项目已启用 Gmail API，且 Workspace 允许此应用。'],
   oauth_profile_rejected: ['Gmail API rejected the account check. Confirm the Google account has an active Gmail mailbox, then try again.', 'Gmail API 拒绝了账号验证。请确认该 Google 账号有可用的 Gmail 邮箱后重试。'],
+  gmail_system_client_required: ['Set up the Google OAuth client in Settings before connecting a Gmail account.', '请先在「设置」中配置 Google OAuth 客户端，再连接 Gmail。'],
+  gmail_saved_client_unavailable: ['This connection does not have a saved Google OAuth client. Refresh the page or import the client JSON.', '此连接没有已保存的 Google OAuth 客户端，请刷新页面或导入客户端 JSON。'],
+  gmail_client_config_invalid: ['Import a Web application client JSON or enter both the client ID and secret.', '请导入「Web 应用」客户端 JSON，或填写客户端 ID 和密钥。'],
+  gmail_account_changed: ['Google authorized a different mailbox. Select the original Google account, or add a new connector.', 'Google 授权了另一个邮箱。请选择原来的 Google 账号，或添加新连接器。'],
+  invalid_language: ['Choose a supported interface language.', '请选择支持的界面语言。'],
+  invalid_mailbox_paths: ['Select at least one folder or label from this mailbox.', '请从此邮箱中至少选一个文件夹或标签。'],
+  mailbox_listing_unavailable: ['The server did not return a complete mailbox list. Retry loading it.', '邮箱服务器没有返回完整的目录，请重新读取。'],
   oauth_timeout: ['OAuth authorization timed out. Check network access and start authorization again.', 'OAuth 授权超时，请检查网络访问并重新授权。'],
   oauth_invalid_response: ['OAuth returned an invalid authorization or account response. Start authorization again.', 'OAuth 返回了无效的授权或账号响应，请重新授权。'],
   pin_unknown_argument: ['A fixed argument does not exist in this tool’s reviewed schema. Remove that argument.', '固定参数包含工具定义中不存在的参数，请移除此参数。'],
@@ -392,6 +406,7 @@ function permissionMatches(path, data, current) {
   if (path === 'permissions/save') return conn.tools.find(t => t.name === data.tool)?.permissions[data.client] === data.effect;
   return path === 'permissions/connection' && conn.access[data.client] === data.access &&
     (data.approver === undefined || conn.approver === data.approver) &&
+    (data.mailbox_paths === undefined || JSON.stringify([...(conn.mailbox_access?.[data.client] || [])].sort()) === JSON.stringify([...(data.mailbox_paths || [])].sort())) &&
     (data.mail_send === undefined || data.mail_send === 'keep' || mailSendEffect(conn, data.client) === data.mail_send);
 }
 async function mutate(path, data) {
@@ -429,13 +444,16 @@ function renameMember(member, kind = 'members') {
   }, 'primary');
 }
 function render() {
+  zh = prefersChinese(state.language);
+  document.documentElement.lang = zh ? 'zh-CN' : 'en';
+  try { localStorage.setItem(localeKey, state.language); } catch {}
   const tab = Object.keys(tabUrls).find(key => tabUrls[key] === location.pathname) || 'overview';
   version.textContent = 'v' + state.version; version.hidden = false;
   app.replaceChildren(); const identity = document.getElementById('identity'); identity.replaceChildren();
   button(identity, nameOf(state.owner), () => renameMember(state.members.find(m => m.id === state.owner)), 'profile-name');
   button(identity, tr('Sign out', '退出'), async () => { await api('auth/logout', {}); csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); });
   const nav = el(app, 'nav'); nav.setAttribute('aria-label', tr('Administration', '管理导航'));
-  const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '群组成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')]];
+  const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '群组成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')], ['settings', tr('Settings', '设置')]];
   for (const [key, label] of tabs) {
     const link = el(nav, 'a', label, tab === key ? 'button active' : 'button');
     link.href = tabUrls[key];
@@ -445,7 +463,7 @@ function render() {
       event.preventDefault(); navigate(key);
     });
   }
-  ({overview, members, agents, connections, permissions})[tab]();
+  ({overview, members, agents, connections, permissions, settings: systemSettings})[tab]();
 }
 function overview() {
   const hero = el(app, 'section', undefined, 'hero'); el(hero, 'p', tr('Ready when you are', '准备就绪'), 'eyebrow');
@@ -455,7 +473,7 @@ function overview() {
   const grid = el(app, 'div', undefined, 'grid');
   for (const [key, count, title, hint] of [
     ['members', state.members.length, tr('Group members', '群组成员'), tr('Manage groups and their members.', '管理群组及其成员。')],
-    ['connections', state.connections.length, tr('Account connectors', '账号连接器'), tr('Start with demo notes, or connect your accounts.', '可先用模拟笔记，也可连接你的账号。')],
+    ['connections', state.connections.length, tr('Account connectors', '账号连接器'), tr('Connect a service or add a remote MCP server.', '连接服务账号或添加远程 MCP 服务。')],
     ['agents', state.clients.length, tr('Agent credentials', 'Agent 凭据'), tr('Each agent has its own tool permissions.', '每个 Agent 单独配置工具权限。')]]) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'p', String(count), 'count'); el(card, 'h3', title); el(card, 'p', hint, 'muted');
     button(card, tr('Manage', '管理'), () => navigate(key));
@@ -685,8 +703,10 @@ function connectorDetails(id) {
     if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
-    if (conn.oauth) {
+    if (conn.kind === 'gmail' || conn.oauth) {
       button(actions, tr('Reauthorize', '重新授权'), () => { connectorForm(conn, true); box.close(); });
+    }
+    if (conn.oauth) {
       button(actions, tr('Revoke authorization', '撤销授权'), () => confirmAction(tr('Revoke authorization?', '撤销授权？'), tr('Reconnect to use this account again.', '需重新授权后才能继续使用此账号。'), async () => {
         const result = await api('oauth/revoke', {id, revision: state.revision}); await refresh(); box.close();
         notify(result.provider === 'revoked' ? tr('Authorization revoked locally and at the provider.', '已在网关和服务商撤销授权。') : result.provider === 'unsupported' ? tr('Gateway tokens cleared. The provider has no revocation endpoint; remove the grant in its account settings if needed.', '网关 Token 已清除。服务商未提供撤销接口，需要时请在其账号设置中移除授权。') : tr('Gateway tokens cleared. The provider revocation request failed; remove the grant in its account settings.', '网关 Token 已清除。服务商撤销请求失败，请在其账号设置中移除授权。'));
@@ -769,8 +789,8 @@ function gmailAccessLabels() {
     read_organize_send: tr('Read, organize, and send', '读取、整理和发送'),
   };
 }
-function gmailSettings(parent, existing) {
-  const settings = {}, credentials = {};
+function gmailSettings(parent, existing, reauthorize) {
+  const settings = {};
   settings.gmail_access = select(parent, tr('Google permissions', 'Google 权限'), 'gmail_access',
     Object.entries(gmailAccessLabels()), existing?.settings.gmail_access || 'read');
   const permissions = el(parent, 'small', '', 'gmail-scope-note');
@@ -785,6 +805,52 @@ function gmailSettings(parent, existing) {
   }
   settings.gmail_access.addEventListener('change', scopeNote); scopeNote();
 
+  const clientId = state.gmail_oauth.client_id;
+  if (!existing?.settings.client_id && !clientId) {
+    const link = el(parent, 'a', tr('Set up Gmail OAuth in Settings', '在「设置」中配置 Gmail OAuth'));
+    link.href = tabUrls.settings;
+    link.addEventListener('click', event => { event.preventDefault(); link.closest('dialog').close(); navigate('settings'); });
+  }
+  const useSystemClient = existing && clientId ? checkbox(parent, tr('Use the system OAuth client on reauthorization', '重新授权时使用系统 OAuth 客户端'), reauthorize && clientId !== existing.settings.client_id) : null;
+  return {settings, useSystemClient};
+}
+function systemSettings() {
+  el(app, 'h1', tr('Settings', '设置'));
+  const preferences = el(app, 'section', undefined, 'card');
+  el(preferences, 'h2', tr('My preferences', '个人偏好'));
+  const language = select(preferences, tr('Interface language', '界面语言'), 'language',
+    [['auto', tr('Follow browser', '跟随浏览器')], ['en', 'English'], ['zh-CN', '简体中文']], state.language);
+  button(preferences, tr('Save language', '保存语言'), () => mutate('settings/language', {language: language.value}));
+  const card = el(app, 'section', undefined, 'card');
+  el(card, 'h2', 'Gmail OAuth');
+  const {client_id: id} = state.gmail_oauth;
+  el(card, 'p', id ? tr('Configured for new Gmail connections.', '新建 Gmail 连接将使用这套配置。') :
+    tr('Set up one OAuth client for Gmail. Authorize each mailbox separately.', '配置一套 Gmail OAuth 客户端，每个邮箱单独授权。'), 'muted');
+  if (id) el(card, 'code', id, 'url');
+  button(card, id ? tr('Change OAuth client', '更换 OAuth 客户端') : tr('Configure OAuth client', '配置 OAuth 客户端'), gmailClientDialog);
+}
+function gmailClientDialog() {
+  const box = modal(tr('Gmail OAuth client', 'Gmail OAuth 客户端'));
+  const saved = state.gmail_oauth.saved_clients;
+  const source = saved.length ? select(box, tr('Client configuration', '客户端配置'), 'gmail_client_source',
+    [['', tr('Import JSON or enter credentials', '导入 JSON 或填写凭据')], ...saved.map(id => [id, tr('Use client from: ', '采用连接中的客户端：') + id])],
+    state.gmail_oauth.client_id ? '' : saved[0]) : null;
+  const parent = el(box, 'div');
+  const {clientId, clientSecret} = googleClientFields(parent);
+  function toggleImport() { parent.hidden = Boolean(source?.value); }
+  source?.addEventListener('change', toggleImport);
+  toggleImport();
+  button(box, tr('Save OAuth client', '保存 OAuth 客户端'), async () => {
+    if (source?.value) await mutate('settings/gmail-oauth', {connection: source.value});
+    else {
+      const client_id = clientId.value.trim(), client_secret = clientSecret.value.trim();
+      if (!client_id || !client_secret) throw new Error(tr(...messages.gmail_client_config_invalid));
+      await mutate('settings/gmail-oauth', {client_id, client_secret});
+    }
+    box.close(); notify(tr('Gmail OAuth client saved.', '已保存 Gmail OAuth 客户端。'));
+  }, 'primary', tr('Saving…', '正在保存…'));
+}
+function googleClientFields(parent) {
   const guide = el(parent, 'details');
   el(guide, 'summary', tr('Google Cloud setup', 'Google Cloud 设置'));
   const link = el(guide, 'a', tr('Open Google Cloud OAuth clients', '打开 Google Cloud OAuth 客户端'));
@@ -799,18 +865,14 @@ function gmailSettings(parent, existing) {
   });
   el(guide, 'p', tr('Download the client JSON, then import it here.', '下载该客户端的 JSON 文件，然后在这里导入。'));
 
-  const imported = field(parent, existing ? tr('Replace OAuth client (optional)', '更换 OAuth 客户端（可选）') :
-    tr('Google OAuth client JSON', 'Google OAuth 客户端 JSON'), 'google_client_file', '', 'file');
+  const imported = field(parent, tr('Google OAuth client JSON', 'Google OAuth 客户端 JSON'), 'google_client_file', '', 'file');
   imported.accept = '.json,application/json';
   const status = el(parent, 'p', '', 'muted');
   status.setAttribute('role', 'status');
   const manual = el(parent, 'details');
   el(manual, 'summary', tr('Enter credentials manually', '手动填写凭据'));
-  settings.client_id = field(manual, tr('Google OAuth client ID', 'Google OAuth 客户端 ID'), 'client_id', existing?.settings.client_id || '');
-  credentials.client_secret = field(manual, tr('Google OAuth client secret', 'Google OAuth 客户端密钥'), 'client_secret', '', 'password',
-    existing ? tr('Leave blank to keep this client’s saved secret.', '留空保留此客户端已保存的密钥。') : '');
-  credentials.refresh_token = field(manual, tr('Existing refresh token (optional)', '已有刷新令牌（可选）'), 'refresh_token', '', 'password',
-    tr('Leave blank to authorize in your browser.', '留空即可通过浏览器授权。'));
+  const clientId = field(manual, tr('Google OAuth client ID', 'Google OAuth 客户端 ID'), 'client_id');
+  const clientSecret = field(manual, tr('Google OAuth client secret', 'Google OAuth 客户端密钥'), 'client_secret', '', 'password');
 
   imported.addEventListener('change', async () => {
     if (!imported.files.length) return;
@@ -822,28 +884,27 @@ function gmailSettings(parent, existing) {
       try { if (file.size <= 64 * 1024) data = JSON.parse(await file.text()); } catch {}
       if (data?.installed && !data?.web) throw new Error(tr('This is a Desktop app client. Download a Web application client instead.', '这是「桌面应用」客户端，请下载「Web 应用」客户端。'));
       const {client_id: id, client_secret: secret} = data?.web || {};
-      if ([id, secret].some(value => typeof value !== 'string' || !value.trim() || value.length > 16000)) {
+      if ([id, secret].some(value => typeof value !== 'string' || !value.trim() || value.length > 4096)) {
         throw new Error(tr('This file does not contain a Web application client ID and secret.', '此文件里没有「Web 应用」客户端的 ID 和密钥。'));
       }
-      settings.client_id.value = id.trim();
-      credentials.client_secret.value = secret.trim();
-      credentials.refresh_token.value = '';
+      clientId.value = id.trim();
+      clientSecret.value = secret.trim();
       manual.open = false;
       status.textContent = tr('OAuth client loaded.', '已导入 OAuth 客户端。');
     } catch (error) { showError(imported, error); }
     finally { imported.value = ''; imported.dispatchEvent(new Event('input', {bubbles: true})); }
   });
-  return {settings, credentials};
+  return {clientId, clientSecret};
 }
 function connectorForm(existing, reauthorize = false) {
   const revision = state.revision;
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
-  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'demo'); kind.disabled = !!existing;
+  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = !!existing;
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Group: ', '群组共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
-  const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider;
+  const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider, useSystemClient;
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
     smtp_security: tr('SMTP encryption', 'SMTP 加密方式'), smtp_username: tr('SMTP username (optional override)', 'SMTP 用户名（可选覆盖）'),
@@ -851,9 +912,9 @@ function connectorForm(existing, reauthorize = false) {
     url: tr('HTTPS service URL', '服务 HTTPS 地址'), timezone: tr('Time zone', '时区'), password: tr('App-specific password', 'App 专用密码'),
     token: tr('Helper bearer token', '辅助服务 Bearer Token')};
   function fields() {
-    dynamic.replaceChildren(); settings = {}; credentials = {}; mailProvider = null;
+    dynamic.replaceChildren(); settings = {}; credentials = {}; mailProvider = null; useSystemClient = null;
     if (kind.value === 'gmail') {
-      ({settings, credentials} = gmailSettings(dynamic, existing));
+      ({settings, useSystemClient} = gmailSettings(dynamic, existing, reauthorize));
       return;
     }
     const spec = state.catalog[kind.value];
@@ -922,9 +983,9 @@ function connectorForm(existing, reauthorize = false) {
   function values() {
     const values = Object.fromEntries(Object.entries(credentials).map(([k, input]) => [k, input.value]));
     if (mailProvider?.value === 'gmail') values.password = values.password.replace(/\s+/g, '');
-    return {revision, id: name.value, kind: kind.value, owner: owner.value,
-      settings: Object.fromEntries(Object.entries(settings).map(([k, input]) => [k, input.value])),
-      credentials: values};
+    const fields = Object.fromEntries(Object.entries(settings).map(([k, input]) => [k, input.value]));
+    if (kind.value === 'gmail' && !systemGmail()) fields.client_id = existing.settings.client_id;
+    return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values};
   }
   function needsReview() {
     return ['remote', 'reminders'].includes(kind.value) && (!existing || settings.url.value.trim() !== existing.settings.url);
@@ -935,8 +996,12 @@ function connectorForm(existing, reauthorize = false) {
       ['issuer', 'client_id', 'auth_method', 'scope', 'client_metadata_url'].some(key => settings[key].value !== (existing?.settings[key] || ''))
     );
   }
+  function systemGmail() { return !existing?.settings.client_id || Boolean(useSystemClient?.checked); }
+  function gmailConsent() {
+    return kind.value === 'gmail' && (systemGmail() || reauthorize || settings.gmail_access.value !== (existing.settings.gmail_access || 'read'));
+  }
   function saveLabel() {
-    if (kind.value === 'gmail' && !credentials.refresh_token?.value.trim()) return tr('Authorize with Google', '通过 Google 授权');
+    if (gmailConsent()) return tr('Authorize with Google', '通过 Google 授权');
     if (needsReview()) return tr('Preview tools', '预览工具');
     if (needsOAuth()) return tr('Authorize and save', '授权并保存');
     return tr('Save connector', '保存连接器');
@@ -945,15 +1010,8 @@ function connectorForm(existing, reauthorize = false) {
     name.value = name.value.trim();
     if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
     if (!form.reportValidity()) return;
-    if (kind.value === 'gmail') {
-      settings.client_id.value = settings.client_id.value.trim();
-      credentials.refresh_token.value = credentials.refresh_token.value.trim();
-      if (!settings.client_id.value || ((!existing || settings.client_id.value !== existing.settings.client_id) && !credentials.client_secret.value)) {
-        throw new Error(tr('Import a Google OAuth client JSON or enter the client ID and secret manually.', '请导入 Google OAuth 客户端 JSON，或手动填写客户端 ID 和密钥。'));
-      }
-      if (!credentials.refresh_token.value) {
-        const result = await api('oauth/start', values()); location.assign(result.url); return;
-      }
+    if (gmailConsent()) {
+      const result = await api('oauth/start', values()); location.assign(result.url); return;
     }
     if (needsOAuth()) {
       const result = await api('oauth/mcp/start', values()); location.assign(result.url); return;
@@ -968,8 +1026,13 @@ function connectorForm(existing, reauthorize = false) {
     box.close(); notify(tr('Connector saved.', '连接器已保存。'));
   }, 'primary', tr('Saving…', '正在保存…'));
   kind.addEventListener('change', fields);
-  form.addEventListener('input', () => { if (!save.disabled) save.textContent = saveLabel(); });
-  form.addEventListener('change', () => { if (!save.disabled) save.textContent = saveLabel(); });
+  function updateSave() {
+    save.hidden = kind.value === 'gmail' && systemGmail() && !state.gmail_oauth.client_id;
+    if (!save.disabled) save.textContent = saveLabel();
+  }
+  form.addEventListener('input', updateSave);
+  form.addEventListener('change', updateSave);
+  updateSave();
 }
 function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
@@ -1071,6 +1134,57 @@ function accessSummary(parent, conn, client) {
     el(parent, 'small', tr('Approver: ', '审批人：') + approver);
   }
 }
+function mailboxPathEditor(parent, conn, client) {
+  const gmail = conn.kind === 'gmail';
+  const old = conn.mailbox_access[client] || null;
+  const selected = new Set(old);
+  const mode = select(parent, gmail ? tr('Gmail labels', 'Gmail 标签') : tr('Mailbox folders', '邮箱文件夹'), 'mailbox_paths_mode',
+    [['all', gmail ? tr('All labels', '所有标签') : tr('All folders', '所有文件夹')],
+     ['selected', gmail ? tr('Selected labels', '仅所选标签') : tr('Selected folders', '仅所选文件夹')]], old ? 'selected' : 'all');
+  const optional = el(parent, 'div');
+  const list = el(optional, 'div', undefined, 'mailbox-paths');
+  let loaded = false, loading = false;
+  async function load() {
+    if (loaded || loading) return;
+    loading = true; list.replaceChildren();
+    el(list, 'p', tr('Reading mailbox…', '正在读取邮箱目录…'), 'muted');
+    try {
+      const {paths} = await api('connections/mailboxes', {id: conn.id});
+      list.replaceChildren();
+      const current = new Set(paths.map(p => p.id));
+      for (const id of selected) if (!current.has(id)) paths.push({id, name: id + tr(' (no longer listed)', '（邮箱中未找到）')});
+      paths.sort((a, b) => a.name.localeCompare(b.name));
+      if (!paths.length) el(list, 'p', tr('No folders or labels are available.', '没有可选择的文件夹或标签。'), 'muted');
+      for (const path of paths) {
+        const input = checkbox(list, path.name, selected.has(path.id));
+        input.addEventListener('change', () => { if (input.checked) selected.add(path.id); else selected.delete(path.id); });
+      }
+      loaded = true;
+    } catch (error) {
+      list.replaceChildren();
+      const retry = button(list, tr('Retry reading mailbox', '重新读取邮箱目录'), load);
+      showError(retry, error);
+    } finally { loading = false; }
+  }
+  el(optional, 'small', gmail ? tr('A message is accessible if it has any selected label. Trash and restore require access to all labels.', '邮件带有任一所选标签即可访问。移入或移出废纸篓需要访问所有标签。') :
+    tr('Select each folder explicitly, including subfolders. Moving mail requires access to both folders.', '请逐一勾选文件夹和子文件夹。移动邮件需要源和目标文件夹都有权限。'), 'muted');
+  function refreshMode() {
+    optional.hidden = mode.value !== 'selected';
+    if (!parent.hidden && !optional.hidden) void load();
+  }
+  mode.addEventListener('change', refreshMode);
+  return {
+    visibility(show) { parent.hidden = !show; refreshMode(); },
+    selection() {
+      if (parent.hidden) return {};
+      if (mode.value === 'all') return old ? {mailbox_paths: null} : {};
+      if (!selected.size || selected.size > 512) throw new Error(tr(...messages.invalid_mailbox_paths));
+      const paths = [...selected].sort();
+      if (old && JSON.stringify([...old].sort()) === JSON.stringify(paths)) return {};
+      return {mailbox_paths: paths};
+    },
+  };
+}
 function permissions() {
   const title = tr('Inspect permissions', '检查权限');
   infoHeading(app, 'h1', title, tr('These permissions apply to everyone using the selected Agent. Each approval covers one operation. Changes expire pending approvals.', '权限适用于此 Agent 的所有使用者。每次审批只批准一次操作。权限变更会使待审批请求失效。')).classList.add('page-heading');
@@ -1110,6 +1224,7 @@ function permissionEditor(id, client) {
     if (writes) options.push(['read_write', tr('Read and write', '读写')]);
     if (current === 'custom') options.push(['custom', tr('Custom — keep existing tool settings', '自定义（保留现有逐工具配置）')]);
     const mode = select(card, tr('Connection access', '连接权限'), 'connection_access', options, scope);
+    const mailboxPaths = conn.mailbox_access ? mailboxPathEditor(el(card, 'div'), conn, client) : null;
     if (!writes && !(conn.available_tools || []).some(t => t.access === 'write')) el(card, 'p', tr('This connector only provides read operations.', '此连接器只提供读取操作，不支持写入。'), 'muted');
     const approvalFields = el(card, 'div', undefined, 'form-grid');
     const readSettings = el(approvalFields, 'div'), writeSettings = el(approvalFields, 'div');
@@ -1134,6 +1249,7 @@ function permissionEditor(id, client) {
     el(approval, 'small', tr('Applies to all Agents using this connector.', '适用于使用此连接器的所有 Agent。'), 'muted');
     const enrollment = el(approval, 'p', '', 'muted');
     function feedback() {
+      mailboxPaths?.visibility(mode.value !== 'none');
       readSettings.hidden = !['read', 'read_write'].includes(mode.value);
       writeSettings.hidden = mode.value !== 'read_write' || !otherWrites;
       sendSettings.hidden = !sendApproval || mode.value !== 'read_write';
@@ -1153,11 +1269,13 @@ function permissionEditor(id, client) {
       if (access === 'read_write') access = readApproval.value === 'approval_required'
         ? (writeApproval.value === 'approval_required' ? 'read_write_approval' : 'read_approval_write_direct')
         : (writeApproval.value === 'approval_required' ? 'read_write' : 'read_write_direct');
+      const mailboxSelection = mailboxPaths?.selection() || {};
       const controls = [...card.querySelectorAll('input, select, button')];
       const disabled = controls.map(control => control.disabled);
       controls.forEach(control => { control.disabled = true; });
       try {
         await mutate('permissions/connection', {client, connection: conn.id, access,
+          ...mailboxSelection,
           ...(!sendSettings.hidden ? {mail_send: sendApproval.value} : {}),
           ...(!approval.hidden ? {approver: approver.value} : {})});
         populate(); notify(tr('Connection permissions updated.', '连接权限已更新。'));

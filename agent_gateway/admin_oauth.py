@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 import httpx2
 from fido2.utils import websafe_encode
 
-from .admin_config import make_connection
+from .admin_config import kind_of, make_connection
 from .gmail_scopes import SCOPE, SCOPES, scope_error
 from .mail_address import email_address
 from .passkey import Refused
@@ -16,6 +16,15 @@ from .passkey import Refused
 AUTHORIZE = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN = "https://oauth2.googleapis.com/token"
 PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+
+
+def saved_gmail_client(conn, values):
+    if kind_of(conn) == "gmail":
+        client_id = conn.env.get("GMAIL_CLIENT_ID")
+        client_secret = values.get(conn.secret_env.get("GMAIL_CLIENT_SECRET"))
+        if client_id and client_secret:
+            return {"client_id": client_id, "client_secret": client_secret}
+    return None
 
 
 def _profile_error(response):
@@ -79,23 +88,38 @@ class GoogleConsent(ConsentSessions):
         credentials = body.setdefault("credentials", {})
         if not isinstance(credentials, dict):
             raise Refused("invalid_connector", 400)
-        credentials["refresh_token"] = "pending-consent"
         gateway = self.controller.runtime.gateway
+        settings = body.setdefault("settings", {})
+        if not isinstance(settings, dict):
+            raise Refused("invalid_connector", 400)
+        # An explicit ID reuses this connection's own client or the legacy
+        # API path. Without one, use the system client with a new account grant.
+        if "client_id" not in settings:
+            if credentials:
+                raise Refused("invalid_connector", 400)
+            client = self.controller.store.state.get("gmail_client")
+            if not client:
+                raise Refused("gmail_system_client_required", 400)
+            settings["client_id"] = client["client_id"]
+            credentials["client_secret"] = client["client_secret"]
+        credentials["refresh_token"] = "pending-consent"
         conn, values = make_connection(body, gateway.cfg, gateway.secrets)
         client_secret = (gateway.secrets | values)[conn.secret_env["GMAIL_CLIENT_SECRET"]]
         body["credentials"] = {"client_secret": client_secret}
         access = conn.env["GMAIL_ACCESS"]
         body["settings"] = {"client_id": conn.env["GMAIL_CLIENT_ID"], "gmail_access": access}
+        previous = next((c for c in gateway.cfg.connections if c.id == conn.id), None)
+        expected_account = previous.mailbox_email if previous else None
         now = time.time()
         self.flows = {key: value for key, value in self.flows.items() if value["expires"] > now}
         if len(self.flows) >= 16:
             raise Refused("too_many_drafts", 429)
         state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(48)
         self.flows[state] = {"session": session["id"], "body": body, "expires": now + 600,
-                             "verifier": verifier, "phase": "pending"}
+                             "verifier": verifier, "phase": "pending", "expected_account": expected_account}
         return {"url": AUTHORIZE + "?" + urlencode({
             "client_id": conn.env["GMAIL_CLIENT_ID"], "redirect_uri": self.redirect,
-            "response_type": "code", "scope": " ".join(SCOPES[access]), "access_type": "offline", "prompt": "consent",
+            "response_type": "code", "scope": " ".join(SCOPES[access]), "access_type": "offline", "prompt": "consent select_account",
             "state": state, "code_challenge": websafe_encode(hashlib.sha256(verifier.encode()).digest()),
             "code_challenge_method": "S256", "include_granted_scopes": "false",
         })}
@@ -132,6 +156,8 @@ class GoogleConsent(ConsentSessions):
                 email = email_address(profile.json().get("emailAddress"))
                 if not email:
                     raise Refused("oauth_invalid_response", 400)
+                if flow["expected_account"] and email.casefold() != flow["expected_account"].casefold():
+                    raise Refused("gmail_account_changed", 400)
             flow["body"]["credentials"]["refresh_token"] = token["refresh_token"]
             flow["account"] = email
             flow["phase"] = "ready"

@@ -119,12 +119,17 @@ def _summary(mailbox: str, uid: int, data: dict[bytes, Any], message: Any = None
 
 
 def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int, submission=None) -> list[Tool]:
+    from ._mail_scope import ARGUMENT, check_source, in_folder
+
     def list_mailboxes(args: dict[str, Any]) -> Any:
         folders = mail.run(lambda c: c.list_folders())
-        return [{"name": name, "flags": _flags(flags)} for flags, _delimiter, name in folders]
+        scope = args.get(ARGUMENT)
+        return [{"name": name, "flags": _flags(flags)} for flags, _delimiter, name in folders
+                if scope is None or in_folder(name, scope)]
 
     def search_messages(args: dict[str, Any]) -> Any:
         mailbox, limit = plain(args.get("mailbox", "INBOX")), args.get("limit", 20)
+        check_source(args, args.get(ARGUMENT))
         criteria: list[Any] = []
         for argument, key in (("from", "FROM"), ("to", "TO"), ("subject", "SUBJECT"), ("text", "TEXT")):
             if args.get(argument):
@@ -151,6 +156,7 @@ def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int
 
     def fetch(args: dict[str, Any]) -> tuple[str, int, dict[bytes, Any], Any]:
         mailbox, uid = plain(args.get("mailbox", "INBOX")), args["uid"]
+        check_source(args, args.get(ARGUMENT))
 
         def run(client: IMAPClient) -> tuple[dict[bytes, Any], bytes]:
             client.select_folder(mailbox, readonly=True)
@@ -255,6 +261,7 @@ def main() -> None:
             max_attachment_bytes=int(setting("IMAP_MAX_ATTACHMENT_BYTES", "5000000")),
             submission=submission,
         ),
+        mail_kind="imap",
     )
 
 

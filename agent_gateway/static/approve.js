@@ -2,7 +2,14 @@
 // page with textContent only, and the CSP forbids inline script, so it stays text.
 'use strict';
 
-const ZH = (navigator.language || '').toLowerCase().startsWith('zh');
+let language, redraw;
+try { language = localStorage.getItem('gateway.ui-language'); } catch {}
+let ZH;
+function setLanguage(preference) {
+  ZH = preference === 'zh-CN' || (preference !== 'en' && (navigator.language || '').toLowerCase().startsWith('zh'));
+  document.documentElement.lang = ZH ? 'zh-CN' : 'en';
+}
+setLanguage(language);
 const TEXT = {
   title_pending: ['An agent is asking to do this', '有 Agent 请求执行以下操作'],
   title_approved: ['Approved', '已批准'],
@@ -121,6 +128,7 @@ function act(parent, label, cls, run) {
   button.addEventListener('click', async () => {
     const buttons = parent.querySelectorAll('button');
     buttons.forEach((b) => { b.disabled = true; });
+    picker.disabled = true;
     const status = document.getElementById('status');
     status.className = 'muted';
     status.textContent = t('working');
@@ -135,6 +143,8 @@ function act(parent, label, cls, run) {
       status.textContent = t('failed') + (browserErrors[error.name]?.[ZH ? 1 : 0] || error.message || error.name);
       status.setAttribute('role', 'alert');
       buttons.forEach((b) => { b.disabled = false; });
+    } finally {
+      picker.disabled = false;
     }
   });
 }
@@ -146,6 +156,7 @@ function row(list, label, value) {
 }
 
 function showRequest(request) {
+  redraw = () => showRequest(request);
   const identity = (id) => {
     return request.names?.[id] || id;
   };
@@ -161,7 +172,7 @@ function showRequest(request) {
   if (request.connection !== request.account) row(facts, t('connection'), request.connection);
   row(facts, t('tool'), request.tool + ' (' + request.upstream_tool + ')');
   if (request.status === 'pending') row(facts, t('decides'), request.approvers.map(identity).join(', '));
-  if (open) row(facts, t('until'), new Date(request.expires * 1000).toLocaleString());
+  if (open) row(facts, t('until'), new Date(request.expires * 1000).toLocaleString(ZH ? 'zh-CN' : 'en'));
   row(facts, t('decided_by'), request.decided_by ? identity(request.decided_by) : null);
   row(facts, t('outcome'), request.outcome);
 
@@ -181,14 +192,19 @@ function showRequest(request) {
 }
 
 function showEnrollment(code) {
+  redraw = () => showEnrollment(code);
+  app.replaceChildren();
   el(app, 'h1', t('enroll_title'));
   el(app, 'p', t('enroll_hint'), 'muted');
   const actions = el(app, 'div', undefined, 'actions');
   act(actions, t('enroll'), 'go', async () => {
     await passkey('enroll', code);
-    app.replaceChildren();
-    el(app, 'h1', t('enroll_title'));
-    el(app, 'p', t('enrolled'), 'notice ok');
+    redraw = () => {
+      app.replaceChildren();
+      el(app, 'h1', t('enroll_title'));
+      el(app, 'p', t('enrolled'), 'notice ok');
+    };
+    redraw();
   });
   el(app, 'p', '', 'muted').id = 'status';
 }
@@ -208,4 +224,12 @@ async function main() {
     el(app, 'p', error.message, 'notice bad');
   }
 }
+
+const picker = document.getElementById('language');
+picker.value = ['en', 'zh-CN'].includes(language) ? language : 'auto';
+picker.addEventListener('change', () => {
+  try { localStorage.setItem('gateway.ui-language', picker.value); } catch {}
+  setLanguage(picker.value);
+  redraw?.();
+});
 main();

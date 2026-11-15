@@ -17,6 +17,7 @@ from typing import Any
 
 from . import _mail
 from ._base import DATE, ConnectorError, Tool, integer, plain, string
+from ._mail_scope import ARGUMENT, check_source, denied, in_folder
 
 SNAPSHOT_SECONDS = 3600
 MAX_SNAPSHOTS = 16
@@ -98,6 +99,7 @@ def additional_tools(mail, max_message_bytes, summary, header_fetch):
         return value + "." + hmac.new(cursor_key, value.encode(), hashlib.sha256).hexdigest()
 
     def list_messages(args):
+        check_source(args, args.get(ARGUMENT))
         now = time.time()
         for key in list(snapshots):
             if snapshots[key]["expires"] <= now:
@@ -161,6 +163,7 @@ def additional_tools(mail, max_message_bytes, summary, header_fetch):
                 "consistency": "Fixed matching UIDs at first search; new arrivals require a new listing. Removed messages are reported per UID."}
 
     def get_messages(args):
+        check_source(args, args.get(ARGUMENT))
         mailbox, validity, uids = plain(args.get("mailbox", "INBOX")), args["uidvalidity"], args["uids"]
 
         def read(client):
@@ -212,6 +215,8 @@ def additional_tools(mail, max_message_bytes, summary, header_fetch):
 
     def mutate(args, operation):
         mailbox, validity, uids = plain(args.get("mailbox", "INBOX")), args["uidvalidity"], args["uids"]
+        scope = args.get(ARGUMENT)
+        check_source(args, scope)
         deadline = time.monotonic() + 15
         if operation == "state" and not any(k in args for k in ("read", "starred")):
             return batch_result(mailbox, validity, [failure(uid, "imap_state_required", "Set read, starred, or both.") for uid in uids])
@@ -230,6 +235,8 @@ def additional_tools(mail, max_message_bytes, summary, header_fetch):
                         raise ConnectorError(f"The server did not identify exactly one {operation} folder. Specify destination from list_mailboxes.", "imap_special_folder_missing")
                     destination = matches[0]
                 destination = plain(destination)
+                if scope is not None and not in_folder(destination, scope):
+                    raise denied()
                 if destination == mailbox or destination.upper() == mailbox.upper() == "INBOX":
                     raise ConnectorError("Source and destination mailbox must be different.", "imap_same_mailbox")
                 if destination not in {name for _, _, name in folders}:

@@ -21,7 +21,7 @@ from .admin_config import (
 )
 from .auth import hash_token, new_token
 from .catalog_sync import bundled_kind
-from .config import NAME, ToolCfg, is_mail_send
+from .config import NAME, ToolCfg, is_mail_send, valid_mailbox_paths
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .upstream import list_all_tools, open_client
@@ -32,11 +32,12 @@ def needs_admin_confirmation(operation, body):
     if operation == "permissions/save":
         return body.get("effect") != "deny"
     if operation == "permissions/connection":
-        return body.get("access") != "none" or "approver" in body
+        return body.get("access") != "none" or "approver" in body or "mailbox_paths" in body
     # OAuth callbacks can only save drafts started by an authorized, session-bound request.
     return operation in {
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
+        "settings/gmail-oauth",
     }
 
 
@@ -107,6 +108,7 @@ class AdminController:
             names = {m["id"]: m["name"] for m in self.store.state["config"][kind]}
             for member in state["config"][kind]:
                 member["name"] = names.get(member["id"], member["name"])
+        state["languages"] = self.store.state.get("languages", {}).copy()
         state["revision"] = self.store.state["revision"] + 1
         state, catalog_updates = self.store.reconcile(state)
         gateway = self._gateway(state)
@@ -150,6 +152,7 @@ class AdminController:
         return {"revision": state["revision"]}
 
     def state(self):
+        from .admin_oauth import saved_gmail_client
         gw = self.runtime.gateway
         keys = self.auth.approver.passkeys()
         connections = []
@@ -166,6 +169,7 @@ class AdminController:
                                 "approver": conn.approver or conn.owner,
                                 "access": {c.id: connection_access(gw.policy, c, conn) for c in gw.cfg.clients},
                                 "settings": self.connection_settings(conn), "tools": tools,
+                                "mailbox_access": conn.mailbox_access if bundled_kind(conn) in ("imap", "gmail") else None,
                                 "mailbox": mailbox_metadata(conn),
                                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None,
                                 "catalog_sync": self.store.catalog_updates.get(conn.id),
@@ -181,6 +185,9 @@ class AdminController:
                              "tool_count": sum(gw.policy.effect(c.subject, t.name, c.id) != "deny"
                                                for conn in gw.cfg.connections for t in conn.tools)} for c in gw.cfg.clients],
                 "connections": connections, "passkeys": keys,
+                "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
+                "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
+                                "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
                 "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()}}
 
     @staticmethod
@@ -316,6 +323,46 @@ class AdminController:
             result = await self.operate("connections/save", connector, session, gmail_email=account)
             del self.google.flows[key]
             return {**result, "google_account": account}
+        if operation == "connections/mailboxes":
+            if set(body) != {"id"}:
+                raise Refused("invalid_argument", 400)
+            gw = self.runtime.gateway
+            conn = next((c for c in gw.cfg.connections if c.id == body["id"]), None)
+            kind = bundled_kind(conn) if conn else None
+            if kind not in ("imap", "gmail"):
+                raise Refused("unsupported_connector", 400)
+            paths, problem = {}, None
+            try:
+                with anyio.fail_after(26):
+                    async with open_client(conn, {n: gw.secrets[n] for n in conn.secret_names()}, self.oauth) as upstream:
+                        offset = 0
+                        while True:
+                            result = await upstream.call_tool("list_labels", {"offset": offset, "limit": 100}) if kind == "gmail" else await upstream.call_tool("list_mailboxes", {})
+                            if result.is_error:
+                                problem = probe_error(kind, result)
+                                break
+                            data = json.loads(result.content[0].text)
+                            if kind == "imap":
+                                for folder in data:
+                                    if not any(flag.casefold() == "\\noselect" for flag in folder["flags"]):
+                                        paths[folder["name"]] = folder["name"]
+                                break
+                            for label in data["labels"]:
+                                paths[label["id"]] = label["name"]
+                            next_offset = data.get("next_offset")
+                            if next_offset is None:
+                                break
+                            if not isinstance(next_offset, int) or not offset < next_offset <= 10000:
+                                problem = "mailbox_listing_unavailable"
+                                break
+                            offset = next_offset
+            except Exception as exc:
+                problem = connector_failure(exc, conn.transport)
+            if problem:
+                incident = secrets.token_hex(6)
+                gw.audit.write("admin_mailbox_paths", connection=conn.id, reason=problem, detail=incident)
+                raise Refused(problem, 422, incident=incident)
+            return {"paths": [{"id": path, "name": name} for path, name in paths.items() if valid_mailbox_paths([path])]}
         if operation == "members/enroll":
             principal = body.get("id")
             if principal not in self.runtime.gateway.cfg.principals or principal in self.runtime.gateway.cfg.shared:
@@ -366,6 +413,33 @@ class AdminController:
             return {"ok": True, "read_tool": probe}
 
         self._revision(body)
+        if operation == "settings/language":
+            if set(body) != {"revision", "language"} or body["language"] not in ("auto", "en", "zh-CN"):
+                raise Refused("invalid_language", 400)
+            state = copy.deepcopy(self.store.state)
+            state.setdefault("languages", {})[self.auth.owner] = body["language"]
+            self.store.save(state)
+            return {"language": body["language"]}
+        if operation == "settings/gmail-oauth":
+            from .admin_oauth import saved_gmail_client
+            state = self.store.candidate()
+            if set(body) == {"revision", "connection"} and isinstance(body["connection"], str):
+                gw = self.runtime.gateway
+                source = next((c for c in gw.cfg.connections if c.id == body["connection"]), None)
+                client = saved_gmail_client(source, gw.secrets) if source else None
+                if not client:
+                    raise Refused("gmail_saved_client_unavailable", 400)
+            elif set(body) == {"revision", "client_id", "client_secret"}:
+                client = {key: body[key] for key in ("client_id", "client_secret")}
+                if not all(isinstance(value, str) and 1 <= len(value.strip()) <= 4096 for value in client.values()):
+                    raise Refused("gmail_client_config_invalid", 400)
+                client = {key: value.strip() for key, value in client.items()}
+            else:
+                raise Refused("gmail_client_config_invalid", 400)
+            if client == state.get("gmail_client"):
+                return {"revision": state["revision"]}
+            state["gmail_client"] = client
+            return await self._commit(state, operation)
         if operation == "oauth/revoke":
             conn = next((c for c in self.runtime.gateway.cfg.connections if c.id == body.get("id")), None)
             if not conn or not conn.oauth_ref:
@@ -452,6 +526,10 @@ class AdminController:
                 client["id"] = renamed
                 for rule in raw["policy"]:
                     rule["clients"] = [renamed if c == name else c for c in rule["clients"]]
+                for conn in raw["connections"]:
+                    scopes = conn["mailbox_access"]
+                    if name in scopes:
+                        scopes[renamed] = scopes.pop(name)
             elif operation == "clients/rotate":
                 token = new_token()
                 client["token_sha256"] = hash_token(token)
@@ -459,6 +537,8 @@ class AdminController:
                 raw["clients"].remove(client)
                 raw["policy"] = [{**r, "clients": [c for c in r["clients"] if c != name]}
                                  for r in raw["policy"] if any(c != name for c in r["clients"])]
+                for conn in raw["connections"]:
+                    conn["mailbox_access"].pop(name, None)
             result = await self._commit(state, operation)
             if operation == "clients/rename":
                 result["id"] = client["id"]
@@ -576,6 +656,15 @@ class AdminController:
                 if not isinstance(approver, str) or approver not in cfg.principals or cfg.household_of(approver) != client.household:
                     raise Refused("invalid_connection_approver", 400)
                 next(c for c in raw["connections"] if c["id"] == name)["approver"] = approver
+            if "mailbox_paths" in body:
+                paths = body["mailbox_paths"]
+                if bundled_kind(conn) not in ("imap", "gmail") or (paths is not None and not valid_mailbox_paths(paths)):
+                    raise Refused("invalid_mailbox_paths", 400)
+                scopes = next(c for c in raw["connections"] if c["id"] == name)["mailbox_access"]
+                if paths is None:
+                    scopes.pop(client_id, None)
+                else:
+                    scopes[client_id] = sorted(paths)
             if mode == "custom":
                 return await self._commit(state, operation)
             # Replace only this Agent's rules on this connection, atomically.
@@ -747,7 +836,7 @@ class AdminController:
             return HTMLResponse(page, status_code=error.status_code, headers=_PAGE_HEADERS)
 
         return [Route("/", page), Route("/admin", page), Route("/admin/", page),
-                *(Route(f"/admin/{section}", page) for section in ("members", "agents", "connections", "permissions")),
+                *(Route(f"/admin/{section}", page) for section in ("members", "agents", "connections", "permissions", "settings")),
                 Route("/admin/oauth/google/callback", oauth_callback),
                 Route("/admin/oauth/mcp/callback", oauth_callback),
                 Route("/admin/assets/{name}", asset),

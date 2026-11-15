@@ -19,6 +19,7 @@ from ..gmail_scopes import SCOPES, can_organize, can_send, scope_error
 from ..mail_address import email_address
 from . import _gmail_ops, _mail
 from ._base import ConnectorError, CredentialGate, Tool, integer, plain, result, serve, setting, string
+from ._mail_scope import ARGUMENT, check_labels, denied, exposed_labels
 from ._smtp import address
 
 _REVOKED = (
@@ -194,6 +195,18 @@ def _about(message: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
 def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int, *, access: str = "read") -> list[Tool]:
     def search_messages(args: dict[str, Any]) -> Any:
         params = [("maxResults", str(args.get("limit", 10)))]
+        scope, label = args.get(ARGUMENT), args.get("label_id")
+        if scope is not None:
+            if not label and len(scope) == 1:
+                label = next(iter(scope))
+            if not label:
+                raise ConnectorError("Choose one allowed label_id from list_labels to search.", "gmail_label_required")
+            if label not in scope:
+                raise denied()
+        if label:
+            params.append(("labelIds", label))
+            if label in ("SPAM", "TRASH"):
+                params.append(("includeSpamTrash", "true"))
         if args.get("query"):
             params.append(("q", args["query"]))
         listing = gmail.get("messages", params)
@@ -201,16 +214,37 @@ def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int,
         messages = []
         for item in listing.get("messages", [])[: args.get("limit", 10)]:
             message = gmail.get(f"messages/{_message_id(item.get('id'))}", wanted)
+            if scope is not None and label not in _gmail_ops.labels_of(message):
+                continue
             pairs = [(str(h.get("name", "")), str(h.get("value", ""))) for h in message.get("payload", {}).get("headers", [])]
-            messages.append({**_about(message, _mail.headers_from_pairs(pairs)), "snippet": str(message.get("snippet", ""))[:300]})
-        return {"estimated_matches": listing.get("resultSizeEstimate"), "returned": len(messages), "messages": messages}
+            summary = _about(message, _mail.headers_from_pairs(pairs))
+            if scope is not None:
+                summary["labels"] = exposed_labels(summary["labels"], scope)
+            messages.append({**summary, "snippet": str(message.get("snippet", ""))[:300]})
+        return {"estimated_matches": listing.get("resultSizeEstimate") if scope is None else None, "returned": len(messages), "messages": messages}
 
     def fetch(args: dict[str, Any]) -> tuple[dict[str, Any], Any]:
         message_id = _message_id(args["id"])
-        size = gmail.get(f"messages/{message_id}", [("format", "minimal")]).get("sizeEstimate", 0)
+        scope = args.get(ARGUMENT)
+        def fetch_format(format):
+            try:
+                data = gmail.get(f"messages/{message_id}", [("format", format)])
+            except ConnectorError as exc:
+                if scope is not None and exc.code == "gmail_message_missing":
+                    raise denied() from None
+                raise
+            if scope is not None:
+                if data.get("id") != message_id:
+                    raise denied()
+                check_labels(data, scope)
+            return data
+
+        size = fetch_format("minimal").get("sizeEstimate", 0)
         if isinstance(size, int) and size > max_message_bytes:
             raise ConnectorError(f"The message is larger than the limit of {max_message_bytes} bytes.")
-        message = gmail.get(f"messages/{message_id}", [("format", "raw")])
+        message = fetch_format("raw")
+        if scope is not None:
+            message["labelIds"] = exposed_labels(message["labelIds"], scope)
         try:
             raw = base64.urlsafe_b64decode(str(message["raw"]) + "==")
         except (KeyError, ValueError):
@@ -242,6 +276,7 @@ def build_tools(gmail: Gmail, max_message_bytes: int, max_attachment_bytes: int,
             search_messages,
             {
                 "query": string("Gmail search query. Leave out for the most recent mail.", 500),
+                "label_id": string("Label ID from list_labels. Required when access is limited to multiple labels.", 200),
                 "limit": integer("How many messages to return, newest first.", 1, 25, 10),
             },
         ),
@@ -324,6 +359,7 @@ def main() -> None:
             max_attachment_bytes=int(setting("GMAIL_MAX_ATTACHMENT_BYTES", "5000000")),
             access=access,
         ),
+        mail_kind="gmail",
     )
 
 

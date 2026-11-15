@@ -403,6 +403,11 @@ admin:
    需要审批时核对具体内容，通过 Passkey 批准一次。审批人可选某位成员或「群组内任意成员」，与 owner 独立。
    同一连接的审批人设置适用于所有 Agent。没有写入工具的连接器只显示只读选项；现有自定义工具规则不会自动改写。
    逐工具权限和参数限制收在「高级设置」；参数限制适用于该暴露工具的所有 Agent。加入群组不会自动获得工具权限。
+   邮箱可按 Agent 限定文件夹或标签。选「仅所选文件夹／标签」后，网关从当前邮箱读取可选项；子文件夹须单独勾选。
+   IMAP 移动的源和目标都必须在范围内。Gmail 邮件须带有至少一个所选标签，搜索多个标签范围时每次指定一个标签；
+   受限 Agent 无法将 Gmail 邮件移入或移出废纸篓。发信由独立的发信权限控制。
+
+在「设置 → 个人偏好」可以切换界面语言。管理页面按管理员保存；同一浏览器中的审批页面也使用所选语言。
 
 「Agent 接入 → 改名」可修正名称中的拼写错误，同时更新该 Agent 的授权引用。原 Token、MCP 地址和群组归属不变，
 客户端无需重新配置；未完成的审批需重新发起。重用旧名称不会继承权限，历史审计记录保留当时的名称。
@@ -416,9 +421,8 @@ admin:
 Google 回调失败也会显示管理页面。iCloud Mail 登录用户名通常是 `@icloud.com` 前的部分，也可尝试完整邮箱地址；
 密码须为 [Apple App 专用密码](https://support.apple.com/en-us/102654)，设置参见 [Apple 的 IMAP 说明](https://support.apple.com/en-us/102525)。
 
-在「连接器 → 添加连接器」选择 **Gmail (Google OAuth)**。首次 [在 Google Cloud](https://console.cloud.google.com/auth/clients)
-启用 Gmail API，创建 **Web 应用** OAuth 客户端，登记网关显示的重定向 URI，再导入 Google 下载的客户端 JSON。
-选好权限后点「通过 Google 授权」：
+在「设置 → Gmail OAuth」配置一次客户端：可采用已连接 Gmail 的 OAuth 客户端，或[在 Google Cloud](https://console.cloud.google.com/auth/clients) 启用 Gmail API、创建 **Web 应用**客户端、登记网关显示的重定向 URI，再导入客户端 JSON。
+在「连接器 → 添加连接器」选择 **Gmail (Google OAuth)**，选好权限后点「通过 Google 授权」。每个邮箱独立授权；更换系统客户端后，已连接的邮箱可通过「重新授权」切换：
 - 只读：`gmail.readonly`。
 - 读取和发送：`gmail.readonly` + `gmail.send`。
 - 读取和整理／读取、整理和发送：`gmail.modify`。Gmail 的此 scope 也允许发信，网关仅在所选档位包含发送时开放发送工具。

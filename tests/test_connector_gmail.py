@@ -88,6 +88,49 @@ async def ask(client, tool: str, **arguments):
     return result
 
 
+async def test_gateway_scopes_gmail_search_ids_and_writes_to_selected_labels(tmp_path):
+    google = FakeGoogle()
+    account = google.add_account(REFRESH_A, CLIENT_ID, CLIENT_SECRET, scope=FakeGoogle.MODIFY)
+    visible = message("Selected", "a@example.test", "b@example.test", "Visible to this Agent")
+    hidden = message("Private", "a@example.test", "b@example.test", "Not in the allowed label")
+    hidden.add_attachment(b"private", maintype="text", subtype="plain")
+    google.add_message(REFRESH_A, "a1", visible.as_bytes(), ("INBOX", "Label_1", "UNREAD"))
+    google.add_message(REFRESH_A, "a2", hidden.as_bytes(), ("INBOX", "Label_2", "UNREAD"))
+    raw = base_config()
+    conn = gmail_connection("gmail-a", "person_a", google, "gmail_token_a", "a")
+    conn["env"]["GMAIL_ACCESS"] = "read_organize"
+    conn["mailbox_access"] = {"agent-a": ["Label_1"]}
+    names = TOOLS + ["list_labels", "set_message_state", "move_messages", "trash_messages"]
+    conn["tools"] = [{"upstream": n, "name": "gmail_" + n} for n in names]
+    raw["connections"] = [conn]
+    raw["policy"] = [{"principals": ["person_a"], "connection": conn["id"], "tools": ["gmail_" + n for n in names], "effect": "allow"}]
+    try:
+        async with running_gateway(await prepare(tmp_path, raw, secrets=SECRETS)) as gw:
+            async with agent(gw.url, TOKEN_A) as a:
+                async def call(tool, **arguments):
+                    return json.loads((await ask(a, "gmail_" + tool, **arguments)).content[0].text)
+
+                assert [label["id"] for label in (await call("list_labels"))["labels"]] == ["Label_1"]
+                # The fake list deliberately ignores labelIds; response filtering
+                # also protects against a stale or overly broad upstream result.
+                found = await call("search_messages", limit=10)
+                assert [entry["id"] for entry in found["messages"]] == ["a1"]
+                assert "INBOX" not in found["messages"][0]["labels"]
+                assert (await call("get_message", id="a1"))["id"] == "a1"
+                for name, args in (("get_message", {"id": "a2"}),
+                                   ("get_attachment", {"id": "a2", "index": 0}),
+                                   ("search_messages", {"label_id": "Label_2"})):
+                    assert (await a.call_tool("gmail_" + name, args)).is_error
+                changed = await call("set_message_state", ids=["a1", "a2"], read=True)
+                assert [entry["status"] for entry in changed["results"]] == ["success", "error"]
+                assert "UNREAD" in account["messages"]["a2"]["labels"]
+                moved = await call("move_messages", ids=["a1"], source="Label_1", destination="Label_2")
+                assert moved["results"][0]["code"] == "mail_scope_denied"
+                trashed = await call("trash_messages", ids=["a1"])
+                assert trashed["results"][0]["code"] == "mail_scope_denied"
+    finally:
+        google.close()
+
 async def test_search_read_and_attachments(google, tmp_path):
     async with running_gateway(await prepare(tmp_path, config(google), secrets=SECRETS)) as gw:
         async with agent(gw.url, TOKEN_A) as a:

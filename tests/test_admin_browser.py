@@ -71,6 +71,10 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
 
                 await page.get_by_role('link', name=t('Connectors','连接器'), exact=True).click()
                 await page.get_by_role('button', name=t('Add connector','添加连接器'), exact=True).click()
+                service = page.get_by_label(t('Service', '服务'), exact=True)
+                await playwright.expect(service).to_have_value('remote')
+                assert await service.locator('option').last.get_attribute('value') == 'demo'
+                await service.select_option('demo')
                 await page.get_by_label(t('Connector name','连接器名称'), exact=True).fill('browser-notes')
                 await page.get_by_role('button', name=t('Save connector','保存连接器'), exact=True).click()
                 connector = page.locator('tr[data-connection=browser-notes]')

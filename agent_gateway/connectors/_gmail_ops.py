@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 
 from ._base import ConnectorError, Tool, integer, string
+from ._mail_scope import ARGUMENT, denied, exposed_labels
 
 
 class ChangeError(ConnectorError):
@@ -30,6 +31,9 @@ def _list(gmail, timeout=30):
 def tools(gmail, message_id, *, organize):
     def list_labels(args):
         labels = _list(gmail)
+        scope = args.get(ARGUMENT)
+        if scope is not None:
+            labels = [label for label in labels if label["id"] in scope]
         query = args.get("query", "").casefold()
         labels = [label for label in labels if query in label["name"].casefold() or query in label["id"].casefold()]
         offset, limit = args.get("offset", 0), args.get("limit", 50)
@@ -47,6 +51,7 @@ def tools(gmail, message_id, *, organize):
         if not gmail.can_organize:
             raise ConnectorError("Organizing was not authorized for this Gmail connector.")
         ids = args["ids"]
+        scope = args.get(ARGUMENT)
         deadline = time.monotonic() + 15
         added, removed, source, endpoint = set(), set(), None, "modify"
 
@@ -77,6 +82,9 @@ def tools(gmail, message_id, *, organize):
                 endpoint, added = "trash", {"TRASH"}
             elif op == "restore":
                 endpoint, removed = "untrash", {"TRASH"}
+            if scope is not None and (op in ("trash", "restore") or (op != "state" and not (added | removed) <= scope)):
+                # Trash and restore can affect other labels implicitly.
+                raise denied()
         except ConnectorError as exc:
             return {"results": [rejected(item, str(exc), exc.code or "gmail_labels_unavailable", "not_attempted") for item in ids]}
 
@@ -90,22 +98,27 @@ def tools(gmail, message_id, *, organize):
                 results.append(rejected(item, message, "gmail_batch_stopped", "not_attempted"))
                 continue
             try:
-                if source:
+                if source or scope is not None:
                     message = gmail.get(f"messages/{item}", [("format", "minimal")], timeout=4)
                     if message.get("id") != item:
                         raise ConnectorError("Gmail did not confirm the source message.", "gmail_read_failed")
                     current = labels_of(message)
-                    if "TRASH" in current or "SPAM" in current or source not in current:
+                    if scope is not None and not current & scope:
+                        raise denied()
+                    if source and ("TRASH" in current or "SPAM" in current or source not in current):
                         raise ConnectorError("The message is not in the requested source, or is in Trash or Spam.", "gmail_move_source_missing")
                     if time.monotonic() >= deadline:
                         results.append(rejected(item, "This batch reached its time limit before the move.", "gmail_batch_stopped", "not_attempted"))
                         continue
                 changed = gmail.change(item, endpoint, body, added, removed)
-                results.append({"id": item, "status": "success", "labels": sorted(changed)})
+                labels = sorted(changed)
+                results.append({"id": item, "status": "success", "labels": labels if scope is None else exposed_labels(labels, scope)})
             except ChangeError as exc:
                 stopped = exc.stop
                 results.append(rejected(item, str(exc), exc.code, exc.outcome))
             except ConnectorError as exc:
+                if scope is not None and exc.code == "gmail_message_missing":
+                    exc = denied()
                 results.append(rejected(item, str(exc), exc.code or "gmail_read_failed"))
         return {"results": results}
 

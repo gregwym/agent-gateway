@@ -33,9 +33,6 @@ from .admin_remote import SPEC, make_remote
 
 CATALOG = {
     "remote": SPEC,
-    "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
-             "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
-             "probe": ("list_notes", {"folder": "inbox"})},
     "imap": {"label": "Mail / 邮箱 (IMAP + SMTP)",
              "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender",
                         "mailbox_email", "mailbox_aliases"], "secrets": ["password"],
@@ -55,6 +52,9 @@ CATALOG = {
     "reminders": {"label": "Reminders Mac helper / 提醒事项 Mac 辅助服务", "fields": ["url"], "secrets": ["token"],
                   "tools": [("reminders_lists", "lists"), ("reminders_list", "list"), ("reminders_get", "get")],
                   "probe": ("reminders_lists", {})},
+    "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
+             "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
+             "probe": ("list_notes", {"folder": "inbox"})},
 }
 
 

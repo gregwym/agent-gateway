@@ -124,7 +124,7 @@ def result(*parts: Any) -> types.CallToolResult:
     return types.CallToolResult(content=content)
 
 
-def build_server(name: str, tools: list[Tool]) -> Server[Any]:
+def build_server(name: str, tools: list[Tool], *, mail_kind: str | None = None) -> Server[Any]:
     by_name = {tool.name: tool for tool in tools}
     one_at_a_time = threading.Lock()  # one upstream connection per connector; calls take turns
 
@@ -137,11 +137,21 @@ def build_server(name: str, tools: list[Tool]) -> Server[Any]:
         tool = by_name.get(params.name)
         if tool is None:
             return text("Unknown tool.", is_error=True)
-        arguments = params.arguments or {}
+        arguments = dict(params.arguments or {})
+        scope = None
+        if mail_kind:
+            from ._mail_scope import ARGUMENT, TOOLS
+            if ARGUMENT in arguments:
+                scope = arguments.pop(ARGUMENT)
+                if (tool.name not in TOOLS[mail_kind] or not isinstance(scope, list) or not scope or
+                        len(scope) > 512 or any(not isinstance(item, str) or not 1 <= len(item) <= 200 for item in scope)):
+                    return text("This tool does not support the requested mailbox restriction.", is_error=True, code="mail_scope_denied")
         try:
             jsonschema.validate(arguments, tool.schema)
         except jsonschema.ValidationError as exc:
             return text(f"Invalid arguments: {exc.message}"[:300], is_error=True)
+        if scope is not None:
+            arguments[ARGUMENT] = frozenset(scope)
 
         def call() -> Any:
             with one_at_a_time:
@@ -162,13 +172,13 @@ def build_server(name: str, tools: list[Tool]) -> Server[Any]:
     return server
 
 
-def serve(name: str, tools: list[Tool]) -> None:
+def serve(name: str, tools: list[Tool], *, mail_kind: str | None = None) -> None:
     """Run as a stdio MCP server until the gateway closes the pipe."""
 
     async def run() -> None:
         from mcp.server.stdio import stdio_server
 
-        server = build_server(name, tools)
+        server = build_server(name, tools, mail_kind=mail_kind)
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
 

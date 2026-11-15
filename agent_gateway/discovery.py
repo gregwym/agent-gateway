@@ -100,6 +100,8 @@ def search_connections(gateway, who, args):
             continue
         item = {"connection": name, "service": conn.service, "owner": owner,
                 "tool_count": len({shared_name(r) for r in routes}), **mailbox}
+        if who.client_id in conn.mailbox_access:
+            item["mailbox_paths_restricted"] = True
         if args.get("tool"):
             item["variants"] = [{"id": r.tool.name, "description": r.exposed.description or "", "inputSchema": r.exposed.input_schema,
                                  "approval_required": gateway.policy.effect(who.principal, r.tool.name, who.client_id) == "approval_required"}

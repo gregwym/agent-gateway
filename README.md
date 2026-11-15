@@ -45,6 +45,8 @@ aggregate service data, or call an LLM. It uses the official
   reconcile on upgrade; new tools stay denied and existing restrictions are preserved.
 - **Argument restrictions.** Fixed parameters and allowed values constrain resources
   such as a mailbox or calendar. Callers cannot override fixed parameters.
+- **Mailbox access.** Restrict each agent to selected IMAP folders or Gmail
+  labels. Pick them from the connected mailbox in the permission editor.
 - **Web administration.** Passkey onboarding, members, agent tokens, connector setup,
   permission editing and connection checks. Changes apply atomically after active
   calls finish.

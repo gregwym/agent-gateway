@@ -49,7 +49,7 @@ from . import __version__
 from .approval import NOT_EXECUTED, ApprovalRequest, Approver, DenyAllApprover, arguments_digest
 from .audit import Audit
 from .auth import StaticTokenVerifier, caller_of
-from .config import Config, ConnectionCfg, ToolCfg
+from .config import Config, ConnectionCfg, ToolCfg, is_mail_send
 from .credentials import Scrubber
 from .lock import Lock
 from .policy import Policy
@@ -319,9 +319,22 @@ class Gateway:
             return _error(f"Invalid arguments: {failure.message[:300]}")
 
         final_arguments = {**arguments, **route.tool.pin}
+        scope = route.conn.mailbox_access.get(who.client_id)
+        upstream_arguments = final_arguments
+        if scope is not None and not is_mail_send(route.conn, route.tool):
+            from .catalog_sync import bundled_kind
+            from .connectors._mail_scope import ARGUMENT, TOOLS, in_folder
+            kind = bundled_kind(route.conn)
+            if (route.tool.upstream not in TOOLS.get(kind, ()) or
+                    (kind == "imap" and route.tool.upstream != "list_mailboxes" and
+                     (not in_folder(final_arguments.get("mailbox", "INBOX"), scope) or
+                      ("destination" in final_arguments and not in_folder(final_arguments["destination"], scope))))):
+                done("deny", "mail_scope_denied")
+                return _error("This action is outside the Agent's allowed mailbox folders or labels.")
+            upstream_arguments = {**final_arguments, ARGUMENT: scope}
 
         if effect != "approval_required":
-            return await self._run(route, final_arguments, done, "ok")
+            return await self._run(route, upstream_arguments, done, "ok")
 
         request = ApprovalRequest(
             principal=who.principal,
@@ -352,7 +365,7 @@ class Gateway:
             done(decision_, reason, approval=approval, **extra)
 
         try:
-            return await self._run(route, final_arguments, approved_done, "approved")
+            return await self._run(route, upstream_arguments, approved_done, "approved")
         finally:
             if approval is not None:
                 with anyio.CancelScope(shield=True):

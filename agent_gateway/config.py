@@ -174,6 +174,13 @@ class ToolCfg(_Model):
         return self
 
 
+def valid_mailbox_paths(paths):
+    return (isinstance(paths, list) and 1 <= len(paths) <= 512
+            and all(isinstance(path, str) and 1 <= len(path) <= 200
+                    and not any(ord(char) < 32 or ord(char) == 127 for char in path) for path in paths)
+            and len(set(paths)) == len(paths))
+
+
 class ConnectionCfg(_Model):
     """One upstream MCP server bound to one account of one service."""
 
@@ -185,6 +192,7 @@ class ConnectionCfg(_Model):
     approver: str | None = None
     mailbox_email: str | None = None
     mailbox_aliases: list[str] = Field(default_factory=list, max_length=50)
+    mailbox_access: dict[str, list[str]] = Field(default_factory=dict, max_length=100)
     transport: Literal["stdio", "http"]
 
     # stdio
@@ -215,6 +223,13 @@ class ConnectionCfg(_Model):
     @model_validator(mode="after")
     def _check(self) -> ConnectionCfg:
         where = f"connection {self.id}"
+        if self.mailbox_access:
+            from .catalog_sync import bundled_kind
+            if bundled_kind(self) not in ("imap", "gmail"):
+                raise ValueError(f"{where}: folder permissions require a bundled mail connector")
+            for paths in self.mailbox_access.values():
+                if not valid_mailbox_paths(paths):
+                    raise ValueError(f"{where}: invalid mailbox folder or label selection")
         if self.transport == "stdio":
             if not self.command:
                 raise ValueError(f"{where}: stdio transport needs a command")
@@ -334,6 +349,10 @@ class Config(_Model):
                 raise ValueError("managed OAuth requires web administration")
             if conn.owner not in known:
                 raise ValueError(f"connection {conn.id}: unknown owner {conn.owner!r}")
+            for client_id in conn.mailbox_access:
+                client = next((c for c in self.clients if c.id == client_id), None)
+                if client is None or (homes and client.household != self.household_of(conn.owner)):
+                    raise ValueError(f"connection {conn.id}: invalid Agent for folder permissions")
             if conn.approver is not None:
                 if conn.approver not in known:
                     raise ValueError(f"connection {conn.id}: unknown approver")

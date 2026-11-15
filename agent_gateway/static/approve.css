@@ -21,3 +21,5 @@ button:disabled { opacity: 0.5; }
 .notice { font-weight: 600; }
 .ok { color: var(--go); }
 .bad { color: var(--stop); }
+.language { display: flex; justify-content: flex-end; align-items: center; gap: 0.5rem; max-width: 34rem; margin: 0 auto; padding: 0.8rem 1rem 0; color: var(--muted); font-size: 0.85rem; }
+.language select { color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 0.35rem 0.6rem; font: inherit; }

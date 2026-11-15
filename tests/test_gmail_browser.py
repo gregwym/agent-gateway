@@ -1,11 +1,13 @@
 """Gmail setup chooses the Google grant separately from Agent access."""
 import json
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
 import pytest
 
 from agent_gateway.admin_oauth import PROFILE, TOKEN, GoogleConsent
+from agent_gateway.connectors._base import result
 from agent_gateway.gmail_scopes import SCOPES
 from test_admin_feedback_browser import admin_page, playwright
 
@@ -41,11 +43,9 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         for name, expected in [('host', 'imap.gmail.com'), ('port', '993'), ('smtp_host', 'smtp.gmail.com'), ('smtp_port', '587'), ('smtp_security', 'starttls')]:
             await playwright.expect(box.locator(f'[name={name}]')).to_have_value(expected)
         await service.select_option('gmail')
-        await box.get_by_label(t('Connector name', '连接器名称'), exact=True).fill('gmail-browser')
-        scope = box.get_by_label(t('Google permissions', 'Google 权限'), exact=True)
-        await playwright.expect(scope).to_have_value('read')
-        await playwright.expect(box.locator('input[name=refresh_token]')).to_be_hidden()
-        await playwright.expect(box.locator('input[name=client_secret]')).to_be_hidden()
+        await box.get_by_role('link', name=t('Set up Gmail OAuth in Settings', '在「设置」中配置 Gmail OAuth'), exact=True).click()
+        assert page.url == origin + '/admin/settings'
+        await page.get_by_role('button', name=t('Configure OAuth client', '配置 OAuth 客户端'), exact=True).click()
         upload = box.get_by_label(t('Google OAuth client JSON', 'Google OAuth 客户端 JSON'), exact=True)
 
         async def import_json(data):
@@ -57,6 +57,17 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         await import_json({'web': {'client_id': 'test-web-client', 'client_secret': 'fake-client-secret',
                                    'token_uri': 'https://untrusted.invalid/token'}})
         await playwright.expect(box.get_by_role('status')).to_contain_text(t('OAuth client loaded', '已导入 OAuth 客户端'))
+        await box.get_by_role('button', name=t('Save OAuth client', '保存 OAuth 客户端'), exact=True).click()
+        await playwright.expect(box).to_have_count(0)
+        assert 'fake-client-secret' not in await page.locator('body').inner_text()
+
+        await page.get_by_role('link', name=t('Connectors', '连接器'), exact=True).click()
+        await add.click()
+        await service.select_option('gmail')
+        await box.get_by_label(t('Connector name', '连接器名称'), exact=True).fill('gmail-browser')
+        await playwright.expect(box.locator('input[type=file],input[type=password]')).to_have_count(0)
+        scope = box.get_by_label(t('Google permissions', 'Google 权限'), exact=True)
+        await playwright.expect(scope).to_have_value('read')
         await scope.select_option(access)
         if access == 'read_organize':
             await playwright.expect(box.locator('.gmail-scope-note')).to_contain_text('gmail.modify')
@@ -77,3 +88,36 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         assert 'fake-refresh-token' not in await page.locator('body').inner_text()
         await row.get_by_role('button', name=t('Edit settings', '编辑设置'), exact=True).click()
         await playwright.expect(scope).to_have_value(access)
+        await box.get_by_role('button', name=t('Save connector', '保存连接器'), exact=True).click()
+        await playwright.expect(box).to_have_count(0)
+        assert page.url == origin + '/admin/connections'
+
+        @asynccontextmanager
+        async def upstream(conn, secrets, oauth):
+            assert conn.id == 'gmail-browser'
+
+            class Labels:
+                async def call_tool(self, tool, arguments):
+                    assert tool == 'list_labels'
+                    return result({'labels': [{'id': 'Label_1', 'name': 'Orders/Receipts'}], 'next_offset': None})
+
+            yield Labels()
+
+        monkeypatch.setattr('agent_gateway.admin.open_client', upstream)
+        await page.get_by_role('link', name=t('Permissions', '权限'), exact=True).click()
+        await row.get_by_role('button', name=t('Edit access', '编辑权限'), exact=True).click()
+        await box.get_by_label(t('Connection access', '连接权限'), exact=True).select_option('read')
+        folders = box.get_by_label(t('Gmail labels', 'Gmail 标签'), exact=True)
+        await folders.select_option('selected')
+        await box.get_by_role('checkbox', name='Orders/Receipts').check()
+        await box.get_by_role('button', name=t('Save connection access', '保存连接权限'), exact=True).click()
+        await playwright.expect(box.get_by_role('checkbox', name='Orders/Receipts')).to_be_checked()
+        await box.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
+
+        await page.get_by_role('link', name=t('Settings', '设置'), exact=True).click()
+        language = page.get_by_label(t('Interface language', '界面语言'), exact=True)
+        await language.select_option('en' if locale == 'zh-CN' else 'zh-CN')
+        await page.get_by_role('button', name=t('Save language', '保存语言'), exact=True).click()
+        await playwright.expect(page.locator('html')).to_have_attribute('lang', 'en' if locale == 'zh-CN' else 'zh-CN')
+        await page.reload()
+        await playwright.expect(page.get_by_role('heading', name=t('设置', 'Settings'), exact=True)).to_be_visible()
