@@ -27,9 +27,12 @@ def socket_dir():
 
 
 def fake_browser(monkeypatch, *, screenshot=None, localized=False):
-    backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100}
+    backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": [], "changed_page": False}
 
     def fetch(host, target, headers, receive):
+        backend["reads"].append(target)
+        if backend["changed_page"]:
+            return response(receive, b"<main>Changed order page</main>")
         if headers.get("Cookie") != "auth=" + SECRET or not backend["auth"]:
             return response(receive, status=302, location="/ap/signin")
         if localized:
@@ -52,6 +55,8 @@ def fake_browser(monkeypatch, *, screenshot=None, localized=False):
         if action == "cookies":
             site = "www.weee.com" if localized else "www.amazon.com"
             assert data["origin"] == "https://" + site
+            if not backend["cookie_ready"]:
+                return {"cookies": []}
             return {"cookies": [{"name": "auth", "domain": site, "value": SECRET},
                                 {"name": "auth", "domain": "evil.test", "value": "unrelated-password"}]}
         return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"]}
@@ -63,7 +68,7 @@ def fake_browser(monkeypatch, *, screenshot=None, localized=False):
 
 
 @pytest.mark.parametrize("plugin", ["amazon-us", "weee-orders"])
-async def test_verified_website_login_is_private_and_atomic(tmp_path, socket_dir, monkeypatch, plugin):
+async def test_website_session_save_is_private_and_independent_of_read_checks(tmp_path, socket_dir, monkeypatch, plugin):
     monkeypatch.setenv("AGW_BROWSER_SOCKET", str(socket_dir / "control.sock"))
     backend = fake_browser(monkeypatch, localized=plugin == "weee-orders")
     async with web_gateway(tmp_path) as (gw, http, origin, config):
@@ -82,25 +87,33 @@ async def test_verified_website_login_is_private_and_atomic(tmp_path, socket_dir
         assert bad.status_code == 400
         typed = "secret-simulated-typed-password"
         assert (await http.post("/admin/api/web-login/text", json={**ref, "text": typed})).status_code == 200
+        backend["cookie_ready"] = False
         failure = await http.post("/admin/api/web-login/save", json=ref)
         assert failure.status_code == 422 and failure.json()["error"] == "web_browser_sign_in_required", failure.text
         assert not any(c["id"] == form["id"] for c in (await state(http))["connections"])
-        backend["auth"] = True
+        backend["cookie_ready"] = True
+        backend["changed_page"] = True
         saved = await http.post("/admin/api/web-login/save", json=ref)
         assert saved.status_code == 200, saved.text
+        assert not backend["reads"]
         assert backend["actions"][-1] == "close"
         assert (await http.post("/admin/api/web-login/frame", json=ref)).json()["error"] == "web_browser_expired"
         settings = await state(http)
         conn = next(c for c in settings["connections"] if c["id"] == form["id"])
-        assert conn["test"]["ok"] and conn["access"]["agent-a"] == "none"
+        assert conn["test"] is None and conn["access"]["agent-a"] == "none"
         assert len(conn["tools"]) == (1 if plugin == "weee-orders" else 2)
         assert all(t["access"] == "read" for t in conn["tools"])
         assert SECRET.encode() not in (tmp_path / "admin.enc").read_bytes()
         assert all(s not in str(settings) + gw.audit_text() for s in (SECRET, typed, "unrelated-password"))
+        before = (tmp_path / "admin.enc").read_bytes()
+        mismatch = await http.post("/admin/api/connections/test", json={"id": conn["id"]})
+        assert mismatch.status_code == 422 and mismatch.json()["error"] == "web_profile_mismatch"
+        assert backend["reads"] and (tmp_path / "admin.enc").read_bytes() == before
+        backend["changed_page"], backend["auth"] = False, True
+        assert (await http.post("/admin/api/connections/test", json={"id": conn["id"]})).status_code == 200
         refreshed = await change(http, "web-login/start", **form)
         assert refreshed.status_code == 200, refreshed.text
-        backend["auth"] = False
-        before = (tmp_path / "admin.enc").read_bytes()
+        backend["cookie_ready"] = False
         failure = await http.post("/admin/api/web-login/save", json={"id": refreshed.json()["id"]})
         assert failure.status_code == 422
         assert (tmp_path / "admin.enc").read_bytes() == before
@@ -175,9 +188,10 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         await login_box.get_by_role("button", name="输入", exact=True).tap()
         await playwright.expect(login_box.get_by_label("输入到选中的框")).to_have_value("")
         backend["auth"] = True
-        await login_box.get_by_role("button", name="保存连接", exact=True).tap()
+        await login_box.get_by_role("button", name="保存会话", exact=True).tap()
         row = page.locator('tr[data-connection="amazon-orders"]')
-        await playwright.expect(row).to_be_visible()
+        await playwright.expect(row).to_contain_text("会话已保存 · 待读取验证")
+        assert not backend["reads"]
         assert backend["inputs"] == ["demo-only-login"] and "tap" in backend["actions"]
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         if directory := os.environ.get("AGW_TEST_ARTIFACTS"):

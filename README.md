@@ -140,9 +140,10 @@ endpoints. OAuth tokens stay encrypted and refresh automatically.
 
 Host-installed [connector manifests](docs/deployment.md#connector-plugins)
 add stdio MCP servers, fixed CLI operations, and read-only website profiles.
-Sign in to a website from the admin page on a phone or computer. Gateway verifies
-a read and stores the session per account; agents never receive browser cookies. Amazon US and Weee! profiles are experimental; authenticated reads have
-only been tested against simulated sites.
+Sign in to a website from the admin page on a phone or computer. Save the session
+per account and test order access separately. Agents never receive browser cookies.
+Amazon US and Weee! profiles are experimental; authenticated reads have only
+been tested against simulated sites.
 
 See [product requirements](docs/requirements.md) and
 [remote connection setup](docs/deployment.md#remote-mcp).

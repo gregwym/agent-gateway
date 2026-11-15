@@ -16,7 +16,7 @@ import httpx2 as httpx
 from .admin_config import CONNECTOR_NAME, kind_of, make_connection
 from .browser_tunnel import connect
 from .browser_worker import HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
-from .connectors.web import ConnectorError, SiteSession, import_session
+from .connectors.web import import_session
 from .lock import definition_of
 from .passkey import Refused
 from .plugins import connector_plugins
@@ -183,23 +183,8 @@ class WebsiteLogin:
             candidate = import_session(json.dumps(cookies), profile)
         except (ValueError, RecursionError):
             raise Refused("web_browser_sign_in_required", 422) from None
-        del cookies
-        # Read via the actual HTTP connector, using only candidate cookies. An
-        # expired, blocked or incompatible page must never replace a good session.
-        def verify():
-            reader = SiteSession(profile, candidate)
-            reader.read(profile.actions[profile.probe], {})
-            return json.dumps([{**cookie, "domain": reader.host} for cookie in json.loads(reader._cookies())])
-
-        try:
-            with anyio.fail_after(26):
-                candidate = await anyio.to_thread.run_sync(verify, abandon_on_cancel=True)
-        except TimeoutError:
-            raise Refused("connector_timeout", 422) from None
-        except ConnectorError as exc:
-            raise Refused("web_browser_sign_in_required" if exc.code == "web_login_required" else exc.code, 422) from None
-        if candidate == "[]":
-            raise Refused("web_browser_sign_in_required", 422)
+        # Session capture is independent of the site's read profile. The admin
+        # can test it later without repeating login if the order page changed.
         form = flow["body"]
         async with admin.editing():
             admin.auth.session(token)
@@ -221,6 +206,5 @@ class WebsiteLogin:
                     definitions = {t.name: definition_of(t) for t in await list_all_tools(client)}
                 admin.stage_website(state, cfg, conn, added, definitions)
                 result = await admin._commit(state, "web-login/save")
-            admin.tests[conn.id] = {"ok": True, "at": int(time.time()), "reason": "ok", "incident": None}
         await self.close()
         return result

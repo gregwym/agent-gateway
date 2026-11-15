@@ -182,7 +182,7 @@ const messages = {
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   web_session_busy: ['Another read is in progress. Try again shortly.', '正在读取这个网站，请稍后重试。'],
   web_session_storage_failed: ['The updated session could not be saved. Check the gateway storage and import a fresh session.', '更新后的会话无法保存。请检查网关存储，再导入新会话。'],
-  web_browser_sign_in_required: ['The order page still requires sign-in. Finish signing in above and try again.', '订单页仍要求登录。请在上方完成登录后再保存。'],
+  web_browser_sign_in_required: ['No session for this website was available to save. Finish signing in and try again.', '没有可保存的该网站会话。请完成登录后再保存。'],
   web_browser_unavailable: ['The sign-in browser could not start. Check the Gateway browser service.', '登录浏览器无法启动，请检查网关的浏览器服务。'],
   web_browser_in_use: ['Another website sign-in is already open. Close it or wait for it to expire.', '已有一个网站登录窗口。请关闭它或等待过期。'],
   web_browser_expired: ['This sign-in window expired. Open a new one and try again.', '此次登录窗口已过期，请重新打开。'],
@@ -673,6 +673,7 @@ function connectionStatus(parent, conn) {
   const [label, style] = failed ? [remote ? tr('MCP check failed', 'MCP 验证失败') : tr('Read check failed', '读取验证失败'), 'bad'] :
     conn.oauth?.error ? [tr('Authorization error', '授权异常'), 'bad'] :
     conn.test?.ok ? [remote ? tr('MCP check passed', 'MCP 验证通过') : tr('Read check passed', '读取验证通过'), ''] :
+    conn.kind === 'web' ? [tr('Session saved · Read not tested', '会话已保存 · 待读取验证'), 'warn'] :
     conn.connected ? [tr('Not yet tested', '待验证'), 'warn'] : [tr('Connecting', '连接中'), 'warn'];
   el(parent, 'span', label, ('badge ' + style).trim());
   if (conn.available_tools?.length && parent.matches('td')) el(parent, 'small', tr('Tools to review', '有工具待审阅'));
@@ -1119,7 +1120,7 @@ function showWebsiteLogin(flow, connector) {
   close.className = 'login-close';
   bar.append(close);
   const host = el(bar, 'p', flow.host, 'login-host');
-  button(bar, tr('Save connection', '保存连接'), () => perform('save'), 'primary', tr('Checking orders…', '正在检查订单…'));
+  button(bar, tr('Save session', '保存会话'), () => perform('save'), 'primary', tr('Saving…', '正在保存…'));
   const viewer = el(box, 'div', undefined, 'login-view');
   const picture = el(viewer, 'img', undefined, 'login-frame');
   picture.width = flow.width; picture.height = flow.height; picture.draggable = false;
@@ -1171,7 +1172,7 @@ function showWebsiteLogin(flow, connector) {
         box.close();
         connector.close();
         await refresh();
-        notify(tr('Website connected. Grant access under Permissions.', '网站已连接。请在「权限」中授予 Agent 访问。'));
+        notify(tr('Session saved. Use Test connection to check order access.', '会话已保存。可用「验证连接」检查订单能否读取。'));
       } else frame(result);
     } finally { busy = false; send.disabled = false; }
   }
