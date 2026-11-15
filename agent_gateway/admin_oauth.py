@@ -18,6 +18,40 @@ TOKEN = "https://oauth2.googleapis.com/token"
 PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 
 
+def _profile_error(response):
+    """Translate known Gmail reasons without sending provider text to the browser."""
+    status = response.status_code
+    if status == 401:
+        return "oauth_profile_token_rejected"
+    if status == 429:
+        return "oauth_profile_rate_limit"
+    if status >= 500:
+        return "oauth_profile_unavailable"
+    try:
+        error = response.json().get("error", {})
+    except (ValueError, AttributeError):
+        error = {}
+    reasons = set()
+    if isinstance(error, dict):
+        for field in ("errors", "details"):
+            entries = error.get(field)
+            if isinstance(entries, list):
+                for item in entries:
+                    if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                        reasons.add(item["reason"])
+    for keys, code in (
+        ({"SERVICE_DISABLED", "accessNotConfigured"}, "oauth_profile_api_disabled"),
+        ({"domainPolicy"}, "oauth_profile_domain_policy"),
+        ({"ACCESS_TOKEN_SCOPE_INSUFFICIENT", "insufficientPermissions"}, "oauth_profile_scope_rejected"),
+        ({"dailyLimitExceeded"}, "oauth_profile_project_quota"),
+        ({"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}, "oauth_profile_rate_limit"),
+        ({"failedPrecondition"}, "oauth_profile_mailbox_unavailable"),
+    ):
+        if keys & reasons:
+            return code
+    return "oauth_profile_forbidden" if status == 403 else "oauth_profile_rejected"
+
+
 class ConsentSessions:
     def _active(self, flow):
         now = int(time.time())
@@ -97,7 +131,7 @@ class GoogleConsent(ConsentSessions):
                 profile.raise_for_status()
                 email = email_address(profile.json().get("emailAddress"))
                 if not email:
-                    raise Refused("oauth_failed", 400)
+                    raise Refused("oauth_invalid_response", 400)
             flow["body"]["credentials"]["refresh_token"] = token["refresh_token"]
             flow["account"] = email
             flow["phase"] = "ready"
@@ -110,13 +144,16 @@ class GoogleConsent(ConsentSessions):
             elif isinstance(exc, httpx2.TransportError):
                 reason = "oauth_network_failed"
             elif isinstance(exc, httpx2.HTTPStatusError):
-                reason = "oauth_profile_rejected" if str(exc.request.url) == PROFILE else "oauth_failed"
-                try:
-                    reason = {"invalid_client": "oauth_client_rejected", "unauthorized_client": "oauth_client_rejected",
-                              "invalid_grant": "oauth_code_rejected", "redirect_uri_mismatch": "oauth_code_rejected"}.get(
-                                  exc.response.json().get("error"), reason)
-                except (ValueError, AttributeError, TypeError):
-                    pass
+                if str(exc.request.url) == PROFILE:
+                    reason = _profile_error(exc.response)
+                else:
+                    reason = "oauth_failed"
+                    try:
+                        reason = {"invalid_client": "oauth_client_rejected", "unauthorized_client": "oauth_client_rejected",
+                                  "invalid_grant": "oauth_code_rejected", "redirect_uri_mismatch": "oauth_code_rejected"}.get(
+                                      exc.response.json().get("error"), reason)
+                    except (ValueError, AttributeError, TypeError):
+                        pass
             else:
                 reason = "oauth_invalid_response"
             flow["error"] = reason

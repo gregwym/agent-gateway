@@ -14,7 +14,7 @@ pytestmark = pytest.mark.anyio
 
 @pytest.mark.parametrize('failure,expected', [
     ('invalid_client', 'oauth_client_rejected'), ('invalid_grant', 'oauth_code_rejected'),
-    ('network', 'oauth_network_failed'), ('timeout', 'oauth_timeout'), ('profile', 'oauth_profile_rejected'),
+    ('network', 'oauth_network_failed'), ('timeout', 'oauth_timeout'), ('profile', 'oauth_profile_forbidden'),
 ])
 async def test_google_failures_report_the_specific_step_without_provider_text(tmp_path, failure, expected):
     async with web_gateway(tmp_path) as (gw, http, origin, path):
@@ -35,6 +35,45 @@ async def test_google_failures_report_the_specific_step_without_provider_text(tm
         response = await http.post('/admin/api/oauth/complete', json={'id': flow})
         assert response.status_code == 400 and response.json()['error'] == expected
         assert 'private-' not in response.text + gw.audit_text()
+
+
+@pytest.mark.parametrize('status,field,reason,expected', [
+    (403, 'details', 'SERVICE_DISABLED', 'oauth_profile_api_disabled'),
+    (403, 'errors', 'accessNotConfigured', 'oauth_profile_api_disabled'),
+    (403, 'errors', 'domainPolicy', 'oauth_profile_domain_policy'),
+    (403, 'details', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT', 'oauth_profile_scope_rejected'),
+    (403, 'errors', 'dailyLimitExceeded', 'oauth_profile_project_quota'),
+    (403, 'errors', 'userRateLimitExceeded', 'oauth_profile_rate_limit'),
+    (400, 'errors', 'failedPrecondition', 'oauth_profile_mailbox_unavailable'),
+    (401, None, None, 'oauth_profile_token_rejected'),
+    (403, 'details', 'private-new-reason', 'oauth_profile_forbidden'),
+    (429, None, None, 'oauth_profile_rate_limit'),
+    (503, None, None, 'oauth_profile_unavailable'),
+])
+async def test_google_profile_reports_the_provider_reason_in_organize_mode(tmp_path, status, field, reason, expected):
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        query = await start(http, 'read_organize')
+
+        def handle(request):
+            if str(request.url) == TOKEN:
+                return httpx2.Response(200, json={'access_token': 'private-access-token',
+                                                   'scope': MODIFY_SCOPE, 'refresh_token': 'private-refresh'})
+            assert str(request.url) == PROFILE
+            if not field:
+                return httpx2.Response(status, text='private-non-json-error')
+            error = {'message': 'private-raw-message', field: [
+                {'reason': reason, 'metadata': {'consumer': 'private-project'}}]}
+            return httpx2.Response(status, json={'error': error})
+
+        gw.app.state.admin.google._http = lambda: httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+        flow = query['state'][0]
+        callback = await http.get('/admin/oauth/google/callback', params={'state': flow, 'code': 'fake-code'})
+        assert callback.status_code == 303
+        response = await http.post('/admin/api/oauth/complete', json={'id': flow})
+        assert response.status_code == 400 and response.json() == {'error': expected}
+        assert 'private-' not in response.text + gw.audit_text()
+        assert not any(c['id'] == 'google-mail' for c in (await state(http))['connections'])
 
 
 async def start(http, access='read'):
