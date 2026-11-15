@@ -13,6 +13,7 @@ from .lock import definition_of
 from .oauth import https_url, oauth_error
 from .passkey import Refused
 from .upstream import list_all_tools, open_client
+from .web_errors import leaves
 
 
 class MCPConsent(ConsentSessions):
@@ -61,7 +62,9 @@ class MCPConsent(ConsentSessions):
             self.sweep()
             raise Refused("oauth_timeout", 504) from None
         if flow.get("error"):
-            raise Refused(flow["error"], 422)
+            self.controller.oauth.discard(ref)
+            del self.flows[key]
+            raise Refused(flow["error"], 422, incident=flow.get("incident"))
         return {"url": flow["url"]}
 
     async def _run(self, key, conn):
@@ -87,7 +90,13 @@ class MCPConsent(ConsentSessions):
                     raise Refused("oauth_not_required", 400)
                 flow["phase"] = "ready"
         except Exception as exc:
-            flow.update(phase="failed", error=oauth_error(exc))
+            reason = oauth_error(exc)
+            incident = secrets.token_hex(6)
+            self.controller.runtime.gateway.audit.write(
+                "admin_oauth_failed", connection=conn.id, reason=reason,
+                detail=f"{incident}:{type(leaves(exc)[0]).__name__}",
+            )
+            flow.update(phase="failed", error=reason, incident=incident)
         finally:
             flow["started"].set()
             flow["done"].set()
@@ -120,7 +129,7 @@ class MCPConsent(ConsentSessions):
         if flow.get("error"):
             self.controller.oauth.discard(flow["ref"])
             del self.flows[key]
-            raise Refused(flow["error"], 400)
+            raise Refused(flow["error"], 400, incident=flow.get("incident"))
         if flow["phase"] != "ready":
             raise Refused("oauth_not_ready", 409)
         del self.flows[key]

@@ -40,6 +40,13 @@ async def test_browser_remote_oauth_review_errors_and_revoke(tmp_path, monkeypat
                 await page.get_by_label(t('Service','服务'), exact=True).select_option('remote')
                 await page.get_by_label(t('Connector name','连接器名称'), exact=True).fill('browser-remote')
                 await page.get_by_label(t('MCP endpoint URL','MCP 接口地址'), exact=True).fill(URL)
+                issuer = page.get_by_label('Issuer', exact=True)
+                advanced = page.get_by_text(t('Advanced OAuth settings', 'OAuth 高级设置'), exact=True)
+                await playwright.expect(issuer).to_be_hidden()
+                await advanced.click()
+                await playwright.expect(issuer).to_be_visible()
+                await advanced.click()
+                await playwright.expect(issuer).to_be_hidden()
                 await page.get_by_role('button', name=t('Preview tools','预览工具'), exact=True).click()
                 await playwright.expect(page.get_by_role('heading', name=t('Review tool definitions','审阅工具定义'), exact=True)).to_be_visible()
                 assert 'mcp_oauth=' not in page.url

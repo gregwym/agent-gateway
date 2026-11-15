@@ -644,14 +644,17 @@ function connectorForm(existing) {
       const tokenBox = el(dynamic, 'div'), headerBox = el(dynamic, 'div'), oauthBox = el(dynamic, 'div');
       credentials.token = field(tokenBox, tr('Token / API key', 'Token / API 密钥'), 'token', '', 'password', existing ? tr('Blank keeps the saved value only when the endpoint is unchanged.', '接口地址未变时，留空保留原值。') : '');
       settings.header = field(headerBox, tr('Credential header', '凭据 Header'), 'header', existing?.settings.header || 'X-API-Key');
-      el(oauthBox, 'p', tr('The gateway discovers the authorization server. Leave client fields blank for automatic registration, or enter a registered client and its issuer. Callback URL:', '网关会发现授权服务器。可留空客户端字段以自动注册，也可填写已注册客户端及其 issuer。回调地址：'), 'hint');
-      el(oauthBox, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
-      settings.issuer = field(oauthBox, 'Issuer', 'issuer', existing?.settings.issuer || '');
-      settings.client_id = field(oauthBox, tr('OAuth client ID (optional)', 'OAuth 客户端 ID（可选）'), 'client_id', existing?.settings.client_id || '');
-      credentials.client_secret = field(oauthBox, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password', existing ? tr('Leave blank to keep the saved value for this client.', '同一客户端留空保留原值。') : '');
-      settings.auth_method = select(oauthBox, tr('Client authentication', '客户端认证'), 'auth_method', [['none', tr('Public client (no secret)', '公共客户端（无密钥）')], ['client_secret_post', 'Client secret in POST'], ['client_secret_basic', 'Client secret in Basic header']], existing?.settings.auth_method || 'none');
-      settings.scope = field(oauthBox, tr('Scopes (optional, space separated)', 'Scope（可选，用空格分隔）'), 'scope', existing?.settings.scope || '', 'text', tr('Blank uses the scopes requested by the MCP server. Review them on the authorization page.', '留空使用 MCP 服务器要求的范围，请在授权页面核对。'));
-      settings.client_metadata_url = field(oauthBox, tr('Client metadata URL (optional)', '客户端元数据 URL（可选）'), 'client_metadata_url', existing?.settings.client_metadata_url || '', 'text', tr('For providers supporting URL-based client registration. Use instead of a client ID.', '用于支持 URL 客户端注册的服务商，与客户端 ID 二选一。'));
+      el(oauthBox, 'p', tr('Select Preview tools to sign in with the provider. Client settings are filled automatically when supported.', '点击「预览工具」前往服务商登录。支持自动注册的服务会由网关填写客户端设置。'), 'hint');
+      const advancedOAuth = el(oauthBox, 'details');
+      el(advancedOAuth, 'summary', tr('Advanced OAuth settings', 'OAuth 高级设置'));
+      el(advancedOAuth, 'p', tr('Register this callback URL with the provider if you use a pre-registered client.', '使用预先注册的客户端时，请在服务商处登记此回调地址。'), 'muted');
+      el(advancedOAuth, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
+      settings.issuer = field(advancedOAuth, 'Issuer', 'issuer', existing?.settings.issuer || '');
+      settings.client_id = field(advancedOAuth, tr('OAuth client ID (optional)', 'OAuth 客户端 ID（可选）'), 'client_id', existing?.settings.client_id || '');
+      credentials.client_secret = field(advancedOAuth, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password', existing ? tr('Leave blank to keep the saved value for this client.', '同一客户端留空保留原值。') : '');
+      settings.auth_method = select(advancedOAuth, tr('Client authentication', '客户端认证'), 'auth_method', [['none', tr('Public client (no secret)', '公共客户端（无密钥）')], ['client_secret_post', 'Client secret in POST'], ['client_secret_basic', 'Client secret in Basic header']], existing?.settings.auth_method || 'none');
+      settings.scope = field(advancedOAuth, tr('Scopes (optional, space separated)', 'Scope（可选，用空格分隔）'), 'scope', existing?.settings.scope || '', 'text', tr('Blank uses the scopes requested by the MCP server. Review them on the authorization page.', '留空使用 MCP 服务器要求的范围，请在授权页面核对。'));
+      settings.client_metadata_url = field(advancedOAuth, tr('Client metadata URL (optional)', '客户端元数据 URL（可选）'), 'client_metadata_url', existing?.settings.client_metadata_url || '', 'text', tr('For providers supporting URL-based client registration. Use instead of a client ID.', '用于支持 URL 客户端注册的服务商，与客户端 ID 二选一。'));
       function authFields() { tokenBox.hidden = !['bearer', 'header'].includes(settings.auth.value); headerBox.hidden = settings.auth.value !== 'header'; oauthBox.hidden = settings.auth.value !== 'oauth'; }
       settings.auth.addEventListener('change', authFields); authFields();
       el(dynamic, 'p', tr('Preview initializes MCP and lists tools; it does not execute a tool. You choose which tools to expose and classify each as read or write.', '预览只初始化 MCP 并列出工具，不执行工具。你可以选择开放的工具，并标明读取或写入。'), 'hint');

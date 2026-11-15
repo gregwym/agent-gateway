@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 import anyio
 import httpx2
 from mcp.client.auth.oauth2 import OAuthClientProvider
-from mcp.client.auth.utils import extract_field_from_www_auth
+from mcp.client.auth.utils import create_client_registration_request, extract_field_from_www_auth
 from mcp.client.auth.exceptions import OAuthFlowError, OAuthRegistrationError, OAuthTokenError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 
@@ -76,13 +76,18 @@ class OAuthVault:
             self.sensitive.add(secret)
 
     def create(self, url, redirect, settings, client_secret=""):
+        scope = settings.get("scope") or None
+        # Linear's read-only endpoint advertises "read write" in the challenge
+        # even though its protected resource metadata lists only "read".
+        if scope is None and url == "https://mcp.linear.app/mcp/readonly":
+            scope = "read"
         ref = secrets.token_hex(32)
         metadata = OAuthClientMetadata(redirect_uris=[redirect], client_name="Agent Gateway", application_type="web",
                                       token_endpoint_auth_method=settings.get("auth_method") or "none",
-                                      scope=settings.get("scope") or None)
+                                      scope=scope)
         record = {"url": url, "metadata": metadata.model_dump(mode="json"), "tokens": {}, "expires": None,
                   "created": time.time(), "issuer": settings.get("issuer") or None,
-                  "requested_scope": settings.get("scope") or None,
+                  "requested_scope": scope,
                   "client_metadata_url": settings.get("client_metadata_url") or None}
         if settings.get("client_id"):
             if not record["issuer"]:
@@ -275,18 +280,30 @@ class ManagedOAuth(OAuthClientProvider):
                     https_url(str(outbound.url), query=True)
                     # No credentialed fallback to a different issuer when discovery fails.
                     record = self.vault.get(self.ref)
-                    if outbound.method == "POST" and str(outbound.url) != record["url"]:
+                    if outbound is not request and outbound.method == "POST":
                         meta = self.context.oauth_metadata
                         if not meta:
                             raise Refused("oauth_metadata_missing", 400)
                         expected = record.get("issuer")
                         if expected and expected != str(meta.issuer):
                             raise Refused("oauth_issuer_changed", 400)
-                        if not self.context.client_info and not meta.registration_endpoint:
-                            raise Refused("oauth_client_registration_required", 400)
+                        if not self.context.client_info:
+                            if not meta.registration_endpoint:
+                                raise Refused("oauth_client_registration_required", 400)
+                            if record["requested_scope"]:
+                                self.context.client_metadata.scope = record["requested_scope"]
+                                outbound = create_client_registration_request(
+                                    meta, self.context.client_metadata, self.context.get_authorization_base_url(record["url"])
+                                )
                     response = yield outbound
-                    if len(response.content) > 2_000_000:
-                        raise Refused("oauth_invalid_response", 400)
+                    # The MCP transport owns the resource response, which can be
+                    # a live event stream. Only buffer OAuth control responses.
+                    if outbound is not request:
+                        size = response.headers.get("content-length", "")
+                        if size.isascii() and size.isdecimal() and (len(size) > 20 or int(size) > 2_000_000):
+                            raise Refused("oauth_invalid_response", 400)
+                        if len(await response.aread()) > 2_000_000:
+                            raise Refused("oauth_invalid_response", 400)
                     try:
                         outbound = await flow.asend(response)
                     except StopAsyncIteration:

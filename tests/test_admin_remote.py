@@ -105,6 +105,26 @@ class Remote:
         return httpx2.Response(200, json={'jsonrpc':'2.0','id':body['id'],'result':result})
 
 
+class StreamingBody(httpx2.AsyncByteStream):
+    def __init__(self, content):
+        self.content = content
+
+    async def __aiter__(self):
+        yield self.content
+
+
+class StreamingOAuthRemote(Remote):
+    def handle(self, request):
+        response = super().handle(request)
+        content = response.content
+        headers = dict(response.headers)
+        if str(request.url) == self.url and response.status_code == 200 and request.method == "POST":
+            headers.pop("content-length", None)
+            headers["content-type"] = "text/event-stream"
+            content = b"event: message\ndata: " + content + b"\n\n"
+        return httpx2.Response(response.status_code, headers=headers, stream=StreamingBody(content))
+
+
 async def remote_preview(http, mode='none', name='remote-notes'):
     return await change(http, 'connections/preview', kind='remote', id=name, owner='person_a',
                         settings={'url':URL, 'auth':mode, 'header':'X-API-Key'},
@@ -163,7 +183,7 @@ async def test_remote_review_classification_and_default_denial(tmp_path, monkeyp
 
 
 async def test_oauth_roundtrip_refresh_restart_scrubbing_and_revoke(tmp_path, monkeypatch):
-    remote = Remote(monkeypatch)
+    remote = StreamingOAuthRemote(monkeypatch)
     async with web_gateway(tmp_path) as (gw, http, origin, path):
         await setup(http, origin, path)
         await consent_start(http, remote)
@@ -258,6 +278,7 @@ async def test_oauth_failures_are_actionable_and_secret_free(tmp_path, monkeypat
         response = await http.post('/admin/api/oauth/mcp/complete', json={'id':flow})
         assert response.status_code == 400 and response.json()['error'] == expected, response.text
         assert not gw.app.state.admin.oauth.records
+        assert response.json()["incident"] in gw.audit_text()
         assert 'private-' not in response.text + gw.audit_text()
 
 
