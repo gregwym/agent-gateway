@@ -78,7 +78,7 @@ async def test_agent_rename_simple_permissions_and_household_approval(tmp_path, 
         await playwright.expect(card.get_by_role('button', name=t('Save connection access', '保存连接权限'), exact=True)).to_be_enabled()
         await playwright.expect(card.get_by_label(t('Who can approve?', '由谁审批？'), exact=True)).to_have_value('household')
         await card.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
-        await playwright.expect(row).to_contain_text(t('Any household member', '家庭内任意成员'))
+        await playwright.expect(row).to_contain_text(t('Any group member', '群组内任意成员'))
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         if directory := os.environ.get('AGW_TEST_ARTIFACTS'):
             Path(directory).mkdir(parents=True, exist_ok=True)

@@ -47,7 +47,7 @@ aggregate service data, or call an LLM. It uses the official
   such as a mailbox or calendar. Callers cannot override fixed parameters.
 - **Web administration.** Passkey onboarding, members, agent tokens, connector setup,
   permission editing and connection checks. Changes apply atomically after active
-  calls finish. The current member-group configuration uses the name `household`.
+  calls finish.
 - **Audit.** Records include client, connection, tool, outcome and timing. They omit
   argument values, message bodies and tool results.
 

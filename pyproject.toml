@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-gateway"
-version = "0.8.0"
+version = "0.8.1"
 description = "A small self-hosted MCP gateway for a household: per-person identity, tool allowlists, credential isolation, audit."
 readme = "README.md"
 requires-python = ">=3.11"

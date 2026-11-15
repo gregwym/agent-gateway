@@ -95,11 +95,11 @@ const messages = {
   unknown_member: ['The selected member no longer exists. Refresh and select an existing member.', '选择的成员不存在，请刷新并选择现有成员。'],
   invalid_member_name: ['Enter a name of 1–80 characters without control characters.', '名字需为 1–80 个字符，不能包含控制字符。'],
   duplicate_member: ['This member name already exists. Choose a different name.', '已有成员使用这个名字，请使用不同名字。'],
-  duplicate_household: ['This household name already exists.', '此家庭名称已存在。'],
-  unknown_household: ['This household no longer exists. Refresh and select a household.', '此家庭已不存在，请刷新并选择所属家庭。'],
+  duplicate_household: ['This group name already exists.', '此群组名称已存在。'],
+  unknown_household: ['This group no longer exists. Refresh and select a group.', '此群组已不存在，请刷新并重新选择。'],
   unknown_agent: ['Select an existing Agent before assigning tool permissions.', '请先选择现有 Agent，再配置工具权限。'],
-  outside_household: ['The Agent and connection belong to different households.', '此 Agent 与连接不属于同一个家庭。'],
-  shared_identity_removed: ['A household is not a member. Add a person here; choose the household as owner for shared connections.', '家庭不是成员。请在这里添加个人，共享连接的所有者请选择家庭。'],
+  outside_household: ['The Agent and connection belong to different groups.', '此 Agent 与连接不属于同一个群组。'],
+  shared_identity_removed: ['Add people as members. To share a connection, choose the group as its owner.', '请在此添加个人成员。要共享连接，请选择群组作为所有者。'],
   member_limit: ['The gateway has reached its limit of 50 members. Remove an unused member first.', '网关已达到 50 个成员的上限，请先移除不再使用的成员。'],
   cannot_remove_member: ['The administrator identity cannot be removed; other members must still exist.', '不能移除管理员身份；其他待移除成员必须仍然存在。'],
   invalid_client_name: ['Agent names must start with a lowercase letter and contain up to 48 lowercase letters, numbers, underscores, or hyphens.', 'Agent 名称须以小写字母开头，最多 48 个小写字母、数字、下划线或连字符。'],
@@ -123,7 +123,7 @@ const messages = {
   invalid_connection_access: ['Choose a valid access scope and read/write approval settings.', '请选择有效的访问范围及读取、写入审批设置。'],
   connection_readonly: ['This connector has no write tools. Choose Read only.', '此连接器没有写入工具，请选择只读。'],
   connection_tools_update_required: ['New write tools are available for this connection. Review and enable them before choosing Read and write.', '此连接有新增写入工具，请先审阅并启用，再选择读写。'],
-  invalid_connection_approver: ['Choose a member of this household, or any member of the household.', '请选择此家庭的一位成员，或家庭内任意成员。'],
+  invalid_connection_approver: ['Choose one member or allow any group member to approve.', '请选择一位成员审批，或允许群组内任意成员审批。'],
   cross_account_required: ['This grants access to another person’s account. Select the explicit cross-account consent checkbox.', '此操作会开放其他个人账号，请勾选明确的跨账号授权选项。'],
   restrictions_object_required: ['Fixed arguments and allowed values must each be a JSON object.', '固定参数和允许值必须分别为 JSON 对象。'],
   restriction_conflict: ['The same argument cannot be both fixed and restricted to allowed values.', '同一个参数不能同时设为固定参数和允许值限制。'],
@@ -435,7 +435,7 @@ function render() {
   button(identity, nameOf(state.owner), () => renameMember(state.members.find(m => m.id === state.owner)), 'profile-name');
   button(identity, tr('Sign out', '退出'), async () => { await api('auth/logout', {}); csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); });
   const nav = el(app, 'nav'); nav.setAttribute('aria-label', tr('Administration', '管理导航'));
-  const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '家庭成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')]];
+  const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '群组成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')]];
   for (const [key, label] of tabs) {
     const link = el(nav, 'a', label, tab === key ? 'button active' : 'button');
     link.href = tabUrls[key];
@@ -454,7 +454,7 @@ function overview() {
   el(hero, 'code', state.mcp_url, 'url');
   const grid = el(app, 'div', undefined, 'grid');
   for (const [key, count, title, hint] of [
-    ['members', state.members.length, tr('Household members', '家庭成员'), tr('Members and agents belong to a household.', '成员和 Agent 都有明确的家庭归属。')],
+    ['members', state.members.length, tr('Group members', '群组成员'), tr('Manage groups and their members.', '管理群组及其成员。')],
     ['connections', state.connections.length, tr('Account connectors', '账号连接器'), tr('Start with demo notes, or connect your accounts.', '可先用模拟笔记，也可连接你的账号。')],
     ['agents', state.clients.length, tr('Agent credentials', 'Agent 凭据'), tr('Each agent has its own tool permissions.', '每个 Agent 单独配置工具权限。')]]) {
     const card = el(grid, 'div', undefined, 'card'); el(card, 'p', String(count), 'count'); el(card, 'h3', title); el(card, 'p', hint, 'muted');
@@ -468,16 +468,15 @@ function overview() {
     tr('Create an agent token and connect it to the MCP endpoint above.', '创建 Agent Token，并连接上面的 MCP 地址。')]) el(steps, 'li', text);
 }
 function members() {
-  const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Household members', '家庭成员'));
+  const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Group members', '群组成员'));
   for (const household of state.households) {
     const card = el(app, 'section', undefined, 'card'); el(card, 'h2', household.name);
-    el(card, 'p', tr('This household contains its members, agents, and shared accounts. Tool access is granted to individual agents.', '家庭包含成员、Agent 和共享账号。工具权限逐个授予 Agent。'), 'muted');
-    button(card, tr('Rename household', '修改家庭名称'), () => renameMember(household, 'households'));
+    button(card, tr('Rename group', '修改群组名称'), () => renameMember(household, 'households'));
   }
   button(head, tr('Add member', '添加成员'), () => {
     const box = modal(tr('Add member', '添加成员')); const name = field(box, tr('Name', '名字'), 'member_name');
     name.required = true; name.maxLength = 80;
-    const household = select(box, tr('Household', '所属家庭'), 'household', householdOptions());
+    const household = select(box, tr('Group', '所属群组'), 'household', householdOptions());
     button(box, tr('Add', '添加'), async () => { if (!name.reportValidity()) return; await mutate('members/add', {name: name.value, household: household.value}); box.close(); }, 'primary');
   }, 'primary');
   const grid = el(app, 'div', undefined, 'grid');
@@ -503,7 +502,7 @@ function renameAgent(client) {
   const box = modal(tr('Rename Agent', '修改 Agent 名称'));
   const name = field(box, tr('Agent name', 'Agent 名称'), 'agent_name', client.id, 'text', tr('Start with a lowercase letter; use lowercase letters, numbers, underscores, or hyphens.', '以小写字母开头，可使用小写字母、数字、下划线或连字符。'));
   name.maxLength = 48; name.required = true;
-  el(box, 'p', tr('Your token, MCP address, household, and tool permissions stay the same. Outstanding approvals must be requested again.', 'Token、MCP 地址、所属家庭和工具权限不变。尚未完成的审批需要重新发起。'), 'hint');
+  el(box, 'p', tr('Your token, MCP address, group, and tool permissions stay the same. Outstanding approvals must be requested again.', 'Token、MCP 地址、所属群组和工具权限不变。尚未完成的审批需要重新发起。'), 'hint');
   button(box, tr('Save name', '保存名称'), async () => {
     name.value = name.value.trim();
     if (!name.reportValidity()) return;
@@ -516,13 +515,13 @@ function agents() {
   const head = el(app, 'div', undefined, 'row between'); el(head, 'h1', tr('Agent access', 'Agent 接入'));
   button(head, tr('Create agent token', '创建 Agent Token'), () => {
     const box = modal(tr('Create agent token', '创建 Agent Token')); const name = field(box, tr('Agent name', 'Agent 名称'), 'client_id');
-    const household = select(box, tr('Household', '所属家庭'), 'household', householdOptions());
+    const household = select(box, tr('Group', '所属群组'), 'household', householdOptions());
     el(box, 'p', tr('A new agent starts with no tool access. Assign its permissions after creating the token.', '新 Agent 默认没有工具权限。创建 Token 后，请为它配置权限。'), 'hint');
     button(box, tr('Create token', '创建 Token'), async () => { const result = await mutate('clients/create', {id: name.value, household: household.value}); box.close(); secretResult(tr('Save your agent token', '保存 Agent Token'), result.token, false, result.fingerprint); }, 'primary');
   }, 'primary');
   el(app, 'code', state.mcp_url, 'url');
   const table = el(el(app, 'div', undefined, 'table-wrap'), 'table'); const heading = el(el(table, 'thead'), 'tr');
-  for (const name of [tr('Agent', 'Agent'), tr('Household / access', '家庭 / 权限'), tr('Credentials', '凭据')]) el(heading, 'th', name);
+  for (const name of [tr('Agent', 'Agent'), tr('Group / access', '群组 / 权限'), tr('Credentials', '凭据')]) el(heading, 'th', name);
   const body = el(table, 'tbody');
   for (const client of state.clients) {
     const row = el(body, 'tr'); const agent = el(row, 'td'); el(agent, 'div', client.id);
@@ -843,7 +842,7 @@ function connectorForm(existing, reauthorize = false) {
   const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'demo'); kind.disabled = !!existing;
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
-  const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
+  const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Group: ', '群组共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
   const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider;
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
@@ -1068,7 +1067,7 @@ function accessSummary(parent, conn, client) {
   }
   if (send) el(parent, 'small', tr('Send: ', '发信：') + (mailSendChoices().find(([value]) => value === send)?.[1] || tr('Custom', '自定义')));
   if (conn.tools.some(tool => tool.permissions[client] === 'approval_required')) {
-    const approver = conn.approver === conn.household ? tr('Any household member', '家庭内任意成员') : nameOf(conn.approver);
+    const approver = conn.approver === conn.household ? tr('Any group member', '群组内任意成员') : nameOf(conn.approver);
     el(parent, 'small', tr('Approver: ', '审批人：') + approver);
   }
 }
@@ -1084,9 +1083,9 @@ function permissions() {
   const agentBar = el(app, 'div', undefined, 'agent-select');
   const selected = select(agentBar, tr('Agent', 'Agent'), 'inspect_agent', state.clients.map(c => [c.id, c.id]), subject);
   selected.addEventListener('change', () => { subject = selected.value; render(); });
-  el(agentBar, 'p', tr('Household: ', '所属家庭：') + nameOf(agent.household), 'muted');
+  el(agentBar, 'p', tr('Group: ', '所属群组：') + nameOf(agent.household), 'muted');
   const entries = state.connections.filter(c => c.household === agent.household);
-  if (!entries.length) { el(app, 'p', tr('No connectors in this household.', '此家庭还没有连接器。'), 'muted'); return; }
+  if (!entries.length) { el(app, 'p', tr('No connectors in this group.', '此群组还没有连接器。'), 'muted'); return; }
   settingsTable(app, 'permissions', title, [tr('Connector', '连接器'), tr('Access', '访问权限'), tr('Actions', '操作')], entries, connectionSearchText, (row, conn) => {
     connectionRowTitle(row, conn, true);
     accessSummary(el(row, 'td'), conn, agent.id);
@@ -1131,7 +1130,7 @@ function permissionEditor(id, client) {
     const approval = el(card, 'div');
     const members = state.members.filter(m => m.household === conn.household);
     const approver = select(approval, tr('Who can approve?', '由谁审批？'), 'connection_approver',
-      [...members.map(m => [m.id, m.name]), [conn.household, tr('Any household member', '家庭内任意成员')]], conn.approver);
+      [...members.map(m => [m.id, m.name]), [conn.household, tr('Any group member', '群组内任意成员')]], conn.approver);
     el(approval, 'small', tr('Applies to all Agents using this connector.', '适用于使用此连接器的所有 Agent。'), 'muted');
     const enrollment = el(approval, 'p', '', 'muted');
     function feedback() {
@@ -1144,7 +1143,7 @@ function permissionEditor(id, client) {
         (!sendSettings.hidden && ['approval_required', 'keep'].includes(sendApproval.value));
       approval.hidden = !required && !(mode.value === 'custom' && conn.tools.some(t => t.permissions[client] === 'approval_required'));
       const eligible = approver.value === conn.household ? members : members.filter(m => m.id === approver.value);
-      enrollment.textContent = eligible.some(m => m.passkeys) ? '' : tr('No selected approver has a passkey yet. Register one under Members before approving requests.', '所选审批人尚未注册通行密钥，请先在家庭成员中注册，再处理审批。');
+      enrollment.textContent = eligible.some(m => m.passkeys) ? '' : tr('No selected approver has a passkey yet. Register one under Members before approving requests.', '所选审批人尚未注册通行密钥，请先在「群组成员」中注册，再处理审批。');
     }
     for (const input of [mode, readApproval, writeApproval, sendApproval, approver]) input?.addEventListener('change', feedback);
     feedback();

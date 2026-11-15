@@ -43,8 +43,10 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                     output = Path(directory); output.mkdir(parents=True, exist_ok=True)
                     await page.screenshot(path=str(output / f'admin-overview-{locale}.png'), full_page=True)
 
-                await page.get_by_role('link', name=t('Members','家庭成员'), exact=True).click()
+                await page.get_by_role('link', name=t('Members','群组成员'), exact=True).click()
                 assert page.url == origin + '/admin/members'
+                await playwright.expect(page.get_by_role('heading', name=t('Group members', '群组成员'), exact=True)).to_be_visible()
+                await playwright.expect(page.get_by_role('button', name=t('Rename group', '修改群组名称'), exact=True)).to_be_visible()
                 await page.get_by_role('button', name=t('Add member','添加成员'), exact=True).click()
                 await page.get_by_label(t('Name','名字'), exact=True).fill('alex')
                 await page.get_by_role('button', name=t('Add','添加'), exact=True).click()
@@ -54,7 +56,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 assert page.url == origin + '/admin/agents'
                 await page.get_by_role('button', name=t('Create agent token','创建 Agent Token'), exact=True).click()
                 await page.get_by_label(t('Agent name','Agent 名称'), exact=True).fill('browser-agent')
-                await page.get_by_label(t('Household','所属家庭'), exact=True).select_option('household')
+                await page.get_by_label(t('Group','所属群组'), exact=True).select_option('household')
                 await page.get_by_role('button', name=t('Create token','创建 Token'), exact=True).click()
                 token = await page.get_by_label(t('Agent token','Agent Token'), exact=True).input_value()
                 assert token.startswith('agw_')

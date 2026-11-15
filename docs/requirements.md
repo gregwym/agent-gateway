@@ -38,7 +38,7 @@ Agent Gateway 是一个自托管的 MCP Proxy。它让多个 Agent 通过统一�
 |---|---|
 | Agent / client | 通过独立凭据认证的调用方；Token 不证明当前聊天用户是谁 |
 | Member | 可登记 Passkey 的人员身份，可作为账号所有者或审批人 |
-| Member group | 成员、Agent 和共享账号的组织范围；当前配置字段名为 `household` |
+| Group（群组） | 成员、Agent 和共享账号的组织范围 |
 | Connection | 绑定一个服务账号、上游地址或进程以及凭据的连接 |
 | Owner | 连接所属的成员或组，不因所有权自动获得 Agent 工具权限 |
 | Approver | 有权批准该连接调用的成员，或组内任意成员，与 owner 分开配置 |
