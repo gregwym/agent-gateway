@@ -24,7 +24,8 @@ async def web_gateway(tmp_path, *, path=None, port=None):
         raw["admin"] = {"owner": "person_a", "state": "admin.enc"}
         path = await prepare(tmp_path, raw)
     async with running_gateway(path, port=port) as gw:
-        async with httpx2.AsyncClient(base_url=origin, headers={"Origin": origin}, trust_env=False) as http:
+        # Match the browser's budget: connection checks may take up to 35 seconds.
+        async with httpx2.AsyncClient(base_url=origin, headers={"Origin": origin}, trust_env=False, timeout=45) as http:
             yield gw, http, origin, path
 
 
@@ -61,7 +62,8 @@ async def change(http, operation, **kwargs):
 
 
 async def rpc(origin, token, name='tools/list', params=None):
-    async with httpx2.AsyncClient(trust_env=False) as http:
+    # A connector call can legitimately consume its 30-second upstream budget.
+    async with httpx2.AsyncClient(trust_env=False, timeout=45) as http:
         return await http.post(origin + '/mcp', headers={'Authorization': 'Bearer ' + token,
             'Accept': 'application/json, text/event-stream'}, json={
                 'jsonrpc': '2.0', 'id': 1, 'method': name, **({'params': params} if params else {})})

@@ -25,7 +25,9 @@ def smtp_server(path, *, implicit=False, reject_auth=False, disconnect_data=Fals
         def handle(self):
             conn = context.wrap_socket(self.request, server_side=True) if implicit else self.request
             encrypted = implicit
-            conn.settimeout(5)
+            # Match the connector's socket budget; hosted runners may spend
+            # several seconds resolving their local EHLO hostname after connect.
+            conn.settimeout(30)
             reader = conn.makefile("rb")
             recipients = []
             try:
