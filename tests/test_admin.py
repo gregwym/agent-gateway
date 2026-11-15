@@ -246,19 +246,20 @@ async def test_revocation_drains_inflight_calls_and_drafts_are_session_bound(tmp
         key, _ = await setup(http, origin, path)
         token = (await change(http, 'clients/create', id='slow-agent', household='household')).json()['token']
         assert (await change(http, 'permissions/save', client='slow-agent', connection='notes-a', tool='a_slow', effect='allow')).status_code == 200
-        order = []
         async def running_call():
             answer = await rpc(origin, token, 'tools/call', {'name':'a_slow','arguments':{'seconds':0.25}})
             assert not answer.json()['result'].get('isError')
-            order.append('finished')
         async with anyio.create_task_group() as group:
             group.start_soon(running_call)
             with anyio.fail_after(5):
                 while not gw.app.state.runtime.active:
                     await anyio.sleep(.005)
             assert (await change(http, 'clients/revoke', id='slow-agent')).status_code == 200
-            order.append('revoked')
-        assert order == ['finished','revoked']
+        # Both clients get their responses independently. Check the order of
+        # tool completion and publication on the server.
+        order = [(row['event'], row.get('decision') or row.get('detail')) for row in gw.audit()
+                 if row.get('client') == 'slow-agent' or row.get('detail') == 'clients/revoke']
+        assert order == [('tool_call', 'allow'), ('admin_updated', 'clients/revoke')]
         assert (await rpc(origin, token)).status_code == 401
         draft = (await change(http, 'connections/preview', id='staged', kind='demo', owner='person_a')).json()['draft']
         async with httpx2.AsyncClient(base_url=origin, headers={'Origin':origin}) as second:
