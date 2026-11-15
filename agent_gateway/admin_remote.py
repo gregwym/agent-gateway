@@ -30,8 +30,9 @@ def make_remote(name, owner, account, settings, provided, previous, values, cred
             raise Refused("missing_token", 400)
         if any(ord(c) < 32 or ord(c) == 127 for c in token):
             raise Refused("invalid_remote_token", 400)
-        key = credential_ref("token", old)
-        fresh[key] = token
+        key = old if old and not provided.get("token") else credential_ref("token", old)
+        if provided.get("token"):
+            fresh[key] = token
         if auth == "bearer":
             raw["bearer_secret"] = key
         else:

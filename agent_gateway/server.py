@@ -41,7 +41,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -199,7 +199,7 @@ class Gateway:
     # -- MCP handlers ---------------------------------------------------------
 
     async def list_tools(self, ctx: Any, params: Any) -> types.ListToolsResult:
-        who = caller_of(ctx.request)
+        who = caller_of(ctx.request, self.cfg.clients)
         if who is None:
             raise MCPError(types.INVALID_REQUEST, "Not authenticated")
         if self.cfg.server.tool_discovery == "search":
@@ -216,7 +216,7 @@ class Gateway:
 
     async def call_tool(self, ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         started = time.monotonic()
-        who = caller_of(ctx.request)
+        who = caller_of(ctx.request, self.cfg.clients)
         if who is None:
             raise MCPError(types.INVALID_REQUEST, "Not authenticated")
         name = params.name
@@ -421,10 +421,12 @@ def build_app(gateway: Gateway) -> Starlette:
     cfg = gateway.cfg
 
     async def list_tools(ctx, params):
-        return await runtime.gateway.list_tools(ctx, params)
+        async with runtime.lease() as current:
+            return await current.list_tools(ctx, params)
 
     async def call_tool(ctx, params):
-        return await runtime.gateway.call_tool(ctx, params)
+        async with runtime.lease() as current:
+            return await current.call_tool(ctx, params)
     server: Server[Any] = Server(
         "agent-gateway",
         version=__version__,
@@ -454,15 +456,23 @@ def build_app(gateway: Gateway) -> Starlette:
         async def verify_token(self, token):
             return await StaticTokenVerifier(list(runtime.gateway.cfg.clients)).verify_token(token)
 
+    transport = StreamableHTTPASGIApp(manager)
+
+    async def mcp_request(scope, receive, send):
+        if scope["method"] == "GET":
+            # The gateway has no standalone notifications or session to resume.
+            await Response(status_code=405, headers={"Allow": "POST, DELETE"})(scope, receive, send)
+            return
+        await transport(scope, receive, send)
+
     authenticated = AuthenticationMiddleware(
-        RequireAuthMiddleware(StreamableHTTPASGIApp(manager), required_scopes=[]),
+        RequireAuthMiddleware(mcp_request, required_scopes=[]),
         backend=BearerAuthBackend(Verifier()),
     )
 
     class MCPEndpoint:
         async def __call__(self, scope, receive, send):
-            async with runtime.lease():
-                await authenticated(scope, receive, send)
+            await authenticated(scope, receive, send)
 
     mcp_endpoint = MCPEndpoint()
 

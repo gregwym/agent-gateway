@@ -61,6 +61,10 @@ async def test_browser_remote_oauth_review_errors_and_revoke(tmp_path, monkeypat
                 await page.get_by_role('button', name=t('Apply connector','应用连接器'), exact=True).click()
                 card = page.locator('.card').filter(has=page.get_by_role('heading', name='browser-remote', exact=True))
                 await playwright.expect(card).to_be_visible()
+                await card.get_by_role('button', name=t('Edit settings', '编辑设置'), exact=True).click()
+                await page.get_by_role('button', name=t('Save connector', '保存连接器'), exact=True).click()
+                await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+                assert remote.tokens == 1
                 await card.get_by_role('button', name=t('Test connection','验证连接'), exact=True).click()
                 await playwright.expect(card).to_contain_text(t('MCP initialization and tools verified','MCP 初始化和工具验证通过'))
                 assert not remote.calls

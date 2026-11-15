@@ -2,6 +2,8 @@
 import json
 import time
 
+import anyio
+import httpx2
 import pytest
 
 from helpers import TOKEN_A, prepare
@@ -50,3 +52,74 @@ async def test_busy_admin_queue_has_bounded_actionable_error(tmp_path):
             assert reply.status_code == 409 and reply.json()['error'] == 'admin_busy'
             assert time.monotonic() - started < 7
         assert (await state(http))['revision'] == revision
+
+
+async def test_connector_saves_with_mcp_listener_and_stalled_post(tmp_path):
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        headers = {'Authorization': 'Bearer ' + TOKEN_A, 'Accept': 'text/event-stream'}
+        listener = await http.get('/mcp', headers=headers, timeout=3)
+        assert listener.status_code == 405
+
+        started, release = anyio.Event(), anyio.Event()
+        responses = []
+
+        async def body():
+            started.set()
+            await release.wait()
+            yield b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+        async def stalled_request():
+            async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=gw.app), base_url=origin) as client:
+                responses.append(await client.post('/mcp', content=body(), headers={
+                    **headers, 'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json'}))
+
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(stalled_request)
+                await started.wait()
+                saved = await change(http, 'connections/save', kind='imap', id='mail', owner='person_a',
+                                     settings={'username':'demo@example.test'}, credentials={'password':'fake-password'})
+                assert saved.status_code == 200 and saved.json()['saved'], saved.text
+                rotated = await change(http, 'clients/rotate', id='agent-a')
+                assert rotated.status_code == 200, rotated.text
+                release.set()
+        assert responses[0].json()['error']['message'] == 'Not authenticated'
+        assert (await rpc(origin, TOKEN_A)).status_code == 401
+        assert (await rpc(origin, rotated.json()['token'])).status_code == 200
+
+
+async def test_permission_change_waits_for_a_running_tool(tmp_path, monkeypatch):
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        runtime = gw.app.state.runtime
+        upstream = runtime.gateway.upstreams['notes-a']
+        original = upstream.call
+        started, release = anyio.Event(), anyio.Event()
+        calls, saves = [], []
+
+        async def held_call(*args):
+            started.set()
+            await release.wait()
+            return await original(*args)
+
+        async def call():
+            calls.append(await rpc(origin, TOKEN_A, 'tools/call', {'name':'a_whoami','arguments':{}}))
+
+        async def save():
+            saves.append(await change(http, 'permissions/connection', client='agent-a', connection='notes-a', access='none'))
+
+        monkeypatch.setattr(upstream, 'call', held_call)
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(call)
+                await started.wait()
+                tasks.start_soon(save)
+                while not runtime.changing:
+                    await anyio.sleep(0.01)
+                assert not saves
+                release.set()
+        assert 'person_a' in calls[0].json()['result']['content'][0]['text']
+        assert saves[0].status_code == 200
+        await call()
+        assert 'error' in calls[1].json()

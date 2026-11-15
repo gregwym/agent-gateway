@@ -47,8 +47,8 @@ class Runtime:
                     self.condition.notify_all()
 
     async def replace(self, gateway, commit):
-        # The caller serializes writers. Authentication is inside the lease, so a
-        # token revoked by this change cannot sneak through after the publication.
+        # The caller serializes writers. Each tool handler leases a snapshot
+        # and checks the HTTP identity against that snapshot before proceeding.
         with anyio.CancelScope(shield=True):
             async with self.condition:
                 self.changing = True
@@ -58,8 +58,8 @@ class Runtime:
                             await self.condition.wait()
                     reuse = (gateway.secrets == self.gateway.secrets and gateway.lock.entries == self.gateway.lock.entries
                              and set(gateway.upstreams) == set(self.gateway.upstreams)
-                             and all(gateway.upstreams[key].conn.model_dump(exclude={'approver'}) ==
-                                     self.gateway.upstreams[key].conn.model_dump(exclude={'approver'})
+                             and all(gateway.upstreams[key].conn.model_dump(exclude={'approver', 'mailbox_email', 'mailbox_aliases'}) ==
+                                     self.gateway.upstreams[key].conn.model_dump(exclude={'approver', 'mailbox_email', 'mailbox_aliases'})
                                      for key in gateway.upstreams))
                     commit()
                     if reuse:

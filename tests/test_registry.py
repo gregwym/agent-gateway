@@ -74,6 +74,7 @@ async def test_registry_selection_prefills_remote_mcp_without_saving(tmp_path, m
     async with admin_page(tmp_path, 'en-US') as (page, _):
         await page.get_by_role('button', name='Connectors', exact=True).click()
         await page.get_by_role('button', name='Add connector', exact=True).click()
+        await page.get_by_label('Service', exact=True).select_option('remote')
         await page.get_by_role('button', name='Search MCP Registry', exact=True).click()
         await page.get_by_label('Service name', exact=True).fill('todoist')
         await page.get_by_role('button', name='Search', exact=True).click()

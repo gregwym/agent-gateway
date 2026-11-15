@@ -329,7 +329,8 @@ async def test_expired_refresh_is_recoverable_through_reauthorization(tmp_path, 
         assert sum(str(r.url).endswith('/register') for r in remote.requests) == registrations
         remote.fail_token = None
         await consent_start(http, remote)
-        assert (await apply(http, await consent_complete(http, remote))).status_code == 200
+        saved = await consent_complete(http, remote)
+        assert saved.status_code == 200 and saved.json()['saved'], saved.text
         assert ref not in admin.oauth.records
         assert (await change(http, 'connections/test', id='remote-notes')).status_code == 200
 

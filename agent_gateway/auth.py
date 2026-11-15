@@ -39,6 +39,10 @@ class Caller:
     principal: str
 
 
+class GatewayAccessToken(AccessToken):
+    token_sha256: str
+
+
 class StaticTokenVerifier:
     """Implements the SDK's `TokenVerifier` protocol over the configured clients."""
 
@@ -56,10 +60,10 @@ class StaticTokenVerifier:
         if match is None:
             return None
         # The raw token is not kept: nothing downstream needs it.
-        return AccessToken(token="", client_id=match.id, scopes=[], subject=match.subject)
+        return GatewayAccessToken(token="", client_id=match.id, scopes=[], subject=match.subject, token_sha256=digest)
 
 
-def caller_of(request: Any) -> Caller | None:
+def caller_of(request: Any, clients: list[ClientCfg]) -> Caller | None:
     """The authenticated caller of one HTTP request, or None.
 
     Read per request from what the auth middleware attached to the ASGI scope,
@@ -70,6 +74,11 @@ def caller_of(request: Any) -> Caller | None:
     if not isinstance(user, AuthenticatedUser):
         return None
     token = user.access_token
-    if not token.client_id or not token.subject:
-        return None
-    return Caller(client_id=token.client_id, principal=token.subject)
+    # The HTTP request can wait for its body or dispatch while a configuration
+    # change rotates the token or renames its client. Use the active snapshot.
+    if isinstance(token, GatewayAccessToken):
+        for client in clients:
+            if (client.id == token.client_id and client.subject == token.subject
+                    and hmac.compare_digest(client.token_sha256, token.token_sha256)):
+                return Caller(client_id=client.id, principal=client.subject)
+    return None

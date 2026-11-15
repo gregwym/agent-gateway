@@ -321,6 +321,8 @@ def make_connection(body, cfg, values, *, gmail_email=None):
         value = provided.get(key) or values.get(old_name)
         if not value:
             raise Refused("missing_" + key, 400)
+        if old_name and not provided.get(key):
+            return old_name
         secret_name = credential_ref(key, old_name)
         fresh[secret_name] = value
         return secret_name
@@ -390,7 +392,7 @@ def make_connection(body, cfg, values, *, gmail_email=None):
         if gmail_email:
             raw["mailbox_email"] = gmail_email
         elif previous and previous.env.get("GMAIL_CLIENT_ID") == raw["env"]["GMAIL_CLIENT_ID"] and all(
-                fresh[ref] == values.get(previous.secret_env.get(key)) for key, ref in raw["secret_env"].items()):
+                fresh.get(ref, values.get(ref)) == values.get(previous.secret_env.get(key)) for key, ref in raw["secret_env"].items()):
             raw["mailbox_email"] = previous.mailbox_email
             raw["mailbox_aliases"] = previous.mailbox_aliases
     else:

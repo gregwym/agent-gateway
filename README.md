@@ -113,14 +113,15 @@ restart invalidates cursors. Batch operations report a result for each requested
 message, including unknown or unattempted outcomes. SMTP acceptance does not prove
 delivery. See [deployment and connector behavior](docs/deployment.md) for limits.
 
-The web console connects remote Streamable HTTP MCP servers using OAuth, Bearer
-or API-key headers, or no authentication. Search the [MCP Registry](https://registry.modelcontextprotocol.io/)
-from **Add connector** to fill in a published HTTPS endpoint. The Registry verifies
-publisher namespace ownership. Check the publisher and endpoint before authorizing.
-Preview tools, select which to expose, and classify each as read or write before
-assigning Agent permissions. OAuth
-supports server discovery, PKCE, registered clients, dynamic registration and
-client metadata URLs. Tokens stay encrypted and refresh automatically.
+Built-in connectors save directly using the tools shipped with Gateway. Use
+**Edit settings** to change a connection's settings while keeping its tool grants.
+
+For a remote Streamable HTTP MCP server, select **Remote MCP** and search the
+[MCP Registry](https://registry.modelcontextprotocol.io/) to find a published
+HTTPS endpoint. Review the tools when adding or changing an endpoint. Choose
+which tools to expose and classify them before granting Agent access. Remote
+connections support OAuth, Bearer or API-key headers, and unauthenticated
+endpoints. OAuth tokens stay encrypted and refresh automatically.
 
 Custom stdio commands remain host-configured. Gateway-client OAuth and an external
 approval-service adapter are not implemented. See the [product requirements](docs/requirements.md)

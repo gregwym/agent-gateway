@@ -88,12 +88,10 @@ async def test_google_consent_is_session_bound_reviewed_and_never_echoes_credent
         async with httpx2.AsyncClient(base_url=origin, headers={'Origin':origin}) as second:
             await login(second, key, origin)
             assert (await second.post('/admin/api/oauth/complete', json={'id':flow})).status_code == 403
-        review = await http.post('/admin/api/oauth/complete', json={'id':flow})
-        assert review.status_code == 200, review.text
-        assert review.json()['google_account'] == 'owner@example.test'
-        assert 'google-private-refresh' not in review.text
-        assert not any(c['id'] == 'google-mail' for c in (await state(http))['connections'])
-        assert (await change(http, 'connections/apply', draft=review.json()['draft'], reviewed=True)).status_code == 200
+        saved = await http.post('/admin/api/oauth/complete', json={'id':flow})
+        assert saved.status_code == 200, saved.text
+        assert saved.json()['saved'] and saved.json()['google_account'] == 'owner@example.test'
+        assert 'google-private-refresh' not in saved.text
         conn = next(c for c in (await state(http))['connections'] if c['id'] == 'google-mail')
         assert conn['mailbox'] == {'email':'owner@example.test'}
         assert 'google-private-refresh' not in json.dumps(await state(http)) + gw.audit_text()

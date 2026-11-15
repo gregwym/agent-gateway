@@ -20,6 +20,7 @@ from .admin_config import (
     extend_catalog_tools, kind_of, mailbox_metadata, make_connection, member_name, settings_of, tool_access,
 )
 from .auth import hash_token, new_token
+from .catalog_sync import bundled_kind
 from .config import NAME, ToolCfg
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
@@ -57,18 +58,19 @@ class AdminController:
     async def sweep(self):
         while True:
             await anyio.sleep(30)
-            now = time.time()
-            self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > now}
-            self.mcp_oauth.sweep()
-            try:
-                self.oauth.prune({c.oauth_ref for c in self.runtime.gateway.cfg.connections if c.oauth_ref})
-            except Exception:
-                self.runtime.gateway.audit.write("oauth_cleanup_failed", reason="storage_unavailable")
-            pending = {f["ref"] for f in self.mcp_oauth.flows.values()} | {d.get("oauth_ref") for d in self.drafts.values()}
-            for ref, record in list(self.oauth.records.items()):
-                if ref not in self.oauth.persisted and ref not in pending and record["created"] + 600 <= now:
-                    self.oauth.discard(ref)
-            self.google.flows = {k: v for k, v in self.google.flows.items() if v["expires"] > now}
+            async with self.mutex:
+                now = time.time()
+                self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > now}
+                self.mcp_oauth.sweep()
+                try:
+                    self.oauth.prune({c.oauth_ref for c in self.runtime.gateway.cfg.connections if c.oauth_ref})
+                except Exception:
+                    self.runtime.gateway.audit.write("oauth_cleanup_failed", reason="storage_unavailable")
+                pending = {f["ref"] for f in self.mcp_oauth.flows.values()} | {d.get("oauth_ref") for d in self.drafts.values()}
+                for ref, record in list(self.oauth.records.items()):
+                    if ref not in self.oauth.persisted and ref not in pending and record["created"] + 600 <= now:
+                        self.oauth.discard(ref)
+                self.google.flows = {k: v for k, v in self.google.flows.items() if v["expires"] > now}
 
     @asynccontextmanager
     async def editing(self):
@@ -168,6 +170,53 @@ class AdminController:
                 "connections": connections, "passkeys": keys,
                 "catalog": {k: {f: v[f] for f in ("label", "fields", "secrets")} for k, v in CATALOG.items()}}
 
+    @staticmethod
+    def stage_connection(state, cfg, conn, added):
+        connections = state["config"]["connections"]
+        updated = conn.model_dump(mode="json")
+        state["secrets"].update(added)
+        for index, previous in enumerate(cfg.connections):
+            if previous.id == conn.id:
+                connections[index] = updated
+                referenced = conn.secret_names() | {key for c in cfg.connections if c.id != conn.id for key in c.secret_names()}
+                for key in previous.secret_names() - referenced:
+                    state["secrets"].pop(key, None)
+                break
+        else:
+            if len(connections) >= 50:
+                raise Refused("connector_limit", 400)
+            connections.append(updated)
+
+    async def save_connection(self, state, cfg, conn, added, previous):
+        # Keep the approved capabilities and runtime settings on edits. A
+        # different HTTP service endpoint must go through the review flow.
+        if previous:
+            if conn.url != previous.url:
+                raise Refused("connector_review_required", 409)
+            if conn.transport == "http":
+                conn = previous.model_copy(update={
+                    "bearer_secret": conn.bearer_secret,
+                    "secret_headers": conn.secret_headers,
+                    "oauth_ref": conn.oauth_ref,
+                })
+            elif kind_of(conn) != "demo":
+                conn = previous.model_copy(update={
+                    "env": previous.env | conn.env,
+                    "secret_env": previous.secret_env | conn.secret_env,
+                    "mailbox_email": conn.mailbox_email,
+                    "mailbox_aliases": conn.mailbox_aliases,
+                })
+            else:
+                conn, added = previous, {}
+            _, _, values = self.store.effective(state)
+            if conn == previous and all(values.get(key) == value for key, value in added.items()):
+                return {"saved": True, "revision": state["revision"], "id": conn.id}
+        elif bundled_kind(conn) is None:
+            raise Refused("connector_review_required", 409)
+        self.stage_connection(state, cfg, conn, added)
+        result = await self._commit(state, "connections/save")
+        return {**result, "saved": True, "id": conn.id}
+
     def preview_result(self, state, conn, added, definitions, session):
         from .admin_remote import remote_tools
         cfg, _, _ = self.store.effective(state)
@@ -178,18 +227,12 @@ class AdminController:
             raise Refused("missing_upstream_tool", 422)
         if not conn.tools:
             raise Refused("remote_no_tools", 422)
+        self.stage_connection(state, cfg, conn, added)
         raw = state["config"]
-        raw["connections"] = [c for c in raw["connections"] if c["id"] != conn.id] + [conn.model_dump(mode="json")]
         # Removed remote tools lose their rules before the candidate is validated.
         names = {t.name for t in conn.tools}
         raw["policy"] = [{**r, "tools": [t for t in r["tools"] if t in names]} if r["connection"] == conn.id else r
                          for r in raw["policy"] if r["connection"] != conn.id or any(t in names for t in r["tools"])]
-        state["secrets"].update(added)
-        previous = next((c for c in cfg.connections if c.id == conn.id), None)
-        if previous:
-            referenced = conn.secret_names() | {key for c in cfg.connections if c.id != conn.id for key in c.secret_names()}
-            for key in previous.secret_names() - referenced:
-                state["secrets"].pop(key, None)
         lock = Lock()
         for tool in conn.tools:
             lock.put(conn.id, definitions[tool.upstream])
@@ -208,13 +251,16 @@ class AdminController:
                 "tools": [{"upstream": t.upstream, "access": tool_access(conn, t)} for t in conn.tools],
                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None}
 
-    async def preview_remote_oauth(self, flow, session):
+    async def finish_remote_oauth(self, flow, session):
         state = self.store.candidate()
         cfg, _, values = self.store.effective(state)
         conn, added = make_connection(flow["body"], cfg, values)
-        if len(cfg.connections) >= 50 and not any(c.id == conn.id for c in cfg.connections):
+        previous = next((c for c in cfg.connections if c.id == conn.id), None)
+        if len(cfg.connections) >= 50 and previous is None:
             raise Refused("connector_limit", 400)
         conn = conn.model_copy(update={"oauth_ref": flow["ref"]})
+        if previous and conn.url == previous.url:
+            return await self.save_connection(state, cfg, conn, added, previous)
         return self.preview_result(state, conn, added, flow["definitions"], session)
 
     def connection_settings(self, conn):
@@ -231,13 +277,18 @@ class AdminController:
         if operation == "oauth/mcp/start":
             return await self.mcp_oauth.start(body, session)
         if operation == "oauth/mcp/complete":
-            flow = self.mcp_oauth.complete(body.get("id"), session)
-            return await self.preview_remote_oauth(flow, session)
+            key = body.get("id")
+            flow = self.mcp_oauth.complete(key, session)
+            result = await self.finish_remote_oauth(flow, session)
+            del self.mcp_oauth.flows[key]
+            return result
         if operation == "oauth/start":
             return self.google.start(body, session)
         if operation == "oauth/complete":
-            connector, account = self.google.complete(body.get("id"), session)
-            result = await self.operate("connections/preview", connector, session, gmail_email=account)
+            key = body.get("id")
+            connector, account = self.google.complete(key, session)
+            result = await self.operate("connections/save", connector, session, gmail_email=account)
+            del self.google.flows[key]
             return {**result, "google_account": account}
         if operation == "members/enroll":
             principal = body.get("id")
@@ -411,7 +462,7 @@ class AdminController:
                 metadata[renamed] = metadata.pop(name)
             result = await self._commit(state, operation)
             return {**result, "id": renamed}
-        if operation in ("connections/preview", "connections/review-tools"):
+        if operation in ("connections/save", "connections/preview", "connections/review-tools"):
             cfg, _, values = self.store.effective(state)
             if operation == "connections/review-tools":
                 if set(body) - {"id", "revision"}:
@@ -426,8 +477,18 @@ class AdminController:
                 conn, added = make_connection(body, cfg, values, gmail_email=gmail_email)
             if len(raw["connections"]) >= 50 and not any(c["id"] == conn.id for c in raw["connections"]):
                 raise Refused("connector_limit", 400)
-            if kind_of(conn) == "remote" and body.get("settings", {}).get("auth") == "oauth" and not conn.oauth_ref:
-                raise Refused("oauth_reauthorization_required", 400)
+            if kind_of(conn) == "remote" and body.get("settings", {}).get("auth") == "oauth":
+                if not conn.oauth_ref:
+                    raise Refused("oauth_reauthorization_required", 400)
+                if operation == "connections/save":
+                    saved = self.connection_settings(conn)
+                    fields = ("issuer", "client_id", "auth_method", "scope", "client_metadata_url")
+                    if body.get("credentials", {}).get("client_secret") or any(
+                            key in body["settings"] and body["settings"][key] != saved[key] for key in fields):
+                        raise Refused("oauth_reauthorization_required", 400)
+            if operation == "connections/save":
+                previous = next((c for c in cfg.connections if c.id == conn.id), None)
+                return await self.save_connection(state, cfg, conn, added, previous)
             values.update(added)
             try:
                 with anyio.fail_after(35):

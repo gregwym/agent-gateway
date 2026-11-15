@@ -143,6 +143,7 @@ const messages = {
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   invalid_connector: ['Some connector fields are invalid. Check the form.', '连接器字段无效，请检查表单。'],
+  connector_review_required: ['Preview tools to review this new MCP endpoint before saving.', '请先预览并审阅这个新 MCP 地址的工具，再保存。'],
   invalid_imap_server: ['Check the IMAP server name and TLS port (1–65535).', '请检查 IMAP 服务器地址及 TLS 端口（1–65535）。'],
   invalid_smtp_server: ['Check the SMTP server name and port (1–65535).', '请检查 SMTP 服务器地址及端口（1–65535）。'],
   smtp_invalid_security: ['Choose STARTTLS or TLS for SMTP.', 'SMTP 加密方式请选择 STARTTLS 或 TLS。'],
@@ -239,7 +240,8 @@ function serverError(data, status) {
     const error = new Error(message); error.code = data?.error; return error;
 }
 function button(parent, label, action, cls = '', busyLabel = '') {
-  const node = el(parent, 'button', label, cls); node.type = 'button';
+  const text = typeof label === 'function' ? label : () => label;
+  const node = el(parent, 'button', text(), cls); node.type = 'button';
   node.addEventListener('click', async () => {
     node.disabled = true;
     node.setAttribute('aria-busy', 'true');
@@ -247,7 +249,7 @@ function button(parent, label, action, cls = '', busyLabel = '') {
     node.closest('dialog')?.querySelector('.operation-error')?.remove();
     if (busyLabel) node.textContent = busyLabel;
     try { await action(); } catch (error) { showError(node, error); }
-    finally { node.disabled = false; node.removeAttribute('aria-busy'); node.textContent = label; }
+    finally { node.disabled = false; node.removeAttribute('aria-busy'); node.textContent = text(); }
   }); return node;
 }
 function field(parent, label, name, value = '', type = 'text', help = '') {
@@ -551,14 +553,14 @@ function connections() {
         catch (error) { if (state) await refresh(); throw error; }
         await refresh(); notify(remote ? tr('MCP initialization and tool discovery passed. No tool was executed.', 'MCP 初始化和工具发现通过，未执行工具。') : tr('Read-only connection check passed.', '只读连接验证通过。'));
       }, 'primary', tr('Testing connection…', '正在验证连接…'));
-      button(actions, tr('Edit & review', '编辑并审阅'), () => connectorForm(conn));
+      if (conn.kind !== 'demo') button(actions, tr('Edit settings', '编辑设置'), () => connectorForm(conn));
     }
     button(actions, tr('Rename', '改名'), () => renameConnector(conn));
     if (conn.kind === 'remote') button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id: conn.id, revision: state.revision}));
     });
     if (conn.oauth) {
-      button(actions, tr('Reauthorize', '重新授权'), () => connectorForm(conn));
+      button(actions, tr('Reauthorize', '重新授权'), () => connectorForm(conn, true));
       button(actions, tr('Revoke authorization', '撤销授权'), () => confirmAction(tr('Revoke authorization?', '撤销授权？'), tr('The gateway will stop using these OAuth credentials. Reauthorize to connect again.', '网关将停止使用这些 OAuth 凭据，重新连接需要再次授权。'), async () => {
         const result = await api('oauth/revoke', {id: conn.id, revision: state.revision}); await refresh();
         notify(result.provider === 'revoked' ? tr('Authorization revoked locally and at the provider.', '已在网关和服务商撤销授权。') : result.provider === 'unsupported' ? tr('Gateway tokens cleared. The provider has no revocation endpoint; remove the grant in its account settings if needed.', '网关 Token 已清除。服务商未提供撤销接口，需要时请在其账号设置中移除授权。') : tr('Gateway tokens cleared. The provider revocation request failed; remove the grant in its account settings.', '网关 Token 已清除。服务商撤销请求失败，请在其账号设置中移除授权。'));
@@ -632,24 +634,14 @@ function registryPicker(onSelect) {
   query.focus();
 }
 
-function connectorForm(existing) {
+function connectorForm(existing, reauthorize = false) {
+  const revision = state.revision;
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
   const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).map(([key, spec]) => [key, spec.label]), existing?.kind || 'demo'); kind.disabled = !!existing;
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Household: ', '家庭共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
-  if (!existing) {
-    button(form, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
-      kind.value = 'remote';
-      fields();
-      settings.url.value = result.url;
-      settings.service.value = result.service;
-      settings.auth.value = result.auth || '';
-      settings.auth.dispatchEvent(new Event('change'));
-      name.focus();
-    }));
-  }
   const dynamic = el(form, 'div'); let settings = {}, credentials = {};
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
@@ -663,6 +655,13 @@ function connectorForm(existing) {
     const spec = state.catalog[kind.value];
     const defaults = {host: 'imap.mail.me.com', port: '993', smtp_host: !existing || (existing.settings.host || 'imap.mail.me.com') === 'imap.mail.me.com' ? 'smtp.mail.me.com' : '', smtp_port: '587', smtp_security: 'starttls', url: kind.value === 'caldav' ? 'https://caldav.icloud.com' : '', timezone: 'UTC'};
     if (kind.value === 'remote') {
+      if (!existing) button(dynamic, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
+        settings.url.value = result.url;
+        settings.service.value = result.service;
+        settings.auth.value = result.auth || '';
+        settings.auth.dispatchEvent(new Event('change'));
+        name.focus();
+      }));
       settings.url = field(dynamic, tr('MCP endpoint URL', 'MCP 接口地址'), 'url', existing?.settings.url || '', 'url'); settings.url.required = true;
       settings.service = field(dynamic, tr('Service ID', '服务标识'), 'service', existing?.settings.service || 'remote-mcp', 'text', tr('Use the same ID for accounts that expose the same service tools.', '同一服务的不同账号使用相同标识。')); settings.service.disabled = !!existing;
       settings.auth = select(dynamic, tr('Authentication', '认证方式'), 'auth', [['', tr('Choose authentication', '选择认证方式')], ['none', tr('None', '无需认证')], ['bearer', 'Bearer token'], ['header', tr('API key header', 'API 密钥 Header')], ['oauth', 'OAuth']], existing?.settings.auth || 'oauth');
@@ -670,7 +669,6 @@ function connectorForm(existing) {
       const tokenBox = el(dynamic, 'div'), headerBox = el(dynamic, 'div'), oauthBox = el(dynamic, 'div');
       credentials.token = field(tokenBox, tr('Token / API key', 'Token / API 密钥'), 'token', '', 'password', existing ? tr('Blank keeps the saved value only when the endpoint is unchanged.', '接口地址未变时，留空保留原值。') : '');
       settings.header = field(headerBox, tr('Credential header', '凭据 Header'), 'header', existing?.settings.header || 'X-API-Key');
-      el(oauthBox, 'p', tr('Select Preview tools to sign in with the provider. Client settings are filled automatically when supported.', '点击「预览工具」前往服务商登录。支持自动注册的服务会由网关填写客户端设置。'), 'hint');
       const advancedOAuth = el(oauthBox, 'details');
       el(advancedOAuth, 'summary', tr('Advanced OAuth settings', 'OAuth 高级设置'));
       el(advancedOAuth, 'p', tr('Register this callback URL with the provider if you use a pre-registered client.', '使用预先注册的客户端时，请在服务商处登记此回调地址。'), 'muted');
@@ -683,7 +681,6 @@ function connectorForm(existing) {
       settings.client_metadata_url = field(advancedOAuth, tr('Client metadata URL (optional)', '客户端元数据 URL（可选）'), 'client_metadata_url', existing?.settings.client_metadata_url || '', 'text', tr('For providers supporting URL-based client registration. Use instead of a client ID.', '用于支持 URL 客户端注册的服务商，与客户端 ID 二选一。'));
       function authFields() { tokenBox.hidden = !['bearer', 'header'].includes(settings.auth.value); headerBox.hidden = settings.auth.value !== 'header'; oauthBox.hidden = settings.auth.value !== 'oauth'; }
       settings.auth.addEventListener('change', authFields); authFields();
-      el(dynamic, 'p', tr('Preview initializes MCP and lists tools; it does not execute a tool. You choose which tools to expose and classify each as read or write.', '预览只初始化 MCP 并列出工具，不执行工具。你可以选择开放的工具，并标明读取或写入。'), 'hint');
       return;
     }
     for (const key of spec.fields) {
@@ -713,23 +710,45 @@ function connectorForm(existing) {
       el(dynamic, 'p', tr('iCloud requires an app-specific password. SMTP uses the full email address; when the IMAP username has no domain, @icloud.com is added for SMTP. Other providers: enter their SMTP server or leave it blank.', 'iCloud 需要 App 专用密码。SMTP 使用完整邮箱地址；IMAP 用户名不带域名时，SMTP 自动补上 @icloud.com。其他服务商请填写对应的 SMTP 服务器，或留空关闭发信。'), 'muted');
     }
   }
-  kind.addEventListener('change', fields); fields();
+  fields();
   function values() {
-    return {revision: state.revision, id: name.value, kind: kind.value, owner: owner.value,
+    return {revision, id: name.value, kind: kind.value, owner: owner.value,
       settings: Object.fromEntries(Object.entries(settings).map(([k, input]) => [k, input.value])),
       credentials: Object.fromEntries(Object.entries(credentials).map(([k, input]) => [k, input.value]))};
   }
-  button(form, tr('Preview tools', '预览工具'), async () => {
+  function needsReview() {
+    return ['remote', 'reminders'].includes(kind.value) && (!existing || settings.url.value.trim() !== existing.settings.url);
+  }
+  function needsOAuth() {
+    return kind.value === 'remote' && settings.auth.value === 'oauth' && (
+      reauthorize || needsReview() || existing?.settings.auth !== 'oauth' || credentials.client_secret.value ||
+      ['issuer', 'client_id', 'auth_method', 'scope', 'client_metadata_url'].some(key => settings[key].value !== (existing?.settings[key] || ''))
+    );
+  }
+  function saveLabel() {
+    if (needsReview()) return tr('Preview tools', '预览工具');
+    if (needsOAuth()) return tr('Authorize and save', '授权并保存');
+    return tr('Save connector', '保存连接器');
+  }
+  const save = button(form, saveLabel, async () => {
     name.value = name.value.trim();
     if (!name.checkValidity()) throw new Error(tr(...messages.invalid_connector_name));
     if (!form.reportValidity()) return;
-    if (kind.value === 'remote' && settings.auth.value === 'oauth') {
+    if (needsOAuth()) {
       const result = await api('oauth/mcp/start', values()); location.assign(result.url); return;
     }
-    const result = await api('connections/preview', values());
-    for (const input of Object.values(credentials)) input.value = '';
-    showReview(result, box);
-  }, 'primary', tr('Reading tool definitions…', '正在读取工具定义…'));
+    if (needsReview()) {
+      const result = await api('connections/preview', values());
+      for (const input of Object.values(credentials)) input.value = '';
+      showReview(result, box);
+      return;
+    }
+    await mutate('connections/save', values());
+    box.close(); notify(tr('Connector saved.', '连接器已保存。'));
+  }, 'primary', tr('Saving…', '正在保存…'));
+  kind.addEventListener('change', fields);
+  form.addEventListener('input', () => { if (!save.disabled) save.textContent = saveLabel(); });
+  form.addEventListener('change', () => { if (!save.disabled) save.textContent = saveLabel(); });
 }
 function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
@@ -741,12 +760,13 @@ function showReview(result, form) {
   if (result.remote) el(review, 'p', tr('Gateway suggests Read for names like get, list, and search. Ambiguous tools default to Write. Confirm each category before applying. Unselected tools and read-to-write changes lose their existing grants.', '网关会将 get、list、search 等工具预选为读取，含义不明确的工具预选为写入。请核对后应用。取消选择的工具，以及从读取改为写入的工具，将撤销原有授权。'), 'hint');
   const selections = [];
   for (const definition of result.definitions) {
+    const row = el(review, 'div', undefined, 'row');
     if (result.remote) {
-      const row = el(review, 'div', undefined, 'row'); const included = checkbox(row, definition.name); included.checked = true;
+      const included = checkbox(row, definition.name); included.checked = true;
       const access = select(row, tr('Operation type: ', '操作类型：') + definition.name, 'access_' + selections.length, [['write', tr('Write', '写入')], ['read', tr('Read', '读取')]], result.tools.find(t => t.upstream === definition.name)?.access || 'write');
       selections.push({upstream: definition.name, included, access});
-      const detail = el(review, 'details'); el(detail, 'summary', tr('Definition', '工具定义')); el(detail, 'pre', JSON.stringify(definition, null, 2));
-    } else { el(review, 'h3', definition.name); el(review, 'pre', JSON.stringify(definition, null, 2)); }
+    } else el(row, 'strong', definition.name);
+    const detail = el(review, 'details'); el(detail, 'summary', tr('Definition', '工具定义')); el(detail, 'pre', JSON.stringify(definition, null, 2));
   }
   const checked = checkbox(review, tr('I reviewed these definitions and permissions.', '我已审阅这些工具定义和权限。'));
   const apply = button(review, tr('Apply connector', '应用连接器'), async () => {
@@ -782,8 +802,18 @@ async function resumeGoogle() {
   if (!gmailResult && !mcpOAuthResult) return;
   const operation = mcpOAuthResult ? 'oauth/mcp/complete' : 'oauth/complete';
   const id = mcpOAuthResult || gmailResult; gmailResult = null; mcpOAuthResult = null; history.replaceState(null, '', '/admin/');
-  try { const result = await api(operation, {id}); tab = 'connections'; render(); showReview(result); }
-  catch (error) { showError(app, error); if (error.code === 'oauth_not_ready') { mcpOAuthResult = id; button(app, tr('Continue authorization', '继续授权'), resumeGoogle); } }
+  try {
+    const result = await api(operation, {id}); tab = 'connections';
+    if (result.saved) { await refresh(); notify(tr('Connector saved.', '连接器已保存。')); }
+    else { render(); showReview(result); }
+  }
+  catch (error) {
+    showError(app, error);
+    if (['oauth_not_ready', 'active_calls_busy', 'admin_busy'].includes(error.code)) {
+      if (operation === 'oauth/mcp/complete') mcpOAuthResult = id; else gmailResult = id;
+      button(app, tr('Continue authorization', '继续授权'), resumeGoogle);
+    }
+  }
 }
 function permissions() {
   el(app, 'h1', tr('Inspect permissions', '检查权限'));

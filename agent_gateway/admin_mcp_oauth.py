@@ -132,5 +132,4 @@ class MCPConsent(ConsentSessions):
             raise Refused(flow["error"], 400, incident=flow.get("incident"))
         if flow["phase"] != "ready":
             raise Refused("oauth_not_ready", 409)
-        del self.flows[key]
         return flow

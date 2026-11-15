@@ -43,8 +43,9 @@ class GoogleConsent(ConsentSessions):
         if body.get("kind") != "gmail":
             raise Refused("invalid_connector", 400)
         body.setdefault("credentials", {})["refresh_token"] = "pending-consent"
-        conn, values = make_connection(body, self.controller.runtime.gateway.cfg, self.controller.runtime.gateway.secrets)
-        client_secret = values[conn.secret_env["GMAIL_CLIENT_SECRET"]]
+        gateway = self.controller.runtime.gateway
+        conn, values = make_connection(body, gateway.cfg, gateway.secrets)
+        client_secret = (gateway.secrets | values)[conn.secret_env["GMAIL_CLIENT_SECRET"]]
         body["credentials"] = {"client_secret": client_secret}
         now = time.time()
         self.flows = {key: value for key, value in self.flows.items() if value["expires"] > now}
@@ -127,5 +128,4 @@ class GoogleConsent(ConsentSessions):
         if flow["phase"] != "ready":
             raise Refused("oauth_not_ready", 409)
         self.controller._revision(flow["body"])
-        del self.flows[state]
         return flow["body"], flow["account"]
