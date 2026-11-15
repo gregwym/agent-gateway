@@ -1,485 +1,175 @@
 # agent-gateway
 
-A small, self-hosted MCP gateway for a household. Personal AI agents connect to
-one MCP endpoint; the gateway identifies **which Agent is calling** from the credential the
-agent presents, shows that caller **only the tools they were given**, and makes
-the upstream calls with **credentials the agent never sees**.
+A self-hosted MCP proxy that gives agents access to approved tools while keeping
+upstream credentials on the gateway. Connect multiple agents to one endpoint,
+grant access per connection, and require human approval for selected operations.
 
-```
- OpenClaw (shared) ── token H ──┐                      ┌─ stdio ── connector: person_a's account   (credential A)
- MausBot for A ────── token A ──┤   Streamable HTTP    │
- MausBot for B ────── token B ──┼──►  agent-gateway  ──┼─ stdio ── connector: person_b's account   (credential B)
- Codex / Claude ──────  ...  ───┘                      │
-                                 identity → policy →   └─ https ── MCP server: household account   (credential H)
-                                 locked definition →
-                                 arguments → audit
-```
+[Product requirements](docs/requirements.md) · [Design](docs/design.md) ·
+[Deployment](docs/deployment.md) · [MIT license](LICENSE)
 
-The gateway uses the official [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
-It can be managed with YAML and CLI commands, or an **opt-in web console** with
-passkey administrator login, family onboarding, agent tokens, connector setup,
-and permission checks. Web-managed configuration and credentials are encrypted;
-the host's YAML, key and original secret store stay read-only.
+## Why use it
 
-**Status.** The gateway core, passkey approval, unified IMAP/SMTP mail connection,
-and read-only iCloud Calendar and Gmail connectors are implemented and tested against local stand-ins
-(a real IMAP server, a TLS/STARTTLS SMTP simulator, a real CalDAV server, a fake Google, and software passkeys).
-The approval page also runs in real Chromium with a virtual WebAuthn authenticator;
-Reminders is exercised through two gateway helpers with an EventKit substitute.
-Automated acceptance uses simulated accounts; provider-specific mail behavior still
-needs verification with your own account. The Reminders connector is experimental. See
-[what it does not do](#what-it-does-not-do), and the checklist of what to verify
-yourself in [docs/deployment.md](docs/deployment.md) (中文).
+| Need | What the gateway provides |
+|---|---|
+| Connect several agents to several services | One MCP endpoint with named upstream connections |
+| Keep service credentials out of agent environments | Separate gateway tokens; upstream secrets stay in an encrypted store |
+| Control which accounts and operations an agent can use | Default-deny grants per agent, connection and tool, with argument restrictions |
+| Require a person to authorize an operation | One-use Passkey approval bound to the exact account, tool and arguments |
+| Keep large tool catalogs out of the agent's initial context | Searchable tool and connection metadata, filtered by current permissions |
+| Diagnose access and execution failures | Actionable administration errors and metadata-only audit logs |
 
-## What it does
-
-- **Households, members, and independent Agent grants.** In the web console, members
-  and Agents belong to a household. A connector is owned by a member or by the
-  household. Only individual Agents receive tool permissions; household membership
-  and account ownership grant no tool access. New Agents and connectors start denied.
-  A shared Agent has one permission set for every person using it. Each connection
-  has an independent approver setting: a household member or any member of its
-  household, defaulting to its owner. The legacy YAML identity rules below remain supported
-  for deployments without web administration.
-- **Identity from the token, nothing else.** Each client has its own bearer token,
-  bound to exactly one principal (`person_a`, `person_b`, `household`). Tool
-  arguments, headers, cookies and session ids cannot change who the caller is.
-- **Default deny, explicit allowlist.** A tool exists for a principal only if a rule
-  names that principal and that tool. Everything else is not listed and not callable,
-  and "not yours" is indistinguishable from "does not exist". No wildcards.
-- **One connection per account.** Each upstream MCP server process is bound to one
-  account and receives only that account's credential. Reaching into another
-  principal's account needs an explicit `cross_account: true` in the rule.
-- **Discover tools when needed.** MCP lists just three gateway tools: search tools,
-  search connections, and execute. Accounts of the same connector share tool names;
-  each call selects a connection. Searches show only usable, granted tools and
-  connections. Every execution rechecks restrictions and approval requirements.
-- **Argument restrictions.** A tool can be exposed with arguments fixed (`pin`) or
-  limited to listed values (`allow_values`), e.g. "the family calendar only".
-  Arguments that are not in the reviewed schema are rejected.
-- **Locked tool definitions.** Agents receive locked names, descriptions and schemas.
-  Bundled connector capabilities reconcile from the installed package on startup;
-  newly added tools start denied and existing grants and argument restrictions remain.
-  Custom or remote upstream changes require explicit review. Definitions that differ
-  from the expected lock remain disabled.
-- **Credentials stay behind.** Upstream secrets live in an encrypted file, are handed
-  only to their own connector, and known secret values are scrubbed from results.
-  Errors shown to agents are fixed strings.
-- **Audit without content.** One JSON line per call and per failed login: who, which
-  tool, which account, outcome, sizes, argument *names*. No argument values, no results.
-- **Approval by passkey.** A rule can say `approval_required`. Such a call waits until
-  a configured approver approves that exact call (same client, account, tool and
-  arguments) with a passkey, runs once, and needs a new approval the next time.
-  Without an `approvals:` section such a tool is visible and **never runs**.
-- **Mail in one connection.** IMAP searches, pages, reads in batches, changes read/star
-  flags and moves/archives/trashes messages; SMTP sends using the same account credential.
-  Reads never mark mail seen. Each write tool follows that Agent's approval setting.
-  Calendar and Gmail connectors remain read-only. No mailbox bodies are synchronized or indexed.
-  See [bundled connectors](#bundled-connectors).
-- **Browser onboarding and administration.** A private, one-time setup link creates
-  the administrator passkey. Sign in to add members, invite their passkeys, issue,
-  rename Agents, rotate or revoke tokens, review connector definitions, test read access,
-  and configure connection access. Agent bearer tokens cannot
-  access the console. Gmail offers browser OAuth with read-only consent.
-
-## What it does not do
-
-Read this list before trusting it with real accounts. Details and reasons are in
-[docs/design.md](docs/design.md) (中文).
-
-- **It cannot protect secrets from someone who controls its host.** Root, the Docker
-  group, or code running as the gateway's user can read everything. Where it runs is
-  the real boundary: see [docs/deployment.md](docs/deployment.md) (中文).
-- **It cannot tell which person is talking to a shared agent.** A token proves which
-  *client* is calling. A token stored where another agent can read it proves nothing.
-  Agents that serve both people must be given a `household` client.
-- **Physical passkeys have not been tested.** The approval tests cover the real
-  Chromium page and WebAuthn API with a virtual authenticator, plus server-side
-  signature checks. Whoever can edit the config or approval store can bypass it.
-- **It has not been verified against the real services.** The connectors were tested
-  against pymap, Radicale and a stand-in for Google's API. iCloud and Gmail will
-  differ somewhere.
-- **"Read-only" is a credential property only for Gmail.** The Gmail token is limited
-  to `gmail.readonly` by Google. An iCloud app-specific password can send mail and
-  change calendars; there, read-only means the connector sends only read requests.
-  macOS grants Reminders access as full access. A buggy or malicious connector can
-  do whatever its credential allows.
-- **No defence against prompt injection in content.** Mail bodies and other tool
-  results are returned as they are. The gateway bounds what a misled model can
-  *do* (its tools, its accounts); it does not stop the model from being misled.
-- **Only MCP tools.** Resources, prompts, sampling and elicitation are not proxied.
-- **No built-in TLS, no general rate limiting, no OS-keychain backend, no OAuth for
-  clients.** Put it on a tailnet or behind a TLS terminator.
-- **No generic HTTP, shell or SSH tools, by design.**
-
-## Quick start (demo, no Docker)
-
-Python 3.11+.
-
-```sh
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'
-
-mkdir -p run/config && cp deploy/gateway.example.yaml run/config/gateway.yaml
-export AGW_CONFIG=run/config/gateway.yaml
-
-agw token           # run three times; put each hash in place of one PASTE_HASH_FROM_agw_token
-agw secret init     # creates run/key/master.key
-agw secret set notes_key_a       # asks for the value; anything works for the demo
-agw secret set notes_key_b
-agw secret set notes_key_house
-
-agw lock            # prints every tool definition the config refers to. Read them.
-agw lock --write    # accept them into run/config/tools.lock.json
-agw check           # prints who can call what
-agw serve           # http://127.0.0.1:8080/mcp
+```text
+MCP clients                 agent-gateway                 Upstream MCP servers
+  Agent A ── token A ──┐     authenticate                  account / credential A
+  Agent B ── token B ──┼──►  authorize + approve  ──────►  account / credential B
+  Agent C ── token C ──┘     route + audit                 shared service account
+                            /mcp                          stdio or Streamable HTTP
 ```
 
-Then, with one of the tokens:
+Agents interpret and combine results. Upstream servers provide service operations.
+The gateway handles access and execution; it does not build a business database,
+aggregate service data, or call an LLM. It uses the official
+[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
 
-```sh
-curl -s http://127.0.0.1:8080/mcp \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-```
+## Capabilities
 
-All authenticated tokens list the same three entry points. Tool and connection
-search results depend on that token's permissions. For example:
+- **Explicit access.** New agents, connections and newly introduced tools start
+  without grants. Account ownership and group membership do not grant tool access.
+- **Independent read and write policies.** Each can be denied, allowed directly,
+  or require approval for every call. A connection's approver can be a member or
+  any member of its group, independently of its owner.
+- **Account-bound routing.** Each connection uses one service account and its
+  credentials. Each agent token identifies a client, not the person chatting with it.
+- **Reviewed tools.** Names, descriptions and schemas are locked. Changes to remote
+  definitions disable affected tools until reviewed. Bundled connector definitions
+  reconcile on upgrade; new tools stay denied and existing restrictions are preserved.
+- **Argument restrictions.** Fixed parameters and allowed values constrain resources
+  such as a mailbox or calendar. Callers cannot override fixed parameters.
+- **Web administration.** Passkey onboarding, members, agent tokens, connector setup,
+  permission editing and connection checks. Changes apply atomically after active
+  calls finish. The current member-group configuration uses the name `household`.
+- **Audit.** Records include client, connection, tool, outcome and timing. They omit
+  argument values, message bodies and tool results.
+
+## Discover and call tools
+
+The default MCP tool list contains three entry points:
+
+| Tool | Purpose |
+|---|---|
+| `gateway_search_tools` | Find permitted tools and their parameter schemas |
+| `gateway_search_connections` | Find permitted connections, restrictions and approval requirements |
+| `gateway_call_tool` | Call a tool on a selected connection |
+
+Example `tools/call` parameters using the demo configuration:
 
 ```json
 {"name":"gateway_search_tools","arguments":{"query":"notes"}}
 {"name":"gateway_search_connections","arguments":{"tool":"notes_add_note"}}
-{"name":"gateway_call_tool","arguments":{"tool":"notes_add_note","connection":"notes-a","arguments":{"folder":"inbox","text":"hello"}}}
+{"name":"gateway_call_tool","arguments":{"tool":"notes_add_note","connection":"notes-a","arguments":{"folder":"inbox","text":"Example note"}}}
 ```
 
-These objects are the `params` of a `tools/call` JSON-RPC request. The write does
-not run without approval: it answers "This action needs human approval and was not executed."
-To try the approval flow, run `agw approval enroll person_a` and open the link it
-prints in a browser on the same machine (the example config uses
-`http://localhost:8080`) to create a passkey. Call `a_notes_add` again: the answer
-now names a page where the request waits. Open it, approve, and repeat the same call.
+Searches operate on metadata, not account contents. Both support `query`, `offset`
+and `limit` (1–25). Use the returned `next_offset` to continue. Tool search can
+filter by `connection`; connection search can filter by `tool` and returns the
+exact schema for each permitted binding. Supply `variant` when a connection has
+multiple restricted bindings for the same tool.
 
-Both searches support `query`, `offset` and `limit` (1–25, default 10), returning
-`total` and `next_offset`. Tool search also accepts `connection`; connection search
-accepts a shared `tool` name and returns exact permitted parameter schemas and
-`approval_required` for each binding. Use `variant` in `gateway_call_tool` only when
-the same tool has several restricted bindings on a connection. Fixed parameters
-remain hidden and cannot be supplied by the caller.
+Every call rechecks permissions, parameters and approval requirements. A call
+requiring approval returns a link without executing. After approval, the agent
+repeats the same call; the grant is consumed once. A failed upstream write is not
+automatically retried.
 
-On the first upgrade to 0.6, reconnect the MCP client or start a session that reloads
-its tool list to acquire these three entry points. Thereafter capability and permission
-changes are discovered through searches without reloading the MCP tool list. Existing
-prefixed calls remain accepted with full authorization checks, but are hidden from
-the default list. `server.tool_discovery: all` retains the previous listing for clients
-that explicitly need it.
+Clients upgrading from the full tool listing must refresh it once. Subsequent
+permission changes are visible through search. Legacy tool names remain callable
+under the same checks; `server.tool_discovery: all` restores the full listing.
 
-## Web onboarding
+## Current status
 
-Start from [gateway.web.example.yaml](deploy/gateway.web.example.yaml) for an empty
-gateway, or add this to an existing configuration that already enables approvals
-and encrypted credentials:
+The core proxy, web administration, Passkey approval and bundled connectors are
+implemented. Automated acceptance uses isolated simulated accounts, local service
+implementations and virtual WebAuthn authenticators. This does not establish full
+compatibility with every provider or physical authenticator.
 
-```yaml
-admin:
-  owner: person_a                   # a non-shared principal, assigned by the host
-  state: ../state/admin.enc
-```
+| Connector | Available operations | Limits |
+|---|---|---|
+| IMAP + SMTP | Search, paginated listing, message and attachment reads, batch reads, read/star flags, move/archive/trash, send | One connection per account; SMTP sending has no attachment support |
+| CalDAV | List calendars and events, read events, check conflicts | Read-only; event listing has a result limit and no continuation cursor |
+| Gmail | Search, message and attachment reads; browser OAuth with `gmail.readonly` | No search continuation, batch reading or writes |
+| Apple Reminders | List reminder lists and reminders, read details | Experimental, read-only; requires a macOS helper and local authorization |
 
-The operator initializes the master key once (`agw secret init`) and starts the
-gateway. On first startup the private setup URL is saved as
-`state/admin-setup-link` (mode `0600`, valid for 24 hours); `agw admin setup`
-prints it, and `agw admin setup --rotate` replaces an expired/lost link. Give it
-directly to the intended administrator. Opening the public home page does not
-grant ownership. If that principal already has a passkey, sign in with it instead.
+IMAP reads use `EXAMINE` and `BODY.PEEK`, so reading does not mark mail as seen.
+Pagination uses an in-memory UID snapshot; new arrivals need a new listing, and
+restart invalidates cursors. Batch operations report a result for each requested
+message, including unknown or unattempted outcomes. SMTP acceptance does not prove
+delivery. See [deployment and connector behavior](docs/deployment.md) for limits.
 
-From then on use `/admin/`: register the administrator passkey, add household
-members, connect an account (or demo notes), review its definitions, run its read
-check, and create a separate token for each agent. Tokens are shown once. Members
-receive a private 15-minute passkey registration link; membership alone does not
-make someone an administrator. The console is available in English and Chinese.
-Click your name in the header, or **Members → Edit name**, to change your name.
-There is one editable name, stored on the member record; internal credential and
-ownership keys stay stable and are not shown as a second name. Passkeys, sessions,
-permissions, and pending approvals survive a rename. Names support Unicode and
-spaces; duplicate member names are rejected.
+Custom stdio and Streamable HTTP upstreams can be configured on the host, using
+per-connection secrets, tool locks and policies. The web console currently offers
+a fixed connector catalog. **The next milestone is web management of arbitrary
+remote MCP connections.** Generic upstream OAuth and an external approval-service
+adapter are not implemented. The [product requirements](docs/requirements.md)
+separate available capabilities from planned work.
 
-In **Agents → Configure permissions**, select an Agent and choose **No access**,
-**Read only**, or **Read and write** for each connection. Configure **Read approval**
-and, when writes are enabled, **Write approval** independently: either no approval
-or a separate one-use passkey decision for every operation. Read-only access can
-therefore require approval too. When either operation requires approval, select a
-member or **Any household member** as approver; ownership stays unchanged. The
-approver setting applies to every Agent using that connection. Existing custom
-tool rules remain intact until you save a preset; individual tools and argument
-limits are under **Advanced**. Only known catalog reads or host-reviewed `tools[].access: read` tools enter the read
-preset; unknown tools are treated as writes, regardless of upstream MCP hints.
-Connectors without write tools, including the Gmail and calendar readers,
-offer read-only access. Changing a setting does not add unsupported connector operations.
-A zero-tool Agent still sees the three entry points, but searches return no available
-tools or connections. Being in the same household does not identify the current human
-speaker or make one Agent inherit another Agent's permissions.
+## Quick start
 
-Use **Agents → Rename** to correct an Agent name. The token, endpoint, household,
-and effective tool grants remain unchanged. Agent references in policy are renamed
-atomically. Outstanding approvals must be requested again, and historical audit
-records retain the name used at the time. Reusing the old name grants no access.
-
-Access and connector changes wait up to 30 seconds for active calls to finish, then atomically save and
-apply; busy calls leave the configuration unchanged. These changes invalidate
-outstanding approvals. Permission-only edits reuse running connectors and preserve
-their pagination snapshots. Queued admin requests fail with a specific busy reason
-after five seconds. If a permission save response times out or is lost, the page
-reads the current revision and settings to confirm the result without resubmitting.
-If the save succeeded but the refresh failed, it explicitly reports that the save succeeded.
-Sessions last 30 minutes, are revocable, and cannot be
-used as MCP tokens. Host paths, administrator identity, origin, and subprocess
-commands cannot be changed through the browser. Connectors use a fixed catalog;
-custom connectors remain a host configuration task.
-Connector preview shows progress and reports validation or network errors inside
-the open dialog, retaining entered values for correction. Preview reads tool
-definitions; the separate read check verifies account access.
-Read-check failures stay on the connector card, with separate reasons for rejected
-credentials, TLS/DNS/network failures, provider permissions, and changed tool
-definitions. Other form errors stay on the current page or dialog. Server errors
-include an error ID that can be matched to the audit log without exposing passwords
-or upstream response bodies; OAuth callback failures also render the normal console.
-Agent rows and one-time token dialogs show a SHA-256 check code. **Check token**
-compares a pasted value locally in the browser, including whitespace/Bearer-prefix
-mistakes; the pasted value is never sent or saved. Clipboard failures are shown
-explicitly and select the full value for manual copying. Checking does not rotate a token.
-
-Web changes override account sections (`households`, `members`, `clients`,
-`connections`, `policy`, and legacy identity keys) from YAML after the first save. `agw check` includes those
-changes. Back up `admin.enc` and `approvals.sqlite` along with the original files;
-keep the encryption key separately. Disabling web administration also disables
-its overrides, so migration back to YAML requires an intentional host-side export.
-See [deployment instructions](docs/deployment.md#网页-onboarding-可选).
-
-On upgrade to 0.3, web configuration with zero or one legacy shared identity is
-normalized into a household and member records. Each existing Agent retains exactly
-its effective permissions and token; old grants without an existing Agent do not
-grant access to future Agents. Existing names, passkeys and ownership bindings are
-preserved. Startup performs no state-file write; the next administrator edit saves
-the new format. More than one legacy shared identity requires an explicit host-side
-membership migration. After saving the new format, rollback to 0.2 requires restoring
-the matching protected backup of configuration/state as well as the older image.
-
-## Docker Compose
+Python 3.11+. Run from a checkout of this repository; installation is from local
+source, not a package with the same name on PyPI.
 
 ```sh
-cd deploy
-mkdir -p data/config data/secrets data/key data/state
-cp gateway.example.yaml data/config/gateway.yaml      # then edit it
-sudo chown -R 10001:10001 data                        # the container runs as uid 10001
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[connectors]'
 
-docker compose build
-docker compose run --rm admin token                    # per client; paste the hashes into gateway.yaml
-docker compose run --rm admin secret init
-docker compose run --rm admin secret set notes_key_a   # and the others
-docker compose run --rm admin lock --write
-docker compose run --rm admin check
+mkdir -p run/config
+cp deploy/gateway.example.yaml run/config/gateway.yaml
+export AGW_CONFIG=run/config/gateway.yaml
 
-AGW_BIND=100.x.y.z docker compose up -d                # this host's Tailscale IP
+agw token            # run for each demo client; put the hashes in gateway.yaml
+agw secret init
+agw secret set notes_key_a
+agw secret set notes_key_b
+agw secret set notes_key_house
+
+agw lock             # inspect the tool definitions before accepting them
+agw lock --write
+agw check
+agw serve
 ```
 
-The container runs as a non-root user with a read-only root filesystem, no
-capabilities, and config, key and secrets mounted read-only. That limits what a bug
-in the gateway can do. It is not isolation from the host's administrators.
-Verified on linux/arm64 (Docker 29, Compose v5); on macOS with Colima or Docker
-Desktop the `chown` is not needed.
-Deployment constraints, real accounts, approvals, backup and rotation:
-[docs/deployment.md](docs/deployment.md).
+The demo secrets can contain arbitrary test values. The configuration deliberately
+refuses to start until its token hashes and secrets have been supplied. It includes
+multiple clients and accounts for testing isolation without external services.
 
-## Configuration
+Configure a client with:
 
-One file, read at startup. [deploy/gateway.example.yaml](deploy/gateway.example.yaml)
-is a complete, commented demo;
-[deploy/gateway.household.example.yaml](deploy/gateway.household.example.yaml) is two
-people with iCloud Mail, iCloud Calendar and Gmail each.
+- Endpoint: `http://127.0.0.1:8080/mcp` for a local demo; an HTTPS endpoint for remote use.
+- Transport: Streamable HTTP.
+- Header: `Authorization: Bearer <gateway-client-token>`.
 
-| Key | Meaning |
-|---|---|
-| `server` | `host`, `port`, `allowed_hosts` (Host header check), `max_result_bytes`, `tool_discovery` (`search` by default, `all` for legacy listing) |
-| `audit` | `path`, `retention_days` (one file per UTC day) |
-| `secrets` | `path` of the encrypted store, `key_file` |
-| `lock_file` | reviewed tool definitions, default `tools.lock.json` |
-| `approvals` | `origin` (the https address people open to approve), `store` (SQLite file), `request_ttl_seconds`, `grant_ttl_seconds` |
-| `principals` | the identities that exist |
-| `shared` | principals whose accounts are meant to be shared (e.g. `household`) |
-| `clients[]` | `id`, `principal`, `token_sha256`: one per credential handed out |
-| `connections[]` | one upstream MCP server for one `(service, account)`, its `owner`, how to start or reach it, which secrets it gets, and its `tools[]` |
-| `connections[].tools[]` | `upstream` name, exposed `name` (unique across the gateway), optional `description`, `pin`, `allow_values` |
-| `policy[]` | `principals`, `connection`, `tools`, `effect` (`allow` / `approval_required` / `deny`), `cross_account` |
+For browser administration, use
+[gateway.web.example.yaml](deploy/gateway.web.example.yaml). The host creates a
+private, one-time setup link; complete Passkey registration, then use `/admin/`
+to connect accounts and grant agent access. Agent tokens cannot access the console.
+See [deployment instructions](docs/deployment.md) for setup, Docker Compose,
+HTTPS, connector credentials, approvals and backups.
 
-Unknown keys are errors. If several rules match, the strictest wins. Paths are
-relative to the config file.
+## Security boundaries
 
-## Commands
+- The gateway host, administrator and local stdio connectors are trusted. Anyone
+  who controls that host or runtime can access credentials and change policy.
+- A shared agent token provides one permission set for everyone using it. Tool
+  arguments and prompts cannot establish an end-user identity.
+- Gmail's read-only scope is enforced by the provider. IMAP app passwords and
+  EventKit permissions can permit writes even when the gateway grants only reads.
+- Tool results can contain prompt injection. The gateway enforces access boundaries
+  but does not interpret content or control the agent's downstream data handling.
+- TLS is provided by a reverse proxy or encrypted private network. General rate
+  limiting and OAuth authentication for gateway clients are not implemented.
+- Only MCP tools are proxied. Resources, prompts, sampling and elicitation are not.
+  The gateway exposes no unrestricted HTTP, shell or SSH tool.
 
-| Command | Does |
-|---|---|
-| `agw serve [--host H] [--port P]` | run the gateway |
-| `agw check` | validate the config; print each principal's access; exit 1 if a tool cannot be served |
-| `agw lock [--write] [--connection ID]` | diff upstream tool definitions against the lock file; `--write` accepts them |
-| `agw token` | mint a client token and print its hash (the token is not stored) |
-| `agw secret init \| set NAME \| rm NAME \| list` | manage upstream credentials (values are read from a prompt or stdin, never from argv) |
-| `agw approval enroll PERSON \| passkeys \| forget ID \| requests \| cancel -- ID` | register a person's passkey (prints a one-time link), list or remove passkeys, list recent requests, revoke an unused approval |
-
-All take `-c FILE` or `$AGW_CONFIG`. They are run by a person on the gateway host;
-none of this is reachable over the network.
-
-## Connecting an agent
-
-Every client needs three things: the URL (`http://<gateway>:8080/mcp`), the
-Streamable HTTP transport, and the header `Authorization: Bearer <its own token>`.
-The legacy SSE transport and OAuth are not offered.
-
-**OpenClaw** (`openclaw.json`). OpenClaw on a shared machine cannot prove which
-person is asking, so it gets the `household` client:
-
-```json5
-{
-  mcp: {
-    servers: {
-      family: {
-        url: "http://agent-gateway.your-tailnet.ts.net:8080/mcp",
-        transport: "streamable-http",
-        headers: { Authorization: "Bearer ${AGW_TOKEN_HOUSEHOLD}" },  // from the environment, not a literal
-        requestTimeoutMs: 60000,
-      },
-    },
-  },
-}
-```
-
-**Claude Code** (`.mcp.json`) and other clients that use the `mcpServers` shape:
-
-```json
-{
-  "mcpServers": {
-    "family": {
-      "type": "http",
-      "url": "http://agent-gateway.your-tailnet.ts.net:8080/mcp",
-      "headers": { "Authorization": "Bearer ${AGW_TOKEN}" }
-    }
-  }
-}
-```
-
-**Codex** (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.family]
-url = "http://agent-gateway.your-tailnet.ts.net:8080/mcp"
-bearer_token_env_var = "AGW_TOKEN"
-```
-
-**MausBot and anything else.** Give it the same three values in whatever form its
-MCP client configuration takes. Use one gateway client per person the bot serves,
-and select the token in the bot's code from the authenticated chat user, never from
-anything the model writes. If it cannot do that, give it one `household` client.
-
-A client-side tool filter (such as OpenClaw's `toolFilter`) is a convenience. The
-allowlist that counts is the gateway's.
-
-## Bundled connectors
-
-Each is a small stdio MCP server, started by the gateway as
-`python -m agent_gateway.connectors.<module>` with one account's credential.
-
-| Module | Service | Tools | Credential | Read-only is enforced by |
-|---|---|---|---|---|
-| `imap_mail` | iCloud Mail / IMAP + SMTP, one connection | `list_mailboxes`, `search_messages`, `get_message`, `get_attachment`, `list_messages`, `get_messages`, `set_message_state`, `move_messages`, `archive_messages`, `trash_messages`, `send_message` | one app-specific password for both protocols | read tools use `EXAMINE` and `BODY.PEEK`; explicit write tools require the Agent's configured write permission |
-| `caldav_calendar` | iCloud Calendar (any CalDAV) | `list_calendars`, `list_events`, `get_event`, `check_conflicts` | app-specific password | the connector only (`PROPFIND`, `REPORT`); the password itself can write |
-| `gmail` | Gmail REST API | `search_messages`, `get_message`, `get_attachment` | OAuth refresh token | Google (scope `gmail.readonly`); the connector refuses to use a token with any other scope |
-| `reminders_eventkit` | Apple Reminders, macOS only, **experimental** | `list_lists`, `list_reminders`, `get_reminder` | none (a macOS permission) | the connector only; macOS grants full access |
-
-IMAP `list_messages` snapshots matching UIDs and pages without offset shifts from new
-arrivals, deletions, or flag changes. Follow `next_cursor` until null; deleted UIDs have
-explicit error entries. Snapshots last up to one hour, are held in connector memory,
-and expire on restart; new arrivals need a new listing. Limits are 16 active snapshots
-and one million total UIDs; use disjoint date ranges if a mailbox exceeds that limit.
-Completed snapshots may be reclaimed when a new listing starts. UID snapshots do not
-freeze message flags or contents on the provider.
-
-`get_messages` reads up to 50 UIDs in two batch fetches, using `BODY.PEEK`; bodies have
-`truncated`/`next_offset`. Pass the mailbox's `uidvalidity` from `list_messages` to batch
-reads and writes. Each UID gets success, error, unknown, or not_attempted; byte/response
-limits report which UIDs need smaller batches. Writes have a time budget and do not
-retry automatically. Unknown results require inspecting the current state before retrying.
-Moves use UID MOVE or COPY + STORE + UID EXPUNGE, never unscoped EXPUNGE; a failed fallback
-may leave a copy in the destination and reports its completed steps. Archive/Trash use
-server special-use folders or an explicit destination; folders are not guessed or created.
-
-SMTP supports text and optional HTML with To/Cc/Bcc, without attachments. It uses a
-configured sender, TLS/STARTTLS and the same saved mail password. It reports SMTP
-acceptance/refusal per recipient; acceptance is not confirmed delivery. Disconnects
-during submission return unknown and are never automatically retried. It does not append
-an extra copy to Sent; that depends on the provider. The administrator's connection
-test checks IMAP plus configured SMTP authentication without sending email.
-SMTP uses the connected socket's address literal for EHLO and the sender's domain
-for Message-ID, avoiding implicit local-host DNS lookups that can stall authentication
-or sending on hosts without reliable reverse DNS.
-
-Existing bundled IMAP, Gmail, CalDAV and demo connections automatically register new
-capabilities and compatible definitions when the gateway starts after an upgrade.
-This is a general catalog reconciliation mechanism; it requires no connection-ID-specific
-data repair. It preserves names, settings, credentials, grants and argument restrictions.
-New tools start denied even on an existing read/write connection; choose the desired
-Agent permissions to grant them. A tool reclassified from read to write loses its prior
-grants. Removed tools lose grants too. Incompatible restrictions are retained, with a
-specific explanation on the connection card. Startup overlays do not write managed
-state; the next admin edit persists them. Approval bindings include the bundled catalog
-revision so an old approval cannot authorize changed tool definitions.
-
-Automatic reconciliation applies only to standard bundled `python -m` launch commands.
-Custom wrappers, remote helpers and arbitrary upstreams keep the explicit lock/review
-workflow. Where a catalog addition can be reviewed manually, **Review new tools**
-preserves the existing server settings and credential references. The original four
-IMAP definitions remain compatible with existing tool locks.
-
-Long bodies are returned in pages and attachments up to a size limit. A refused credential produces a
-fixed message telling the agent that a person has to act, and the connector stops
-presenting that credential for a while. `gmail_auth` is the one-time consent helper
-that produces the Gmail token. Setup for each service, and what the Reminders
-connector needs (a helper on that person's own Mac), is in
-[docs/deployment.md](docs/deployment.md).
-
-## Adding another service
-
-A connector is an ordinary MCP server that follows four rules
-([examples/demo_connector.py](examples/demo_connector.py) is the template):
-
-1. One process (or one URL) serves exactly one account.
-2. Its credential comes from the gateway: an environment variable for stdio, a header for HTTP.
-3. No tool takes an account, user or credential argument.
-4. Tool results never contain the credential.
-
-Then: add a `connection`, store its secret with `agw secret set`, review its tools
-with `agw lock`, add `policy` rules, restart. A stdio connector runs with the
-gateway's own privileges, so its code is as trusted as the gateway's: review it and
-pin its version. A tool that changes something should get `effect: approval_required`.
-Why the bundled connectors were written rather than taken from existing iCloud MCP
-projects is in [docs/design.md](docs/design.md).
-
-## Development
-
-```sh
-pip install -e '.[dev]'
-pytest
-```
-
-The tests start a real gateway on a local port in front of real connector
-processes and cover: cross-user access, calls outside the allowlist, identity
-spoofing through arguments and headers, credential leakage, tool-name collisions,
-upstream definition changes, SSRF through URLs, redirects and schema references,
-approval bypass and replay, the exposed HTTP surface, and upstream failure.
-The connector tests run the mail connector against [pymap](https://github.com/icgood/pymap)
-behind TLS, the calendar connector against [Radicale](https://radicale.org), and the
-Gmail connector against a local stand-in for Google's token and API endpoints.
-
-For the full simulated acceptance suite (no real accounts or credentials):
+## Development and acceptance
 
 ```sh
 pip install -e '.[dev,browser-tests]'
@@ -487,22 +177,8 @@ python -m playwright install chromium
 python scripts/acceptance.py --docker
 ```
 
-The command runs all tests, including the actual approval page in Chromium and
-Reminders through two simulated Mac helpers. With `--docker`, it also builds the
-image and checks non-root execution, read-only mounts, account isolation, approvals
-surviving restart, and connector recovery. It creates only disposable test volumes
-and removes them afterwards. Omit `--docker` when no Docker daemon is available.
-Reports (`report.json`, JUnit XML, logs and browser screenshots) are saved under
-`run/acceptance/`. The JSON report identifies the tested source snapshot.
-[GitHub Actions](.github/workflows/acceptance.yml) runs this on Linux and macOS;
-the Linux Python 3.12 job includes Docker. These simulations do not certify real
-Apple/Google accounts, physical authenticators or macOS permission prompts.
-
-The project is not published on PyPI; install it from a clone.
-`requirements.txt` pins the versions the tests ran against, with hashes, and is what
-the image installs. Regenerate it with
-`pip-compile --generate-hashes --strip-extras --extra connectors -o requirements.txt pyproject.toml`.
-
-## License
-
-[MIT](LICENSE)
+The suite covers account isolation, permissions, secret handling, tool definition
+changes, approval replay, connector operations, browser flows and container
+recovery. It uses temporary fixtures rather than production accounts. Reports,
+logs and screenshots are written to `run/acceptance/`. Provider-specific checks
+are documented separately in [deployment.md](docs/deployment.md).
