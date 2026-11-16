@@ -277,6 +277,29 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
 
 
 
+@pytest.mark.parametrize("mime", ["application/json", "application/graphql-response+json"])
+def test_json_redaction_preserves_response_shape(mime):
+    profile = bundled_profiles()["weee-orders"][1]
+    wire_body = (
+        br'{"result":true,"count":101,"flag":1,"text":"en route",'
+        br'"old":"private\u002dsession-cookie","new":"rotated-session-cookie","price":12.99}'
+    )
+
+    def fetch(host, target, method, headers, body, receive):
+        return response(receive, wire_body, rotate="rotated-session-cookie", content_type=mime)
+
+    cookies = [{"domain": "www.weee.com", "path": "/", "expires": -1, "name": name, "value": value}
+               for name, value in (("auth", "private-session-cookie"), ("language", "en"), ("flag", "1"))]
+    session = web.SiteSession(profile, json.dumps(cookies), fetch=fetch)
+    result = session.request("http_request", {"method": "GET", "path": "/api"})
+
+    assert result["status"] == 200
+    assert json.loads(result["body"]) == {
+        "result": True, "count": 101, "flag": "[REDACTED]", "text": "[REDACTED] route",
+        "old": "[REDACTED]", "new": "[REDACTED]", "price": 12.99,
+    }
+
+
 @pytest.mark.anyio
 async def test_pages_redact_before_slicing_and_detect_a_changed_body(tmp_path, monkeypatch):
     secret = "long-private-session-cookie"

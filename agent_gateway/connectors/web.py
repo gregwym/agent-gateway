@@ -34,6 +34,8 @@ _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 _METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 _COOKIE_NAME = re.compile(r"^[a-zA-Z0-9!#$%&'*+.^_`|~-]{1,128}$")
 _COOKIE_VALUE = re.compile(r"^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]{1,8192}$")
+_JSON_TOKEN = re.compile(r'"(?:[^"\\]++|\\.)*+"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?')
+_JSON_REDACTED = json.dumps(_REDACTED)
 _TLS = ssl.create_default_context()
 
 
@@ -360,15 +362,62 @@ class SiteSession:
         if value:
             self.seen_secrets.update((value, quote(value, safe=""), unquote(value), html.escape(value)))
 
-    def _redact(self, value, *, body=False):
+    def _redaction_pattern(self, *, body=False):
         secrets = sorted(self.seen_secrets - {""}, key=len, reverse=True)
         if secrets:
             # In prose/markup a short cookie such as "en" or "1" is often
             # part of an unrelated word or number. Still mask a literal echo.
             patterns = [r"(?<!\w)" + re.escape(s) + r"(?!\w)" if body and len(s) < 6 else re.escape(s)
                         for s in secrets]
-            value = re.sub("|".join(patterns), _REDACTED, value)
-        return value
+            return re.compile("|".join(patterns))
+        return None
+
+    def _redact(self, value):
+        pattern = self._redaction_pattern()
+        return pattern.sub(_REDACTED, value) if pattern else value
+
+    def _redact_body(self, value, content_type):
+        pattern = self._redaction_pattern(body=True)
+        if not pattern:
+            return value
+        if content_type != "application/json" and not content_type.endswith("+json"):
+            return pattern.sub(_REDACTED, value)
+        try:
+            # Validate without converting potentially large numeric literals.
+            json.loads(value, parse_int=str, parse_float=str)
+        except (ValueError, RecursionError):
+            return pattern.sub(_REDACTED, value)
+
+        matches = iter(pattern.finditer(value))
+        pending = next(matches, None)
+        spans_syntax = False
+
+        def replace(token):
+            nonlocal pending, spans_syntax
+            raw = token.group()
+            quotes = 1 if raw.startswith('"') else 0
+            raw_match = False
+            start, end = token.span()
+            while pending and pending.start() < end:
+                if pending.start() < start + quotes or pending.end() > end - quotes:
+                    spans_syntax = True
+                raw_match = True
+                pending = next(matches, None)
+            if not quotes:
+                return _JSON_REDACTED if raw_match else raw
+            if "\\" in raw:
+                # A literal echo may also appear in the string's JSON escapes.
+                if raw_match:
+                    return _JSON_REDACTED
+                decoded = json.loads(raw)
+            else:
+                decoded = raw[1:-1]
+            scrubbed = pattern.sub(_REDACTED, decoded)
+            return json.dumps(scrubbed) if scrubbed != decoded else raw
+
+        rendered = _JSON_TOKEN.sub(replace, value)
+        # A match across JSON punctuation cannot be replaced within one value.
+        return _JSON_REDACTED if spans_syntax or pending else rendered
 
     def request(self, tool, arguments):
         plan = plan_request(tool, arguments)
@@ -476,7 +525,7 @@ class SiteSession:
                 if time.monotonic() - started > 23:
                     raise TimeoutError()
             # Redact before slicing so credentials cannot straddle a page boundary.
-            rendered = self._redact(bytes(buffer).decode("utf-8", errors="replace"), body=True)
+            rendered = self._redact_body(buffer.decode("utf-8", errors="replace"), content_type)
             version = sha256(rendered.encode("utf-8")).hexdigest()
             if plan.body_version is not None and plan.body_version != version:
                 raise ConnectorError("The website response changed. Read again from the first page.", "web_response_changed")
