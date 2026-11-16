@@ -277,6 +277,67 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
 
 
 
+@pytest.mark.anyio
+async def test_pages_redact_before_slicing_and_detect_a_changed_body(tmp_path, monkeypatch):
+    secret = "long-private-session-cookie"
+    heading = "<p>Order content 102 costs $12.99.</p>"
+    left = heading + "字" * (web.MAX_TEXT - len(heading) - 7) + "<b>"
+    right = "</b> <i>en</i> <p>1</p> <p>End</p>"
+    site_body = left + secret + right
+    sanitized = left + "[REDACTED]" + right.replace(">en<", ">[REDACTED]<").replace(">1<", ">[REDACTED]<")
+    requests = []
+
+    def fetch(host, target, method, headers, body, receive):
+        assert host == "www.weee.com"
+        assert "auth=" + secret in headers["Cookie"]
+        requests.append((target, method))
+        if target == "/account":
+            return response(receive, status=307, location=f"/en/account/login?state={secret}")
+        if target.startswith("/en/account/login"):
+            return response(receive, site_body.encode())
+        if target == "/graphql":
+            assert json.loads(body) == {"query": "{ viewer { name } }"}
+            return response(receive, b'{"data":"Example"}', content_type="application/json")
+        pytest.fail(f"Unexpected simulated request: {target}")
+
+    monkeypatch.setattr(web, "_fetch", fetch)
+    config, port = await start_site(tmp_path)
+    async with web_gateway(tmp_path, path=config, port=port) as (gw, http, origin, config):
+        await setup(http, origin, config)
+        cookies = [{"name": key, "value": value, "domain": "www.weee.com"}
+                   for key, value in (("auth", secret), ("site_lang", "en"), ("flag", "1"))]
+        imported = await change(http, "connections/save", id="retail", kind="web", owner="person_a",
+                                settings={"plugin": "weee-orders"}, credentials={SESSION_ENV: json.dumps(cookies)})
+        assert imported.status_code == 200, imported.text
+        granted = await change(http, "permissions/connection", connection="retail", client="agent-a", access="read_write_direct")
+        assert granted.status_code == 200, granted.text
+        async with agent(origin + "/mcp", TOKEN_A) as client:
+            request = {"method": "GET", "path": "/account"}
+            first = payload(await execute(client, "web_http_request", "retail", request))
+            assert first["status"] == 200 and first["final_path"] == "/[REDACTED]/account/login"
+            assert first["body"].startswith(heading) and first["body"].endswith("[RED")
+            assert first["truncated"] and first["next_offset"] == len(first["body"]) == web.MAX_TEXT
+            assert first["body_chars"] == len(sanitized)
+            more = {**request, "offset": first["next_offset"], "body_version": first["body_version"]}
+            second = payload(await execute(client, "web_http_request", "retail", more))
+            assert first["body"] + second["body"] == sanitized
+            assert "next_offset" not in second and second["body_version"] == first["body_version"]
+            assert secret not in str(first) + str(second) + gw.audit_text()
+            site_body += "new"
+            changed = await execute(client, "web_http_request", "retail", more)
+            assert changed.is_error and "response changed" in text_of(changed)
+
+            last = len(requests)
+            replay_write = await execute(client, "web_http_request", "retail", {**more, "method": "POST"})
+            assert replay_write.is_error and len(requests) == last
+            query = {"path": "/graphql", "query": "{ viewer { name } }", "max_chars": 10}
+            pair = payload(await execute(client, "web_graphql_request", "retail", query))
+            final = payload(await execute(client, "web_graphql_request", "retail",
+                                          {**query, "offset": pair["next_offset"], "body_version": pair["body_version"]}))
+            assert pair["body"] + final["body"] == '{"data":"Example"}'
+
+
+
 def test_non_public_dns_answer_is_refused_before_connect(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))])
     monkeypatch.setattr(socket, "socket", lambda *a, **kw: pytest.fail("attempted a private connection"))

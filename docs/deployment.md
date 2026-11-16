@@ -536,8 +536,10 @@ Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据�
 HTTP 状态和文本响应。网关只向该连接的 HTTPS 来源发送 Cookie，不返回 Cookie 请求头或响应头，
 跨站跳转也不返回目标。当首个跳转地址因 Cookie 脱敏被隐藏时，HTTP GET、HEAD 会在网关内跟随最多
 四次同源跳转。`follow_redirects: true` 也会跟随可见地址，`false` 只检查单次响应。有限制参数的
-工具仍须逐次提交请求。网站若在普通页面中展示
-额外的敏感信息，该页面也属于获授权 Agent 可读取的数据范围。
+工具仍须逐次提交请求。跟随跳转后会返回脱敏的 `final_path`，可用于区分登录页和请求的页面。
+长文本以字符分页；读操作可把 `next_offset` 作为下一次的 `offset`，同时传回 `body_version`，
+避免拼接不同时刻的响应。每页重新向网站读取；写操作没有续页。网站若在普通页面中展示额外的敏感
+信息，该页面也属于获授权 Agent 可读取的数据范围。
 
 HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理。HTTP 的 POST、PUT、PATCH、DELETE
 和 GraphQL mutation 按写处理。读写由请求内容决定，同一连接可分别设置审批。只读依赖网站遵循

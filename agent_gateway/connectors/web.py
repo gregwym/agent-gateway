@@ -12,6 +12,7 @@ import time
 import threading
 from contextlib import closing
 from dataclasses import dataclass
+from hashlib import sha256
 from http.cookiejar import Cookie, CookieJar
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlsplit
@@ -20,10 +21,12 @@ from urllib.request import Request
 from graphql import GraphQLError, OperationDefinitionNode, FragmentDefinitionNode, OperationType, parse
 
 from ..web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile
-from ._base import ConnectorError, Tool, serve, setting, string
+from ._base import ConnectorError, Tool, integer, serve, setting, string
 
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_TEXT = 60_000
+_REDACTED = "[REDACTED]"
+_MAX_OFFSET = MAX_RESPONSE * len(_REDACTED)
 MAX_BODY = 128_000
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 4
@@ -125,6 +128,9 @@ class RequestPlan:
     body: bytes | None
     access: str
     follow_redirects: bool | None = False  # None follows only when the Location would be hidden.
+    offset: int = 0
+    max_chars: int = MAX_TEXT
+    body_version: str | None = None
 
 
 def _invalid(message):
@@ -240,7 +246,11 @@ def plan_request(tool, args):
         raise _invalid("The request body could not be encoded.") from None
     if body is not None and len(body) > MAX_BODY:
         raise _invalid("The request body is too large.")
-    return RequestPlan(method, target, headers, body, "read" if read else "write", follow_redirects)
+    offset, version = args.get("offset", 0), args.get("body_version")
+    if not read and (offset or version is not None):
+        raise _invalid("Only reads can request another response page; replaying a write could change data twice.")
+    return RequestPlan(method, target, headers, body, "read" if read else "write", follow_redirects,
+                       offset, args.get("max_chars", MAX_TEXT), version)
 
 
 def _same_origin_location(origin, current_path, locations):
@@ -266,7 +276,14 @@ def build_tools(handler=None):
                "Optional HTTP headers: Accept, Accept-Language, Content-Type, If-Match, If-None-Match, Range, X-Requested-With. The session is supplied by the Gateway.",
                "additionalProperties": string("Header value", 1024, r"^[\x20-\x7e]+$")}
     http, graphql = WEB_TOOLS
-    result = " Returns the HTTP status and text body. Cross-site redirects are blocked."
+    result = (" Returns HTTP status and a page of the text body. For reads, pass next_offset as offset with "
+              "the same request and body_version; the site is fetched again and changes are reported. "
+              "Cross-site redirects are blocked.")
+    paging = {
+        "offset": integer("Read response from this character offset. Use next_offset from the previous page.", 0, _MAX_OFFSET, 0),
+        "max_chars": integer("Maximum characters of the response body to return.", 1, MAX_TEXT, MAX_TEXT),
+        "body_version": string("Optional body_version from the previous page. Reject if the response changed.", 64, r"^[a-f0-9]{64}$"),
+    }
     redirects = (" GET and HEAD follow up to four same-origin redirects when the first destination is hidden "
                  "by credential redaction. Set follow_redirects=true to follow visible destinations too, or false "
                  "to inspect the first redirect without following it.")
@@ -275,14 +292,14 @@ def build_tools(handler=None):
              lambda args: handler(http, args),
              {"path": path, "method": {"type": "string", "enum": list(_METHODS)}, "headers": headers,
               "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for write methods."},
-              "follow_redirects": {"type": "boolean", "description": "Follow same-origin GET or HEAD redirects. If omitted, follow only when the first destination is hidden."}},
+              "follow_redirects": {"type": "boolean", "description": "Follow same-origin GET or HEAD redirects. If omitted, follow only when the first destination is hidden."}, **paging},
              ("path", "method"), read_only=False),
         Tool(graphql, "Send a GraphQL request to the connection's website. A selected query is a read and a mutation is a write." + result,
              lambda args: handler(graphql, args),
              {"path": path, "query": {"type": "string", "minLength": 1, "maxLength": _MAX_QUERY}, "headers": headers,
               "operation_name": string("Operation to execute when the document contains multiple operations.", 128,
                                        r"^[_A-Za-z][_0-9A-Za-z]*$"),
-              "variables": {"type": "object", "maxProperties": 100}},
+              "variables": {"type": "object", "maxProperties": 100}, **paging},
              ("path", "query"), read_only=False),
     ]
 
@@ -319,10 +336,14 @@ class SiteSession:
         if value:
             self.seen_secrets.update((value, quote(value, safe=""), unquote(value), html.escape(value)))
 
-    def _redact(self, value):
+    def _redact(self, value, *, body=False):
         secrets = sorted(self.seen_secrets - {""}, key=len, reverse=True)
         if secrets:
-            value = re.sub("|".join(re.escape(s) for s in secrets), "[REDACTED]", value)
+            # In prose/markup a short cookie such as "en" or "1" is often
+            # part of an unrelated word or number. Still mask a literal echo.
+            patterns = [r"(?<!\w)" + re.escape(s) + r"(?!\w)" if body and len(s) < 6 else re.escape(s)
+                        for s in secrets]
+            value = re.sub("|".join(patterns), _REDACTED, value)
         return value
 
     def request(self, tool, arguments):
@@ -348,6 +369,9 @@ class SiteSession:
             if location is None or not follow or result["status"] not in _REDIRECT_STATUSES:
                 if len(visited) > 1:
                     result["redirects_followed"] = len(visited) - 1
+                    result["final_path"] = self._redact(_target(target).path)
+                if plan.body_version is not None and "body_version" not in result:
+                    raise ConnectorError("The website response changed. Read again from the first page.", "web_response_changed")
                 return result
             if location in visited:
                 raise ConnectorError("The website repeated a redirect.", "web_redirect_loop")
@@ -424,10 +448,18 @@ class SiteSession:
                     raise ConnectorError("The Web request exceeded the response size limit.", "web_response_limit")
                 if time.monotonic() - started > 23:
                     raise TimeoutError()
-            rendered = self._redact(bytes(buffer).decode("utf-8", errors="replace"))
-            result["body"] = rendered[:MAX_TEXT]
-            if len(rendered) > MAX_TEXT:
+            # Redact before slicing so credentials cannot straddle a page boundary.
+            rendered = self._redact(bytes(buffer).decode("utf-8", errors="replace"), body=True)
+            version = sha256(rendered.encode("utf-8")).hexdigest()
+            if plan.body_version is not None and plan.body_version != version:
+                raise ConnectorError("The website response changed. Read again from the first page.", "web_response_changed")
+            end = plan.offset + plan.max_chars
+            result.update(body=rendered[plan.offset:end], body_offset=plan.offset,
+                          body_chars=len(rendered), body_version=version)
+            if end < len(rendered):
                 result["truncated"] = True
+                if plan.access == "read":
+                    result["next_offset"] = end
             return result, None
 
         try:
