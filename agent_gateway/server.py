@@ -354,7 +354,11 @@ class Gateway:
         if is_website(route.conn):
             from .connectors.web import ConnectorError, plan_request
             try:
-                operation = plan_request(route.tool.upstream, arguments).access
+                plan = plan_request(route.tool.upstream, arguments)
+                if plan.follow_redirects and (route.tool.pin or route.tool.allow_values):
+                    done("deny", "web_redirect_restricted")
+                    return _error("This tool has argument restrictions. Submit each redirect target as a separate request.")
+                operation = plan.access
             except ConnectorError as exc:
                 done("deny", exc.code)
                 return _error(str(exc))

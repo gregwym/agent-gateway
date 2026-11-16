@@ -25,6 +25,8 @@ from ._base import ConnectorError, Tool, serve, setting, string
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_TEXT = 60_000
 MAX_BODY = 128_000
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_REDIRECTS = 4
 _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 _METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 _COOKIE_NAME = re.compile(r"^[a-zA-Z0-9!#$%&'*+.^_`|~-]{1,128}$")
@@ -122,6 +124,7 @@ class RequestPlan:
     headers: dict[str, str]
     body: bytes | None
     access: str
+    follow_redirects: bool = False
 
 
 def _invalid(message):
@@ -205,6 +208,8 @@ def plan_request(tool, args):
             if method not in _METHODS:
                 raise _invalid("Unsupported HTTP method.")
             read = method in _READ_METHODS
+            if args.get("follow_redirects") and method not in ("GET", "HEAD"):
+                raise _invalid("Only HTTP GET and HEAD can follow redirects.")
             _http_query(parts, read)
             if "body" in args:
                 if read:
@@ -232,7 +237,8 @@ def plan_request(tool, args):
         raise _invalid("The request body could not be encoded.") from None
     if body is not None and len(body) > MAX_BODY:
         raise _invalid("The request body is too large.")
-    return RequestPlan(method, target, headers, body, "read" if read else "write")
+    return RequestPlan(method, target, headers, body, "read" if read else "write",
+                       bool(args.get("follow_redirects")) if tool == "http_request" else False)
 
 
 def _same_origin_location(origin, current_path, locations):
@@ -258,12 +264,15 @@ def build_tools(handler=None):
                "Optional HTTP headers: Accept, Accept-Language, Content-Type, If-Match, If-None-Match, Range, X-Requested-With. The session is supplied by the Gateway.",
                "additionalProperties": string("Header value", 1024, r"^[\x20-\x7e]+$")}
     http, graphql = WEB_TOOLS
-    result = " Returns the HTTP status and text body, plus a relative Location for same-site redirects. Redirects are never followed automatically."
+    result = " Returns the HTTP status and text body. Cross-site redirects are blocked."
+    redirects = (" Set follow_redirects=true on GET or HEAD to follow up to four same-site redirects, even when the "
+                 "destination is hidden by credential redaction. Otherwise a safe relative location is returned if available.")
     return [
-        Tool(http, "Make an HTTP request to the connection's website. GET, HEAD and OPTIONS are reads; POST, PUT, PATCH and DELETE are writes." + result,
+        Tool(http, "Make an HTTP request to the connection's website. GET, HEAD and OPTIONS are reads; POST, PUT, PATCH and DELETE are writes." + result + redirects,
              lambda args: handler(http, args),
              {"path": path, "method": {"type": "string", "enum": list(_METHODS)}, "headers": headers,
-              "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for write methods."}},
+              "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for write methods."},
+              "follow_redirects": {"type": "boolean", "default": False, "description": "Follow same-site GET or HEAD redirects inside the Gateway."}},
              ("path", "method"), read_only=False),
         Tool(graphql, "Send a GraphQL request to the connection's website. A selected query is a read and a mutation is a write." + result,
              lambda args: handler(graphql, args),
@@ -324,7 +333,28 @@ class SiteSession:
 
     def _request(self, plan):
         started = time.monotonic()
-        request = Request(self.profile.origin + plan.target, headers={
+        target = plan.target
+        visited = {target}
+        while True:
+            if time.monotonic() - started >= 23:
+                raise ConnectorError("The Web request timed out.", "connector_timeout")
+            result, location = self._request_hop(plan, target, started)
+            if location is None or not plan.follow_redirects or result["status"] not in _REDIRECT_STATUSES:
+                if len(visited) > 1:
+                    result["redirects_followed"] = len(visited) - 1
+                return result
+            if location in visited:
+                raise ConnectorError("The website repeated a redirect.", "web_redirect_loop")
+            if len(visited) > _MAX_REDIRECTS:
+                raise ConnectorError("The website exceeded the same-site redirect limit.", "web_redirect_limit")
+            # A redirect is still a new request. Refuse method overrides or a
+            # GraphQL operation hidden in a Location query string.
+            _http_query(_target(location), is_read=True)
+            target = location
+            visited.add(target)
+
+    def _request_hop(self, plan, target, started):
+        request = Request(self.profile.origin + target, headers={
             "User-Agent": "Agent-Gateway/1.0", "Accept-Encoding": "identity",
             **plan.headers,
         }, method=plan.method)
@@ -362,17 +392,17 @@ class SiteSession:
             if fields := {name.lower(): self._redact(value) for name in ("ETag", "Last-Modified", "Content-Range")
                           if (value := headers.get(name)) and len(value) <= 1024}:
                 result["headers"] = fields
-            # Expose only same-origin redirects. An Agent may submit the next
-            # hop as a new, separately authorized call; we never replay a write.
             if 300 <= status < 400 and (locations := headers.get_all("Location", [])):
-                location = _same_origin_location(self.profile.origin, plan.target, locations)
-                if location is not None:
-                    result["location"] = self._redact(location)
-                else:
+                location = _same_origin_location(self.profile.origin, target, locations)
+                if location is None:
                     result["redirect_blocked"] = True
-                return result
+                elif self._redact(location) != location:
+                    result["location_redacted"] = True
+                else:
+                    result["location"] = location
+                return result, location
             if plan.method == "HEAD" or status in (204, 304):
-                return result
+                return result, None
             if headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise ConnectorError("The website returned an unsupported content encoding.", "web_response_encoding")
             if (not content_type.startswith("text/") and not content_type.endswith(("+json", "+xml"))
@@ -380,7 +410,7 @@ class SiteSession:
                 # Preserve the status of empty or binary responses, without
                 # copying an opaque body that we cannot redact.
                 result["body_omitted"] = True
-                return result
+                return result, None
             buffer = bytearray()
             while data := stream.read1(16384):
                 buffer.extend(data)
@@ -392,10 +422,10 @@ class SiteSession:
             result["body"] = rendered[:MAX_TEXT]
             if len(rendered) > MAX_TEXT:
                 result["truncated"] = True
-            return result
+            return result, None
 
         try:
-            return self.fetch(self.host, plan.target, plan.method, dict(request.header_items()), plan.body, receive)
+            return self.fetch(self.host, target, plan.method, dict(request.header_items()), plan.body, receive)
         except TimeoutError:
             raise ConnectorError("The Web request timed out.", "connector_timeout") from None
         except ssl.SSLError:

@@ -187,6 +187,78 @@ async def test_upgrade_removes_order_tools_and_grants_without_losing_rotated_ses
         assert saved_cookie.encode() not in original_bytes
 
 
+@pytest.mark.anyio
+async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, monkeypatch):
+    seen = []
+    original, refreshed = "private-session", "private-rotated-session"
+    cookies = [{"name": "auth", "value": original, "domain": "www.weee.com"},
+               {"name": "site_lang", "value": "zh", "domain": "www.weee.com"}]
+
+    def fetch(host, target, method, headers, body, receive):
+        assert host == "www.weee.com" and method == "GET" and body is None
+        seen.append((target, headers["Cookie"]))
+        if target == "/account/my_orders":
+            return response(receive, status=307, location="/zh/account/my_orders", rotate=refreshed)
+        if target == "/zh/account/my_orders":
+            return response(receive, f"<p>Simulated orders {refreshed}</p>".encode())
+        if target == "/external":
+            return response(receive, status=307, location=f"https://other.example/{refreshed}")
+        if target == "/override":
+            return response(receive, status=307, location="/account?%5fmethod=DELETE")
+        if target == "/loop":
+            return response(receive, status=307, location="/loop")
+        if target.startswith("/step-"):
+            return response(receive, status=307, location=f"/step-{int(target[-1]) + 1}")
+        pytest.fail(f"Unexpected simulated request: {target}")
+
+    monkeypatch.setattr(web, "_fetch", fetch)
+    config, port = await start_site(tmp_path)
+    async with web_gateway(tmp_path, path=config, port=port) as (gw, http, origin, config):
+        await setup(http, origin, config)
+        imported = await change(http, "connections/save", id="retail", kind="web", owner="person_a",
+                                settings={"plugin": "weee-orders"}, credentials={SESSION_ENV: json.dumps(cookies)})
+        assert imported.status_code == 200, imported.text
+        granted = await change(http, "permissions/connection", connection="retail", client="agent-a", access="read_write_direct")
+        assert granted.status_code == 200, granted.text
+        async with agent(origin + "/mcp", TOKEN_A) as client:
+            tools = (await search(client, "tools", query="web_http_request"))["tools"]
+            assert tools[0]["inputSchema"]["properties"]["follow_redirects"]["type"] == "boolean"
+
+            async def request(path, *, follow=True, method="GET"):
+                return await execute(client, "web_http_request", "retail",
+                                     {"method": method, "path": path, "follow_redirects": follow})
+
+            first = payload(await request("/account/my_orders", follow=False))
+            assert first["status"] == 307 and first["location_redacted"] and "location" not in first
+            r = payload(await request("/account/my_orders"))
+            assert r["status"] == 200 and r["redirects_followed"] == 1
+            assert r["body"] == "<p>Simulated orders [REDACTED]</p>"
+            assert [p for p, c in seen] == ["/account/my_orders", "/account/my_orders", "/zh/account/my_orders"]
+            assert "auth=" + refreshed in seen[-1][1] and "site_lang=zh" in seen[-1][1]
+            assert all(token not in str(r) + str(first) + gw.audit_text() for token in (original, refreshed))
+
+            external = payload(await request("/external"))
+            assert external["status"] == 307 and external["redirect_blocked"] and "location" not in external
+            assert seen[-1][0] == "/external"
+            assert (await request("/override")).is_error and seen[-1][0] == "/override"
+            assert (await request("/loop")).is_error and seen[-1][0] == "/loop"
+            limit = await request("/step-0")
+            assert limit.is_error and "redirect limit" in text_of(limit)
+            assert [p for p, c in seen if p.startswith("/step-")] == [f"/step-{i}" for i in range(5)]
+            assert (await request("/account/my_orders", method="POST")).is_error
+            assert seen[-1][0] == "/step-4"
+
+            conn = next(c for c in (await state(http))["connections"] if c["id"] == "retail")
+            name = next(t["name"] for t in conn["tools"] if t["upstream"] == "http_request")
+            restricted = await change(http, "tools/restrict", connection="retail", tool=name,
+                                      allow_values={"path": ["/account/my_orders"]})
+            assert restricted.status_code == 200, restricted.text
+            blocked = await request("/account/my_orders")
+            assert blocked.is_error and "argument restrictions" in text_of(blocked)
+            assert seen[-1][0] == "/step-4"
+
+
+
 def test_non_public_dns_answer_is_refused_before_connect(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))])
     monkeypatch.setattr(socket, "socket", lambda *a, **kw: pytest.fail("attempted a private connection"))
