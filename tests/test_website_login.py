@@ -233,7 +233,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
 
 
 @pytest.mark.browser
-async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
+async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, monkeypatch):
     from agent_gateway.browser_worker import Browser
     playwright = pytest.importorskip("playwright.async_api")
     async with playwright.async_playwright() as driver:
@@ -255,9 +255,20 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
             assert rect["width"] == 150
             await view.use("tap", {"x": rect["x"] + 140, "y": rect["y"] + rect["height"] / 2})
             await playwright.expect(page.locator("p")).to_have_text("Clicked")
-            # A separate identity provider keeps the same zoom and click mapping.
-            await page.goto("https://identity.example/next")
-            await view.use("frame", {})
+            # Simulate the document being replaced during the snapshot taken
+            # after a tap that navigates to a separate identity provider.
+            await page.get_by_role("button").evaluate(
+                "node => node.onclick = () => location.href = 'https://identity.example/next'")
+            evaluate = page.evaluate
+
+            async def context_destroyed(*args, **kwargs):
+                monkeypatch.setattr(page, "evaluate", evaluate)
+                await page.wait_for_url("https://identity.example/next")
+                raise playwright.Error("Execution context was destroyed, most likely because of a navigation")
+
+            monkeypatch.setattr(page, "evaluate", context_destroyed)
+            result = await view.use("tap", {"x": int(rect["x"] + 40), "y": int(rect["y"] + rect["height"] / 2)})
+            assert result["host"] == "identity.example"
             assert (await page.get_by_role("button").bounding_box())["width"] == 150
             result = await view.use("zoom", {"percent": 67})
             assert result["zoom"] == 67

@@ -120,19 +120,35 @@ class Browser:
                 await page.reload(wait_until="commit", timeout=6500)
         elif op != "frame":
             raise ValueError("invalid action")
-        parts = urlsplit(page.url)
-        if self.zoom is not None and parts.scheme == "https":
-            # Apply to the actual page so clickable coordinates stay in the same
-            # viewport, and retain the scale when a sign-in step navigates.
-            await page.evaluate("""factor => {
-                const style = document.documentElement?.style;
-                if (!style) return;
-                if (factor === 1) style.removeProperty('zoom');
-                else if (style.zoom !== String(factor)) style.zoom = factor;
-            }""", self.zoom / 100)
-        picture = await page.screenshot(type="jpeg", quality=75, timeout=5000)
-        return {"image": base64.b64encode(picture).decode("ascii"),
-                "host": parts.hostname if parts.scheme == "https" else None, "zoom": self.zoom or 100}
+        return await self.frame()
+
+    async def frame(self):
+        from playwright.async_api import Error
+
+        for attempt in range(3):
+            page = self.context.pages[-1]
+            url = page.url
+            parts = urlsplit(url)
+            try:
+                if self.zoom is not None and parts.scheme == "https":
+                    # Keep zoom and click coordinates aligned across navigation.
+                    await page.evaluate("""factor => {
+                        const style = document.documentElement?.style;
+                        if (!style) return;
+                        if (factor === 1) style.removeProperty('zoom');
+                        else if (style.zoom !== String(factor)) style.zoom = factor;
+                    }""", self.zoom / 100)
+                picture = await page.screenshot(type="jpeg", quality=75, timeout=5000)
+                if self.context.pages[-1:] == [page] and page.url == url:
+                    return {"image": base64.b64encode(picture).decode("ascii"),
+                            "host": parts.hostname if parts.scheme == "https" else None, "zoom": self.zoom or 100}
+            except Error:
+                if attempt == 2:
+                    raise
+            # A click can destroy the previous page's script context. Retry
+            # the snapshot after navigation; do not replay the input.
+            await asyncio.sleep(.15)
+        raise RuntimeError("browser page changed before capture")
 
 
 def make_app(path):
