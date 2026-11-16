@@ -488,6 +488,11 @@ async def test_password_focus_when_tap_and_tab_cannot_select_it(socket_dir):
             await view.use("text", {"text": "simulated-password", "expect_password": True})
             await playwright.expect(password).to_have_value("simulated-password")
             assert await page.frame_locator("iframe").locator("form").get_attribute("data-submitted") is None
+            await password.fill("")
+            await password.evaluate("node => node.addEventListener('keyup', () => node.blur(), {once: true})")
+            with pytest.raises(PasswordFocusError, match="web_browser_password_interrupted"):
+                await view.use("text", {"text": "simulated-password", "expect_password": True})
+            await playwright.expect(password).to_have_value("s")
 
             second = page.locator('input[type="password"]')
             await page.evaluate("() => document.body.insertAdjacentHTML('beforeend', '<input type=password>')")
@@ -520,8 +525,13 @@ async def test_submit_reaches_the_site_once_and_reports_its_response(socket_dir,
 
             async def login_page(route):
                 await route.fulfill(content_type="text/html", body=(
-                    '<form action="/session" method="post">'
-                    '<input name="password" type="password" required>'
+                    '<form action="/session" method="post" '
+                    'onsubmit="if (this.dataset.keySeen !== \'yes\') event.preventDefault()">'
+                    '<input name="password" type="password" required '
+                    'onkeyup="if (event.isTrusted) this.form.dataset.keySeen = \'yes\'">'
+                    '<label><input id="reveal" type="checkbox" '
+                    'onchange="this.form.password.type = this.checked ? \'text\' : \'password\'">'
+                    'Show password</label>'
                     '<button name="action" value="sign-in">Sign in</button></form>'))
 
             async def receive_login(route):
@@ -541,6 +551,7 @@ async def test_submit_reaches_the_site_once_and_reports_its_response(socket_dir,
             await page.goto(form)
             await view.use("focus-password", {})
             await view.use("text", {"text": "simulated-password", "expect_password": True})
+            await playwright.expect(page.get_by_role("checkbox", name="Show password")).not_to_be_checked()
             if action == "Enter":
                 op, body = "key", {"key": "Enter"}
             elif action == "tap":
@@ -562,9 +573,43 @@ async def test_submit_reaches_the_site_once_and_reports_its_response(socket_dir,
                 await page.wait_for_url(target)
                 result = await view.use("frame", {})
                 assert result["image"] and result["site_status"] == (403 if action == "Enter" else None)
+                assert result["submit_activity"] == {"activity": "response", "status": 403 if action == "Enter" else 200}
                 if action == "submit-form":
                     await playwright.expect(page.locator("main")).to_have_text("Signed in")
                     assert (await view.use("cookies", {"origin": form}))["cookies"][0]["name"] == "session"
             assert received == [("POST", "password=simulated-password&action=sign-in")]
+        finally:
+            await view.close()
+
+
+@pytest.mark.browser
+async def test_non_navigating_submit_reports_the_website_network_response(socket_dir):
+    from agent_gateway.browser_worker import Browser
+    playwright = pytest.importorskip("playwright.async_api")
+    async with playwright.async_playwright() as driver:
+        view = Browser(socket_dir / "control.sock")
+        view.browser = await driver.chromium.launch()
+        try:
+            view.context = await view.new_context({"width": 390, "height": 620}, True, "TestBrowser")
+            view.zoom = None
+            page = await view.context.new_page()
+            origin = "https://signin.example/"
+            await page.route(origin, lambda route: route.fulfill(content_type="text/html", body=(
+                '<form onsubmit="event.preventDefault(); if (this.dataset.send) fetch(\'/session\', {method: \'POST\'});">'
+                '<input type=password required><button>Sign in</button></form>')))
+            await page.route(origin + "session", lambda route: route.fulfill(status=429, body="demo"))
+            await page.goto(origin)
+            await view.use("focus-password", {})
+            await view.use("text", {"text": "simulated-password", "expect_password": True})
+            await view.use("submit-form", {})
+            # Observe a site cancelling native submission without sending a request.
+            await asyncio.sleep(2.05)
+            assert (await view.use("frame", {}))["submit_activity"] == {"activity": "none", "status": None}
+            await page.locator("form").evaluate("node => node.dataset.send = 'yes'")
+            await view.use("focus-password", {})
+            async with page.expect_response(origin + "session"):
+                await view.use("submit-form", {})
+            assert page.url == origin
+            assert (await view.use("frame", {}))["submit_activity"] == {"activity": "response", "status": 429}
         finally:
             await view.close()

@@ -199,6 +199,7 @@ const messages = {
   web_browser_password_missing: ['No visible password field was found on this page.', '此页没有找到可见的密码框。'],
   web_browser_password_multiple: ['This page has more than one password field. Select the one you want.', '此页有多个密码框，请点选要输入的那个。'],
   web_browser_password_unavailable: ['The password field is not ready for typing. Select it again before entering your password.', '密码框还不能输入。请重新选中密码框再输入。'],
+  web_browser_password_interrupted: ['The page changed focus while typing the password. Clear the website password field before trying again.', '输入途中，网站移走了密码框的焦点。重试前请先清空网页里的密码框。'],
   web_browser_closed: ['The website closed its browser tab. Open a new sign-in window.', '网站关闭了浏览器标签页，请重新打开登录窗口。'],
   web_browser_still_loading: ['The website is still loading. Wait for the page before interacting again.', '网站仍在加载，请等页面更新后再操作。'],
   web_browser_action_uncertain: ['The browser could not confirm this action. Check the website before trying again.', '浏览器无法确认这次操作，请先查看网页状态再重试。'],
@@ -1343,7 +1344,13 @@ function showWebsiteLogin(flow, connector) {
     passwordSelected = result.input_kind === 'password';
     input.placeholder = passwordSelected ? tr('Password field selected. Type here.', '已选中密码框，在此输入')
       : result.editable ? tr('Field selected. Type here.', '已选中网页输入框，在此输入') : chooseField;
-    status.textContent = result.site_status ? tr(`The website returned HTTP ${result.site_status}.`, `网站返回了 HTTP ${result.site_status}。`) : '';
+    const submission = result.submit_activity;
+    status.textContent = result.site_status ? tr(`The website returned HTTP ${result.site_status}.`, `网站返回了 HTTP ${result.site_status}。`)
+      : submission?.activity === 'response' ? tr(`After submitting, the browser saw an HTTP ${submission.status} response. Check the website for the sign-in result.`, `提交后浏览器收到了 HTTP ${submission.status} 响应。请查看网页确认登录结果。`)
+      : submission?.activity === 'failed' ? tr('A network request after submitting failed before receiving an HTTP response.', '提交后的网络请求失败，未收到网站的 HTTP 响应。')
+      : submission?.activity === 'none' ? tr('No page navigation or form network request was observed after submitting.', '提交后暂未观察到网页跳转或表单网络请求。')
+      : submission?.activity === 'request' ? tr('The browser observed a network request after submitting.', '提交后浏览器观察到了网络请求。')
+      : submission?.activity === 'waiting' ? tr('Checking whether the website sent a request…', '正在检查网页是否发出请求…') : '';
     zoom = result.zoom ?? zoom;
     zoomLabel.textContent = zoom + '%';
     smaller.disabled = zoom === levels[0];

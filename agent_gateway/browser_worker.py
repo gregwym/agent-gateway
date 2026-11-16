@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary
@@ -29,6 +29,7 @@ class NoFocusedInput(Exception):
 
 PASSWORD_FOCUS_ERRORS = {
     "web_browser_password_missing", "web_browser_password_multiple", "web_browser_password_unavailable",
+    "web_browser_password_interrupted",
 }
 
 
@@ -53,6 +54,24 @@ class Navigation:
     started: float = 0
     failure: str | None = None
     status: int | None = None
+    submission: "Submission | None" = None
+
+
+@dataclass
+class Submission:
+    started: float = field(default_factory=time.monotonic)
+    requests: set = field(default_factory=set)
+    count: int = 0
+    status: int | None = None
+    failed: bool = False
+
+    def snapshot(self):
+        elapsed = time.monotonic() - self.started
+        if elapsed > 8:
+            self.requests.clear()
+        activity = ("response" if self.status is not None else "failed" if self.failed
+                    else "request" if self.count else "waiting" if elapsed < 2 else "none")
+        return {"activity": activity, "status": self.status}
 
 
 def is_web_frame(frame):
@@ -147,6 +166,25 @@ async def submit_form(page):
         await field.dispose()
 
 
+async def type_password(page, text):
+    target = await focused_input(page, kind_only=False)
+    if not target:
+        raise PasswordFocusError("web_browser_password_unavailable")
+    try:
+        # Some forms update their model on keyboard events. insert_text()
+        # only sends an input event. Recheck the target for each key so a
+        # handler moving focus does not receive the rest in another field.
+        for index, character in enumerate(text):
+            if not await target.evaluate("""node => node.isConnected && node.type === 'password' &&
+                node.ownerDocument.hasFocus() && node.getRootNode().activeElement === node &&
+                !node.matches(':disabled, [readonly]')"""):
+                raise PasswordFocusError("web_browser_password_interrupted" if index
+                                         else "web_browser_password_unavailable")
+            await page.keyboard.type(character)
+    finally:
+        await target.dispose()
+
+
 class Browser:
     def __init__(self, path):
         self.path = path
@@ -186,15 +224,28 @@ class Browser:
 
         def started(request):
             with suppress(Error):
-                if request.is_navigation_request() and request.frame == page.main_frame:
+                main_navigation = request.is_navigation_request() and request.frame == page.main_frame
+                if main_navigation:
                     nav.request, nav.started = request, time.monotonic()
                     nav.failure = nav.status = None
+                if ((submission := nav.submission) and time.monotonic() - submission.started <= 8
+                        and submission.count < 12 and (main_navigation or (
+                            request.resource_type in {"xhr", "fetch"} and request.method not in {"GET", "HEAD", "OPTIONS"}))):
+                    submission.requests.add(request)
+                    submission.count += 1
 
         def response(reply):
             if reply.request == nav.request:
                 nav.status = reply.status
+            if (submission := nav.submission) and reply.request in submission.requests:
+                if submission.status is None or reply.status >= 400 or submission.status < 400:
+                    submission.status = reply.status
+                submission.requests.discard(reply.request)
 
         def finished(request, failed=False):
+            if (submission := nav.submission) and request in submission.requests:
+                submission.failed |= failed and request.failure != "net::ERR_ABORTED"
+                submission.requests.discard(request)
             if request != nav.request:
                 return
             nav.request = None
@@ -295,6 +346,10 @@ class Browser:
                 raise BrowserActionError(nav.failure)
             if nav.request or current.scheme != "https":
                 raise BrowserActionError("web_browser_still_loading")
+        if op == "submit-form" or (op == "key" and body["key"] == "Enter"):
+            nav.submission = Submission()
+        elif op != "frame":
+            nav.submission = None
         if op == "tap":
             if self.touch:
                 await page.touchscreen.tap(body["x"], body["y"])
@@ -310,7 +365,10 @@ class Browser:
                 raise PasswordFocusError("web_browser_password_unavailable")
             if not kind:
                 raise NoFocusedInput
-            await page.keyboard.insert_text(body["text"])
+            if kind == "password":
+                await type_password(page, body["text"])
+            else:
+                await page.keyboard.insert_text(body["text"])
         elif op == "key":
             await page.keyboard.press(body["key"])
         elif op == "scroll":
@@ -352,7 +410,8 @@ class Browser:
                         return {"image": base64.b64encode(picture).decode("ascii"),
                                 "host": parts.hostname if parts.scheme == "https" else None,
                                 "zoom": self.zoom or 100, "editable": kind is not None, "input_kind": kind,
-                                "site_status": nav.status if nav.status and nav.status >= 400 else None}
+                                "site_status": nav.status if nav.status and nav.status >= 400 else None,
+                                "submit_activity": nav.submission.snapshot() if nav.submission else None}
             except (TimeoutError, BrowserTimeout):
                 raise BrowserActionError("web_browser_capture_failed") from None
             except Error:
