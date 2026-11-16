@@ -42,6 +42,14 @@ class Browser:
             with suppress(Exception):
                 await browser.close()
 
+    async def new_context(self, driver):
+        # Request the site's phone layout while keeping screenshot and input coordinates
+        # aligned, including on pages without an HTML viewport tag.
+        return await self.browser.new_context(
+            viewport={"width": WIDTH, "height": HEIGHT},
+            user_agent=driver.devices["Pixel 7"]["user_agent"], has_touch=True,
+            accept_downloads=False, service_workers="block")
+
     async def start(self, driver, body):
         self.id, self.expires = body["id"], body["expires"]
         self.zoom = None
@@ -71,8 +79,7 @@ class Browser:
             args=["--disable-quic", "--disable-sync", "--disable-background-networking",
                   "--disable-extensions", "--disable-crash-reporter", "--disable-breakpad",
                   "--disk-cache-size=1048576"])
-        self.context = await self.browser.new_context(viewport={"width": WIDTH, "height": HEIGHT},
-                                                      accept_downloads=False, service_workers="block")
+        self.context = await self.new_context(driver)
 
         async def guard(route):
             request = route.request

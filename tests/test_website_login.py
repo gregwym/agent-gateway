@@ -234,19 +234,22 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
 
 @pytest.mark.browser
 async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, monkeypatch):
-    from agent_gateway.browser_worker import Browser
+    from agent_gateway.browser_worker import Browser, WIDTH
     playwright = pytest.importorskip("playwright.async_api")
     async with playwright.async_playwright() as driver:
         chromium = await driver.chromium.launch()
         try:
             view = Browser(socket_dir / "control.sock")
-            view.context = await chromium.new_context(viewport={"width": 420, "height": 620})
+            view.browser = chromium
+            view.context = await view.new_context(driver)
             view.zoom = None
             page = await view.context.new_page()
             await page.route("https://*.example/**", lambda route: route.fulfill(
                 content_type="text/html",
-                body='<button style="width:100px">Continue</button><p>Before</p><input type="email">'))
+                body=('<button style="width:100px">Continue</button><p>Before</p><input type="email">'
+                      if "Mobile" in route.request.headers.get("user-agent", "") else "<p>Desktop page</p>")))
             await page.goto("https://signin.example/")
+            assert await page.evaluate("() => [innerWidth, navigator.maxTouchPoints > 0]") == [WIDTH, True]
             await page.get_by_role("button").evaluate(
                 "node => node.onclick = () => document.querySelector('p').textContent = 'Clicked'")
             result = await view.use("zoom", {"percent": 150})
