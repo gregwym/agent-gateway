@@ -263,7 +263,7 @@ function errorText(error) {
     AbortError: ['The browser cancelled this operation. Try again.', '浏览器取消了此次操作，请重试。']};
   return known[error.name] ? tr(...known[error.name]) : error.message;
 }
-function showError(source, error) {
+function showError(source, error, focus = true) {
   const dialog = source.closest('dialog');
   const box = dialog?.open && dialog.isConnected ? dialog : app;
   let message = box.querySelector('.operation-error');
@@ -271,7 +271,8 @@ function showError(source, error) {
     message = el(box, 'p', '', 'error operation-error'); message.setAttribute('role', 'alert'); message.tabIndex = -1;
     box.insertBefore(message, box === app ? box.firstChild : box.children[2] || null);
   }
-  message.textContent = errorText(error); message.scrollIntoView({block: 'nearest'}); message.focus();
+  message.textContent = errorText(error);
+  if (focus) { message.scrollIntoView({block: 'nearest'}); message.focus(); }
 }
 async function api(path, body, timeoutMs = 45000) {
   const controller = new AbortController();
@@ -1211,8 +1212,9 @@ function showWebsiteLogin(flow, connector) {
   const send = el(keyboard, 'button', tr('Type', '输入'));
   send.type = 'submit';
   const tools = el(box, 'div', undefined, 'login-controls');
-  const levels = [100, 125, 150, 200];
-  let busy = false, timer, url, saved = false, pointer, zoom = 100;
+  const levels = flow.zoom_levels;
+  let queue = Promise.resolve(), queued = 0, sending = false;
+  let timer, url, saved = false, pointer, zoom = 100, lastImage;
   function fit() {
     // iOS can shrink the visual viewport without changing CSS viewport units
     // while its keyboard is open. Keep the input and submit button above it.
@@ -1225,10 +1227,14 @@ function showWebsiteLogin(flow, connector) {
   window.visualViewport?.addEventListener('scroll', fit);
   fit();
   function frame(result) {
-    const bytes = Uint8Array.from(atob(result.image), c => c.charCodeAt(0));
-    if (url) URL.revokeObjectURL(url);
-    url = URL.createObjectURL(new Blob([bytes], {type: 'image/jpeg'}));
-    picture.src = url;
+    if (result.image !== lastImage) {
+      const bytes = Uint8Array.from(atob(result.image), c => c.charCodeAt(0));
+      const previous = url;
+      url = URL.createObjectURL(new Blob([bytes], {type: 'image/jpeg'}));
+      picture.src = url;
+      if (previous) URL.revokeObjectURL(previous);
+      lastImage = result.image;
+    }
     host.textContent = result.host || flow.host;
     status.textContent = '';
     zoom = result.zoom ?? zoom;
@@ -1236,46 +1242,57 @@ function showWebsiteLogin(flow, connector) {
     smaller.disabled = zoom === levels[0];
     bigger.disabled = zoom === levels.at(-1);
   }
+  function enqueue(task) {
+    const result = queue.then(task);
+    queue = result.catch(() => {});
+    return result;
+  }
   async function perform(op, props = {}) {
-    if (busy || !box.open) return;
-    busy = true;
-    send.disabled = true;
+    if (!box.open) return;
+    if (queued >= 8) throw new Error(tr('Wait for the browser to catch up, then try again.', '请等网页响应后再试。'));
+    queued++;
     try {
-      const result = await api('web-login/' + op, {id: flow.id, ...props}, op === 'save' ? 60000 : 15000);
-      if (!box.open) return;
-      if (op === 'save') {
-        saved = true;
-        box.close();
-        connector.close();
-        await refresh();
-        notify(tr('Session saved.', '会话已保存。'));
-      } else frame(result);
-    } finally { busy = false; send.disabled = false; }
+      await enqueue(async () => {
+        if (!box.open) return;
+        const body = typeof props === 'function' ? props() : props;
+        if (!body) return;
+        box.querySelector('.operation-error')?.remove();
+        const result = await api('web-login/' + op, {id: flow.id, ...body}, op === 'save' ? 60000 : 15000);
+        if (!box.open) return;
+        if (op === 'save') {
+          saved = true;
+          box.close();
+          connector.close();
+          await refresh();
+          notify(tr('Session saved.', '会话已保存。'));
+        } else frame(result);
+      });
+    } finally { queued--; }
   }
-  function action(op, props = {}) {
-    if (busy) return;
-    box.querySelector('.operation-error')?.remove();
-    perform(op, props).catch(error => showError(box, error));
+  function action(op, props) {
+    perform(op, props).catch(error => { if (box.open) showError(box, error); });
   }
-  keyboard.addEventListener('submit', event => {
+  keyboard.addEventListener('submit', async event => {
     event.preventDefault();
-    if (!input.value || busy) return;
+    if (!input.value || sending) return;
     const text = input.value;
     input.value = '';
     input.blur();
-    action('text', {text});
+    sending = send.disabled = true;
+    try { await perform('text', {text}); }
+    catch (error) { if (box.open) showError(box, error); }
+    finally { sending = send.disabled = false; }
   });
-  const changeZoom = step => {
+  const changeZoom = step => action('zoom', () => {
     const percent = levels[levels.indexOf(zoom) + step];
-    if (percent) action('zoom', {percent});
-  };
+    return percent ? {percent} : null;
+  });
   const smaller = el(tools, 'button', '−');
   const zoomLabel = el(tools, 'span', '100%', 'login-zoom');
   const bigger = el(tools, 'button', '+');
   smaller.type = bigger.type = 'button';
   smaller.setAttribute('aria-label', tr('Zoom out', '缩小网页'));
   bigger.setAttribute('aria-label', tr('Zoom in', '放大网页'));
-  smaller.disabled = true;
   smaller.addEventListener('click', () => changeZoom(-1));
   bigger.addEventListener('click', () => changeZoom(1));
   button(tools, 'Tab', () => perform('key', {key: 'Tab'}));
@@ -1288,9 +1305,9 @@ function showWebsiteLogin(flow, connector) {
             y: clamp((event.clientY - rect.top) * flow.height / rect.height, flow.height)};
   };
   picture.addEventListener('pointerdown', event => {
-    if (event.button !== 0 || !picture.src) return;
-    picture.setPointerCapture(event.pointerId);
+    if (event.button !== 0 || !picture.src || pointer) return;
     pointer = {id: event.pointerId, ...coordinate(event)};
+    try { picture.setPointerCapture(event.pointerId); } catch {}
   });
   picture.addEventListener('pointerup', event => {
     if (pointer?.id !== event.pointerId) return;
@@ -1299,25 +1316,26 @@ function showWebsiteLogin(flow, connector) {
     else action('tap', point);
     pointer = null;
   });
-  picture.addEventListener('pointercancel', () => { pointer = null; });
+  picture.addEventListener('pointercancel', event => { if (pointer?.id === event.pointerId) pointer = null; });
   picture.addEventListener('wheel', event => {
     if (!picture.src) return;
     event.preventDefault();
     const amount = delta => Math.round(Math.max(-1200, Math.min(1200, delta * (event.deltaMode === 1 ? 25 : 1))));
     const dx = amount(event.deltaX), dy = amount(event.deltaY);
-    if (dx || dy) action('scroll', {...coordinate(event), dx, dy});
+    if ((dx || dy) && queued < 4) action('scroll', {...coordinate(event), dx, dy});
   }, {passive: false});
   async function poll() {
     if (!box.open || !box.isConnected) return;
     try {
-      // Do not consume a tap while a passive screen refresh is in flight.
-      if (!busy) {
+      // A refresh and user actions share one queue so a slow frame cannot
+      // overwrite a later tap or zoom. Refresh never queues behind user input.
+      if (!queued) await enqueue(async () => {
         const result = await api('web-login/frame', {id: flow.id}, 15000);
-        if (!busy && box.open && box.isConnected) frame(result);
-      }
+        if (box.open && box.isConnected) frame(result);
+      });
     } catch (error) {
       if (!box.open || !box.isConnected) return;
-      showError(box, error);
+      showError(box, error, false);
       if (error.code === 'web_browser_expired') return;
     }
     if (box.open && box.isConnected) timer = setTimeout(poll, 1700);

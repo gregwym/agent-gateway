@@ -25,7 +25,8 @@ from .web_profiles import CUSTOM_PROFILE, PROFILE_ENV, SESSION_ENV, WebProfile, 
 # accepted as destinations supplied by an Agent.
 BUNDLED = {
     "www.amazon.com": (("www.amazon.com",), ("media-amazon.com", "ssl-images-amazon.com", "amazon.com")),
-    "www.weee.com": (("www.weee.com", "www.sayweee.com", "weee.com", "sayweee.com"), ("static.weeecdn.com",)),
+    "www.weee.com": (("www.weee.com", "www.sayweee.com", "weee.com", "sayweee.com"),
+                     ("weeecdn.com", "weeecdn.net")),
 }
 
 
@@ -148,7 +149,7 @@ class WebsiteLogin:
                 with anyio.CancelScope(shield=True):
                     await self.close()
                 raise
-            return {"id": ident, "width": WIDTH, "height": HEIGHT, "host": host}
+            return {"id": ident, "width": WIDTH, "height": HEIGHT, "host": host, "zoom_levels": ZOOM_LEVELS}
 
     async def input(self, operation, body, session, token):
         async with self.lock:

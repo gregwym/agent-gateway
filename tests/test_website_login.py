@@ -27,7 +27,7 @@ def socket_dir():
 
 
 def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
-    backend = {"auth": False, "actions": [], "inputs": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": []}
+    backend = {"auth": False, "actions": [], "inputs": [], "taps": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": []}
 
     def fetch(host, target, method, headers, body, receive):
         assert host == site and method == "HEAD" and target == "/" and body is None
@@ -39,6 +39,8 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
         backend["actions"].append(action)
         if action == "text":
             backend["inputs"].append(data["text"])
+        if action == "tap":
+            backend["taps"].append((data["x"], data["y"]))
         if action == "scroll":
             backend["swipes"].append((data["dx"], data["dy"]))
         if action == "zoom":
@@ -161,7 +163,20 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         }""")
         await login_box.get_by_role("button", name="放大网页").tap()
         await playwright.expect(login_box.locator('.login-zoom')).to_have_text("125%")
-        assert backend["zoom"] == 125
+        smaller = login_box.get_by_role("button", name="缩小网页")
+        for _ in range(3):
+            await smaller.tap()
+        await playwright.expect(login_box.locator('.login-zoom')).to_have_text("67%")
+        assert backend["zoom"] == 67
+
+        scroll_started, release = asyncio.Event(), asyncio.Event()
+
+        async def delay_scroll(route):
+            scroll_started.set()
+            await release.wait()
+            await route.continue_()
+
+        await page.route("**/admin/api/web-login/scroll", delay_scroll)
         await image.scroll_into_view_if_needed()
         await image.evaluate("""image => {
             const {left, top} = image.getBoundingClientRect();
@@ -170,19 +185,24 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
             image.dispatchEvent(new PointerEvent("pointerdown", {...point, clientX: left + 120}));
             image.dispatchEvent(new PointerEvent("pointerup", {...point, clientX: left + 40}));
         }""")
-        await page.wait_for_function(
-            """() => !document.querySelector('.login-keyboard button').disabled""")
-        assert backend["swipes"] and backend["swipes"][0][0] > 0 and backend["swipes"][0][1] == 0
-        await image.tap(position={"x": 40, "y": 60})
-        await login_box.get_by_label("输入到选中的框").fill("demo-only-login")
-        await login_box.get_by_role("button", name="输入", exact=True).tap()
+        try:
+            await asyncio.wait_for(scroll_started.wait(), timeout=5)
+            await image.tap(position={"x": 40, "y": 60})
+            await login_box.get_by_label("输入到选中的框").fill("demo-only-login")
+            await login_box.get_by_role("button", name="输入", exact=True).tap()
+        finally:
+            release.set()
         await playwright.expect(login_box.get_by_label("输入到选中的框")).to_have_value("")
+        await playwright.expect(login_box.get_by_role("button", name="输入", exact=True)).to_be_enabled()
         backend["auth"] = True
         await login_box.get_by_role("button", name="保存会话", exact=True).tap()
         row = page.locator('tr[data-connection="amazon-orders"]')
         await playwright.expect(row).to_contain_text("会话已保存")
         assert not backend["reads"]
-        assert backend["inputs"] == ["demo-only-login"] and "tap" in backend["actions"]
+        assert backend["swipes"] and backend["swipes"][0][0] > 0 and backend["swipes"][0][1] == 0
+        assert backend["inputs"] == ["demo-only-login"] and len(backend["taps"]) == 1
+        assert (backend["actions"].index("scroll") < backend["actions"].index("tap")
+                < backend["actions"].index("text"))
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         if directory := os.environ.get("AGW_TEST_ARTIFACTS"):
             await page.screenshot(path=str(Path(directory) / "mobile-website-connected.png"))
@@ -201,7 +221,7 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
             page = await view.context.new_page()
             await page.route("https://signin.example/**", lambda route: route.fulfill(
                 content_type="text/html",
-                body='<button style="width:100px">Continue</button><p>Before</p>'))
+                body='<button style="width:100px">Continue</button><p>Before</p><input type="email">'))
             await page.goto("https://signin.example/")
             await page.get_by_role("button").evaluate(
                 "node => node.onclick = () => document.querySelector('p').textContent = 'Clicked'")
@@ -216,5 +236,14 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
             await page.goto("https://signin.example/next")
             await view.use("frame", {})
             assert (await page.get_by_role("button").bounding_box())["width"] == 150
+            result = await view.use("zoom", {"percent": 67})
+            assert result["zoom"] == 67
+            assert (await page.get_by_role("button").bounding_box())["width"] == 67
+            email = page.get_by_role("textbox")
+            rect = await email.bounding_box()
+            await view.use("tap", {"x": int(rect["x"] + 4), "y": int(rect["y"] + rect["height"] / 2)})
+            await view.use("text", {"text": "simulated@example.test"})
+            await playwright.expect(email).to_be_focused()
+            await playwright.expect(email).to_have_value("simulated@example.test")
         finally:
             await chromium.close()

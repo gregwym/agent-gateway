@@ -17,7 +17,7 @@ from .browser_tunnel import host_allowed, tunnel
 
 WIDTH, HEIGHT = 420, 620
 KEYS = {"Enter", "Tab", "Backspace", "Escape"}
-ZOOM_LEVELS = (100, 125, 150, 200)
+ZOOM_LEVELS = (50, 67, 80, 100, 125, 150, 200)
 FLOW = re.compile(r"[0-9a-f]{24}")
 
 
