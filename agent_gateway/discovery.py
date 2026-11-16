@@ -14,6 +14,12 @@ from .web_profiles import connection_origins
 SEARCH_TOOLS = "gateway_search_tools"
 SEARCH_CONNECTIONS = "gateway_search_connections"
 CALL_TOOL = "gateway_call_tool"
+DISCOVERY_INSTRUCTIONS = (
+    "Start with gateway_search_connections to select an authorized account or website. "
+    "Then call gateway_search_tools with that connection ID and a focused query; "
+    "this returns only the relevant tool schemas. Use gateway_call_tool with the selected connection and tool. "
+    "Search tools across all connections only when the target connection is unknown."
+)
 
 
 def schema(properties, required=()):
@@ -28,10 +34,19 @@ PAGING = {"query": text("Optional search words; empty finds all permitted matche
           "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
           "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10}}
 TOOLS = [
-    types.Tool(name=SEARCH_TOOLS, description="Search the tools this Agent may use. Tools are shared across connections. Returns names, parameter schemas and connection counts. Use gateway_search_connections to inspect connection-specific restrictions, then gateway_call_tool to execute. Results reflect current permissions, without reloading the MCP tool list.",
-               input_schema=schema({**PAGING, "connection": text("Optional connection ID to search within.", 48)}), annotations=types.ToolAnnotations(read_only_hint=True)),
-    types.Tool(name=SEARCH_CONNECTIONS, description="Search connections this Agent may access by name, service, owner, or known mailbox address and aliases. Mail aliases share the same connection ID. Optionally specify a tool from gateway_search_tools to see its permitted parameter variants and approval requirements on each connection. Hidden or denied connections are never returned.",
-               input_schema=schema({**PAGING, "tool": text("Optional shared tool name from gateway_search_tools.", 128)}), annotations=types.ToolAnnotations(read_only_hint=True)),
+    types.Tool(name=SEARCH_CONNECTIONS, description=(
+        "Start here to find an authorized connection by account, website, service, or owner. "
+        "Mail addresses and their aliases share a connection ID. Pass the selected ID to gateway_search_tools "
+        "so you only receive schemas for that connection. If you already know a tool, pass it here to inspect "
+        "its connection-specific variants and approval requirements."
+    ), input_schema=schema({**PAGING, "tool": text("Optional known shared tool name.", 128)}),
+        annotations=types.ToolAnnotations(read_only_hint=True)),
+    types.Tool(name=SEARCH_TOOLS, description=(
+        "Find permitted tools and their parameter schemas. First use gateway_search_connections to pick a connection, "
+        "then pass its ID as connection and use a focused query. Omit the connection only to search across accounts. "
+        "Results reflect current permissions; run a selected tool with gateway_call_tool."
+    ), input_schema=schema({**PAGING, "connection": text("Connection ID from gateway_search_connections. Omit only to search across all permitted connections.", 48)}),
+        annotations=types.ToolAnnotations(read_only_hint=True)),
     types.Tool(
         name=CALL_TOOL,
         description="Execute a permitted tool: generate a new idempotency_key for each intended operation and pass "

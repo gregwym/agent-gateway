@@ -55,27 +55,28 @@ aggregate service data, or call an LLM. It uses the official
 
 ## Discover and call tools
 
-The default MCP tool list contains three connector entry points:
+The default MCP tool list contains three connector entry points. Start with the
+connection, then search within it so the Agent sees only relevant tool schemas.
 
 | Tool | Purpose |
 |---|---|
-| `gateway_search_tools` | Find permitted tools and their parameter schemas |
-| `gateway_search_connections` | Find permitted connections, restrictions and approval requirements |
+| `gateway_search_connections` | Find the account or website and its connection ID |
+| `gateway_search_tools` | Find tools and parameter schemas for the selected connection |
 | `gateway_call_tool` | Call a tool on a selected connection |
 
 Example `tools/call` parameters using the demo configuration:
 
 ```json
-{"name":"gateway_search_tools","arguments":{"query":"notes"}}
-{"name":"gateway_search_connections","arguments":{"tool":"notes_add_note"}}
+{"name":"gateway_search_connections","arguments":{"query":"notes-a"}}
+{"name":"gateway_search_tools","arguments":{"connection":"notes-a","query":"add_note"}}
 {"name":"gateway_call_tool","arguments":{"idempotency_key":"340a7ed1-5d9f-4238-935d-23f3c87ccbb8","tool":"notes_add_note","connection":"notes-a","arguments":{"folder":"inbox","text":"Example note"}}}
 {"name":"gateway_call_tool","arguments":{"idempotency_key":"340a7ed1-5d9f-4238-935d-23f3c87ccbb8"}}
 ```
 
 Searches operate on metadata, not account contents. Both support `query`, `offset`
-and `limit` (1–25). Use the returned `next_offset` to continue. Tool search can
-filter by `connection`; connection search can filter by `tool` and returns the
-exact schema for each permitted binding. Supply `variant` when a connection has
+and `limit` (1–25). Use the returned `next_offset` to continue. Omit the
+`connection` filter only when exploring across accounts. If a tool is already
+known, filter connection search by `tool` for its variants and approval rules. Supply `variant` when a connection has
 multiple restricted bindings for the same tool.
 
 For IMAP and Gmail, connection search also matches known mailbox addresses. In

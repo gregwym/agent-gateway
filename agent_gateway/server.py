@@ -648,6 +648,7 @@ def build_app(gateway: Gateway) -> Starlette:
     server: Server[Any] = Server(
         "agent-gateway",
         version=__version__,
+        instructions=discovery.DISCOVERY_INSTRUCTIONS if cfg.server.tool_discovery == "search" else None,
         on_list_tools=list_tools,
         on_call_tool=call_tool,
         # Called before the caller is known, so it must not reveal anything: no schema, no validation.
