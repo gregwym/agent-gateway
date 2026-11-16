@@ -30,7 +30,7 @@ def socket_dir():
 
 
 def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
-    backend = {"auth": False, "actions": [], "inputs": [], "taps": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": [], "active": None}
+    backend = {"auth": False, "actions": [], "inputs": [], "taps": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": [], "active": None, "password_selected": False}
 
     def fetch(host, target, method, headers, body, receive):
         assert host == site and method == "HEAD" and target == "/" and body is None
@@ -44,6 +44,9 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
             return {"id": backend["active"]}
         if action == "text":
             backend["inputs"].append(data["text"])
+            assert data.get("expect_password", False) == backend["password_selected"]
+        if action == "focus-password":
+            backend["password_selected"] = True
         if action == "tap":
             backend["taps"].append((data["x"], data["y"]))
         if action == "scroll":
@@ -67,7 +70,8 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
             return {"cookies": [{"name": "auth", "domain": site, "value": SECRET},
                                 {"name": "auth", "domain": "evil.test", "value": "unrelated-password"}]}
         return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"],
-                "editable": bool(backend["taps"])}
+                "editable": bool(backend["taps"]) or backend["password_selected"],
+                "input_kind": "password" if backend["password_selected"] else None}
 
     monkeypatch.setattr(web, "_fetch", fetch)
     monkeypatch.setattr(WebsiteLogin, "worker", worker)
@@ -299,13 +303,32 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         await playwright.expect(login_box.get_by_label("输入到选中的框")).to_have_value("")
         await playwright.expect(login_box.get_by_role("button", name="输入", exact=True)).to_be_enabled()
         await playwright.expect(login_box.get_by_label("输入到选中的框")).to_have_attribute("placeholder", "已选中网页输入框，在此输入")
+
+        # A finger can drift a little on a shrunken image, even as the layout
+        # changes. Send the original tap with the original image dimensions.
+        await image.evaluate("""image => {
+            image.getBoundingClientRect = () => ({left: 20, top: 30, width: 100, height: 200});
+            const point = {pointerId: 2, pointerType: "touch", button: 0, clientY: 130};
+            image.dispatchEvent(new PointerEvent("pointerdown", {...point, clientX: 45}));
+            image.getBoundingClientRect = () => ({left: 45, top: 60, width: 140, height: 250});
+            image.dispatchEvent(new PointerEvent("pointerup", {...point, clientX: 53}));
+            delete image.getBoundingClientRect;
+        }""")
+        await login_box.get_by_role("button", name="选中密码框", exact=True).tap()
+        password_status = login_box.get_by_label("输入到选中的框")
+        await playwright.expect(password_status).to_have_attribute("placeholder", "已选中密码框，在此输入")
+        assert backend["taps"][-1] == (backend["display"]["viewport"]["width"] // 4,
+                                      backend["display"]["viewport"]["height"] // 2)
+        await password_status.fill("simulated-password")
+        await login_box.get_by_role("button", name="输入", exact=True).tap()
+        await playwright.expect(login_box.get_by_role("button", name="输入", exact=True)).to_be_enabled()
         backend["auth"] = True
         await login_box.get_by_role("button", name="保存会话", exact=True).tap()
         row = page.locator('tr[data-connection="amazon-orders"]')
         await playwright.expect(row).to_contain_text("会话已保存")
         assert not backend["reads"]
-        assert backend["swipes"] and backend["swipes"][0][0] > 0 and backend["swipes"][0][1] == 0
-        assert backend["inputs"] == ["demo-only-login"] and len(backend["taps"]) == 1
+        assert len(backend["swipes"]) == 1 and backend["swipes"][0][0] > 0 and backend["swipes"][0][1] == 0
+        assert backend["inputs"] == ["demo-only-login", "simulated-password"] and len(backend["taps"]) == 2
         assert (backend["actions"].index("scroll") < backend["actions"].index("tap")
                 < backend["actions"].index("text"))
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -413,3 +436,56 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
             assert (await view.use("tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)}))["editable"]
         finally:
             await chromium.close()
+
+
+@pytest.mark.browser
+async def test_password_focus_when_tap_and_tab_cannot_select_it(socket_dir):
+    from agent_gateway.browser_worker import Browser, PasswordFocusError
+    playwright = pytest.importorskip("playwright.async_api")
+    async with playwright.async_playwright() as driver:
+        view = Browser(socket_dir / "control.sock")
+        view.browser = await driver.chromium.launch()
+        try:
+            view.context = await view.new_context({"width": 390, "height": 650}, True, "TestBrowser")
+            view.zoom = None
+            page = await view.context.new_page()
+            await page.route("https://signin.example/", lambda route: route.fulfill(
+                content_type="text/html",
+                body='<input type="email" aria-label="Email"><iframe src="https://identity.example/"></iframe>'))
+            await page.route("https://identity.example/", lambda route: route.fulfill(
+                content_type="text/html",
+                body=('<form onsubmit="event.preventDefault(); this.dataset.submitted = 1">'
+                      '<input type="password" style="opacity:0" title="Hidden">'
+                      '<input type="password" tabindex="-1" aria-label="Password" '
+                      'ontouchstart="event.preventDefault()">'
+                      '</form>')))
+            await page.goto("https://signin.example/")
+            email = page.get_by_role("textbox", name="Email")
+            await email.focus()
+            assert (await view.use("frame", {}))["input_kind"] == "text"
+            password = page.frame_locator("iframe").get_by_label("Password")
+            bounds = await password.bounding_box()
+            result = await view.use("tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)})
+            assert result["input_kind"] != "password"
+            assert (await view.use("key", {"key": "Tab"}))["input_kind"] != "password"
+
+            assert (await view.use("focus-password", {}))["input_kind"] == "password"
+            await email.focus()  # A page change or script can steal focus before Type.
+            with pytest.raises(PasswordFocusError, match="web_browser_password_unavailable"):
+                await view.use("text", {"text": "simulated-password", "expect_password": True})
+            await playwright.expect(email).to_have_value("")
+            await view.use("focus-password", {})
+            await view.use("text", {"text": "simulated-password", "expect_password": True})
+            await playwright.expect(password).to_have_value("simulated-password")
+            assert await page.frame_locator("iframe").locator("form").get_attribute("data-submitted") is None
+
+            second = page.locator('input[type="password"]')
+            await page.evaluate("() => document.body.insertAdjacentHTML('beforeend', '<input type=password>')")
+            with pytest.raises(PasswordFocusError, match="web_browser_password_multiple"):
+                await view.use("focus-password", {})
+            await second.evaluate("node => node.remove()")
+            await password.evaluate("node => node.hidden = true")
+            with pytest.raises(PasswordFocusError, match="web_browser_password_missing"):
+                await view.use("focus-password", {})
+        finally:
+            await view.close()

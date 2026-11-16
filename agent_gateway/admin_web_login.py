@@ -16,7 +16,7 @@ import httpx2 as httpx
 
 from .admin_config import CONNECTOR_NAME, kind_of, make_connection
 from .browser_tunnel import connect
-from .browser_worker import FLOW, HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
+from .browser_worker import FLOW, HEIGHT, KEYS, PASSWORD_FOCUS_ERRORS, WIDTH, ZOOM_LEVELS
 from .connectors.web import import_session
 from .passkey import Refused
 from .plugins import connector_plugins
@@ -43,9 +43,10 @@ class WebsiteLogin:
                 response = await client.post("/" + action, json=data)
             if response.status_code in (409, 410):
                 raise Refused("web_browser_in_use" if response.status_code == 409 else "web_browser_expired", 409)
-            if (action == "text" and response.status_code == 422
-                    and response.json().get("error") == "web_browser_select_field"):
-                raise Refused("web_browser_select_field", 422)
+            if response.status_code == 422 and action in {"text", "focus-password"}:
+                code = response.json().get("error")
+                if isinstance(code, str) and (code in PASSWORD_FOCUS_ERRORS or code == "web_browser_select_field"):
+                    raise Refused(code, 422)
             response.raise_for_status()
             return response.json()
         except httpx.TimeoutException:
@@ -210,7 +211,8 @@ class WebsiteLogin:
                 "frame": (),
                 "tap": ("x", "y"),
                 "scroll": ("x", "y", "dx", "dy"),
-                "text": ("text",),
+                "text": ("text", "expect_password") if "expect_password" in body else ("text",),
+                "focus-password": (),
                 "key": ("key",),
                 "reload": (),
                 "zoom": ("percent",),
@@ -223,6 +225,7 @@ class WebsiteLogin:
                                                 for key in ("dx", "dy"))
                     or "text" in body and not (isinstance(body["text"], str) and 0 < len(body["text"]) <= 2048
                                                and not any(ord(s) < 32 for s in body["text"]))
+                    or "expect_password" in body and body["expect_password"] is not True
                     or "key" in body and not (isinstance(body["key"], str) and body["key"] in KEYS)
                     or "percent" in body and not (type(body["percent"]) is int and body["percent"] in ZOOM_LEVELS)):
                 raise Refused("web_browser_input", 400)

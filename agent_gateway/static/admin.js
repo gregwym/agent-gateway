@@ -196,6 +196,9 @@ const messages = {
   web_browser_timeout: ['The login browser stopped responding. Refresh it or open a new window.', '登录浏览器响应超时，请刷新或重新打开窗口。'],
   web_browser_failed: ['The login page could not be loaded or operated. Refresh it and try again.', '无法加载或操作登录页，请刷新后重试。'],
   web_browser_select_field: ['No editable field is selected. Tap the field or use Tab, then press Type again.', '还没有选中可输入的网页字段。点选字段或用 Tab 切换，再按「输入」。'],
+  web_browser_password_missing: ['No visible password field was found on this page.', '此页没有找到可见的密码框。'],
+  web_browser_password_multiple: ['This page has more than one password field. Select the one you want.', '此页有多个密码框，请点选要输入的那个。'],
+  web_browser_password_unavailable: ['The password field is not ready for typing. Select it again before entering your password.', '密码框还不能输入。请重新选中密码框再输入。'],
   web_browser_input: ['This browser action is invalid. Try again.', '浏览器操作无效，请重试。'],
   web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
   web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
@@ -1298,6 +1301,7 @@ function showWebsiteLogin(flow, connector) {
   const tools = el(box, 'div', undefined, 'login-controls');
   const levels = flow.zoom_levels;
   let queue = Promise.resolve(), queued = 0, sending = false;
+  let passwordSelected = false, typingPassword = false;
   let timer, url, saved = false, pointer, zoom = 100, lastImage;
   function fit() {
     // iOS can shrink the visual viewport without changing CSS viewport units
@@ -1320,7 +1324,9 @@ function showWebsiteLogin(flow, connector) {
       lastImage = result.image;
     }
     host.textContent = result.host || flow.host;
-    input.placeholder = result.editable ? tr('Field selected. Type here.', '已选中网页输入框，在此输入') : chooseField;
+    passwordSelected = result.input_kind === 'password';
+    input.placeholder = passwordSelected ? tr('Password field selected. Type here.', '已选中密码框，在此输入')
+      : result.editable ? tr('Field selected. Type here.', '已选中网页输入框，在此输入') : chooseField;
     status.textContent = '';
     zoom = result.zoom ?? zoom;
     zoomLabel.textContent = zoom + '%';
@@ -1357,17 +1363,22 @@ function showWebsiteLogin(flow, connector) {
   function action(op, props) {
     perform(op, props).catch(error => { if (box.open) showError(box, error); });
   }
+  input.addEventListener('input', () => { typingPassword = Boolean(input.value) && (typingPassword || passwordSelected); });
   keyboard.addEventListener('submit', async event => {
     event.preventDefault();
     if (!input.value || sending) return;
-    const text = input.value;
+    const text = input.value, expectPassword = typingPassword || passwordSelected;
     input.value = '';
+    typingPassword = false;
     input.blur();
     sending = send.disabled = true;
-    try { await perform('text', {text}); }
+    try { await perform('text', expectPassword ? {text, expect_password: true} : {text}); }
     catch (error) {
       if (box.open) {
-        if (error.code === 'web_browser_select_field' && !input.value) input.value = text;
+        if (['web_browser_select_field', 'web_browser_password_unavailable'].includes(error.code) && !input.value) {
+          input.value = text;
+          typingPassword = expectPassword;
+        }
         showError(box, error);
       }
     }
@@ -1385,29 +1396,38 @@ function showWebsiteLogin(flow, connector) {
   bigger.setAttribute('aria-label', tr('Zoom in', '放大网页'));
   smaller.addEventListener('click', () => changeZoom(-1));
   bigger.addEventListener('click', () => changeZoom(1));
+  button(tools, tr('Select password field', '选中密码框'), () => perform('focus-password'));
   button(tools, 'Tab', () => perform('key', {key: 'Tab'}));
   button(tools, '⌫', () => perform('key', {key: 'Backspace'})).setAttribute('aria-label', tr('Backspace', '退格'));
   button(tools, 'Enter', () => perform('key', {key: 'Enter'}));
   button(tools, tr('Reload', '刷新'), () => perform('reload'));
-  const coordinate = event => {
-    const rect = picture.getBoundingClientRect(), clamp = (n, max) => Math.min(max - 1, Math.max(0, Math.floor(n)));
+  const coordinate = (event, rect = picture.getBoundingClientRect()) => {
+    const clamp = (n, max) => Math.min(max - 1, Math.max(0, Math.floor(n)));
     return {x: clamp((event.clientX - rect.left) * flow.width / rect.width, flow.width),
             y: clamp((event.clientY - rect.top) * flow.height / rect.height, flow.height)};
   };
   const scrollAmount = delta => Math.round(Math.max(-1200, Math.min(1200, delta)));
   picture.addEventListener('pointerdown', event => {
     if (event.button !== 0 || !picture.src || pointer) return;
-    pointer = {id: event.pointerId, ...coordinate(event)};
+    const rect = picture.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    pointer = {id: event.pointerId, rect, clientX: event.clientX, clientY: event.clientY};
     try { picture.setPointerCapture(event.pointerId); } catch {}
   });
   picture.addEventListener('pointerup', event => {
     if (pointer?.id !== event.pointerId) return;
-    const point = coordinate(event), dx = pointer.x - point.x, dy = pointer.y - point.y;
-    if (Math.hypot(dx, dy) > 20) action('scroll', {x: pointer.x, y: pointer.y, dx: scrollAmount(dx * 1.6), dy: scrollAmount(dy * 1.6)});
-    else action('tap', point);
+    const start = pointer;
     pointer = null;
+    const point = coordinate(start, start.rect);
+    // Measure drift on the device; a small movement can span many remote pixels.
+    if (Math.hypot(start.clientX - event.clientX, start.clientY - event.clientY) > 12) {
+      const end = coordinate(event, start.rect);
+      action('scroll', {...point, dx: scrollAmount((point.x - end.x) * 1.6), dy: scrollAmount((point.y - end.y) * 1.6)});
+    } else action('tap', point);
   });
-  picture.addEventListener('pointercancel', event => { if (pointer?.id === event.pointerId) pointer = null; });
+  const clearPointer = event => { if (pointer?.id === event.pointerId) pointer = null; };
+  picture.addEventListener('pointercancel', clearPointer);
+  picture.addEventListener('lostpointercapture', clearPointer);
   picture.addEventListener('wheel', event => {
     if (!picture.src) return;
     event.preventDefault();

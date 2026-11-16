@@ -25,27 +25,77 @@ class NoFocusedInput(Exception):
     pass
 
 
-async def has_focused_input(page):
+PASSWORD_FOCUS_ERRORS = {
+    "web_browser_password_missing", "web_browser_password_multiple", "web_browser_password_unavailable",
+}
+
+
+class PasswordFocusError(Exception):
+    pass
+
+
+def is_web_frame(frame):
+    return urlsplit(frame.url).scheme == "https" or frame.url in {"about:blank", "about:srcdoc"}
+
+
+async def focused_input_kind(page):
     # Follow the active element into a frame or shadow root, without reading
     # any text, names or values from the form.
     frame = page.main_frame
-    while frame is not None:
+    while frame is not None and is_web_frame(frame):
         focus = await frame.evaluate_handle("""() => {
             let node = document.activeElement;
             while (node?.shadowRoot?.activeElement) node = node.shadowRoot.activeElement;
             return node;
         }""")
         try:
-            if await focus.evaluate("""node => !!node && !node.matches(':disabled, [readonly]') &&
-                (node.isContentEditable || node.tagName === 'TEXTAREA' ||
-                 node.tagName === 'INPUT' && ['text', 'password', 'email', 'tel', 'url', 'search', 'number'].includes(node.type))
-            """):
-                return True
+            kind = await focus.evaluate("""node => {
+                if (!node || node.matches(':disabled, [readonly]') ||
+                    !node.checkVisibility({opacityProperty: true, visibilityProperty: true})) return null;
+                if (node.tagName === 'INPUT' && node.type === 'password') return 'password';
+                if (node.isContentEditable || node.tagName === 'TEXTAREA' ||
+                    node.tagName === 'INPUT' && ['text', 'email', 'tel', 'url', 'search', 'number'].includes(node.type))
+                    return 'text';
+                return null;
+            }
+            """)
+            if kind:
+                return kind
             element = focus.as_element()
             frame = await element.content_frame() if element else None
         finally:
             await focus.dispose()
-    return False
+    return None
+
+
+async def focus_password(page):
+    from playwright.async_api import Error
+
+    # The rendered page decides where the password lives. If several fields
+    # are visible (such as a change-password form), do not choose one for the user.
+    handles = []
+    try:
+        for frame in page.frames:
+            if is_web_frame(frame):
+                handles.extend(await frame.locator('input[type="password"]:visible').element_handles())
+        # Playwright's :visible also matches fully transparent inputs.
+        fields = [field for field in handles if await field.evaluate(
+            "node => node.checkVisibility({opacityProperty: true})")]
+        if not fields:
+            raise PasswordFocusError("web_browser_password_missing")
+        if len(fields) != 1:
+            raise PasswordFocusError("web_browser_password_multiple")
+        field = fields[0]
+        await field.focus()
+        if (not await field.evaluate("node => node.getRootNode().activeElement === node")
+                or await focused_input_kind(page) != "password"):
+            raise PasswordFocusError("web_browser_password_unavailable")
+    except Error:
+        raise PasswordFocusError("web_browser_password_unavailable") from None
+    finally:
+        for field in handles:
+            with suppress(Error):
+                await field.dispose()
 
 
 class Browser:
@@ -136,15 +186,20 @@ class Browser:
         if page is None:
             raise RuntimeError("browser closed")
         current = urlsplit(page.url)
-        if op in {"tap", "text", "key", "scroll"} and current.scheme != "https":
+        if op in {"tap", "text", "focus-password", "key", "scroll"} and current.scheme != "https":
             raise ValueError("sign-in destination not allowed")
         if op == "tap":
             if self.touch:
                 await page.touchscreen.tap(body["x"], body["y"])
             else:
                 await page.mouse.click(body["x"], body["y"])
+        elif op == "focus-password":
+            await focus_password(page)
         elif op == "text":
-            if not await has_focused_input(page):
+            kind = await focused_input_kind(page)
+            if body.get("expect_password") and kind != "password":
+                raise PasswordFocusError("web_browser_password_unavailable")
+            if not kind:
                 raise NoFocusedInput
             await page.keyboard.insert_text(body["text"])
         elif op == "key":
@@ -178,11 +233,11 @@ class Browser:
                         else if (style.zoom !== String(factor)) style.zoom = factor;
                     }""", self.zoom / 100)
                 picture = await page.screenshot(type="jpeg", quality=75, timeout=5000)
-                editable = parts.scheme == "https" and await has_focused_input(page)
+                kind = await focused_input_kind(page) if parts.scheme == "https" else None
                 if self.context.pages[-1:] == [page] and page.url == url:
                     return {"image": base64.b64encode(picture).decode("ascii"),
                             "host": parts.hostname if parts.scheme == "https" else None,
-                            "zoom": self.zoom or 100, "editable": editable}
+                            "zoom": self.zoom or 100, "editable": kind is not None, "input_kind": kind}
             except Error:
                 if attempt == 2:
                     raise
@@ -243,6 +298,8 @@ def make_app(path):
                     return JSONResponse(await browser.use(op, body))
         except NoFocusedInput:
             return JSONResponse({"error": "web_browser_select_field"}, 422)
+        except PasswordFocusError as exc:
+            return JSONResponse({"error": str(exc)}, 422)
         except Exception:
             # Exceptions may contain a page URL or typed text.
             return JSONResponse({}, 422)
