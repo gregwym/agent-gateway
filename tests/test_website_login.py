@@ -3,6 +3,7 @@ import asyncio
 import base64
 import os
 import socket
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -12,7 +13,8 @@ import pytest
 from agent_gateway.admin_web_login import WebsiteLogin
 from agent_gateway.browser_tunnel import connect
 from agent_gateway.connectors import web
-from test_admin import change, login, setup, state, web_gateway
+from agent_gateway.passkey import Refused
+from test_admin import admin_post, change, login, setup, state, web_gateway
 from test_web_connector import response
 
 pytestmark = pytest.mark.anyio
@@ -28,7 +30,7 @@ def socket_dir():
 
 
 def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
-    backend = {"auth": False, "actions": [], "inputs": [], "taps": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": []}
+    backend = {"auth": False, "actions": [], "inputs": [], "taps": [], "swipes": [], "zoom": 100, "cookie_ready": True, "reads": [], "active": None}
 
     def fetch(host, target, method, headers, body, receive):
         assert host == site and method == "HEAD" and target == "/" and body is None
@@ -38,6 +40,8 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
 
     async def worker(self, action, data):
         backend["actions"].append(action)
+        if action == "active":
+            return {"id": backend["active"]}
         if action == "text":
             backend["inputs"].append(data["text"])
         if action == "tap":
@@ -47,8 +51,15 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
         if action == "zoom":
             backend["zoom"] = data["percent"]
         if action == "start":
+            if backend["active"]:
+                raise Refused("web_browser_in_use", 409)
+            backend["active"] = data["id"]
             assert data["url"] == "https://" + site + "/"
             backend["display"] = {key: data[key] for key in ("user_agent", "viewport", "touch")}
+        if action == "close":
+            if data["id"] != backend["active"]:
+                raise Refused("web_browser_expired", 409)
+            backend["active"] = None
         if action == "cookies":
             assert data["origin"] == "https://" + site
             if not backend["cookie_ready"]:
@@ -116,6 +127,62 @@ async def test_website_session_save_is_private_and_independent_of_read_checks(tm
         assert not list(socket_dir.glob("*.proxy"))
 
 
+async def test_force_close_requires_passkey_and_cannot_close_a_replacement(tmp_path, socket_dir, monkeypatch):
+    monkeypatch.setenv("AGW_BROWSER_SOCKET", str(socket_dir / "control.sock"))
+    backend = fake_browser(monkeypatch)
+    async with web_gateway(tmp_path) as (gw, http, origin, config):
+        key, _ = await setup(http, origin, config)
+        form = {"id": "shop-orders", "owner": "person_a", "plugin": "amazon-us"}
+        first = (await change(http, "web-login/start", **form)).json()
+        async with httpx2.AsyncClient(base_url=origin, headers={"Origin": origin}, trust_env=False) as other:
+            assert (await other.post("/admin/api/web-login/active", json={})).status_code == 401
+            assert (await other.post("/admin/api/web-login/terminate", json={})).status_code == 401
+            await login(other, key, origin)
+            target = (await other.post("/admin/api/web-login/active", json={})).json()["target"]
+            assert target and target != first["id"]
+            assert (await other.post("/admin/api/web-login/frame", json={"id": first["id"]})).status_code == 409
+            blocked = await other.post("/admin/api/web-login/terminate", json={"target": target})
+            assert blocked.status_code == 403 and blocked.json()["error"] == "admin_confirmation_required"
+            assert backend["active"] == first["id"]
+
+            await http.post("/admin/api/web-login/cancel", json={"id": first["id"]})
+            replacement = (await change(http, "web-login/start", **form)).json()
+            challenge = blocked.json()["confirmation"]
+            confirmation = {"ceremony_id": challenge["ceremony_id"], "response": key.response(challenge, origin=origin)}
+            stale = await other.post("/admin/api/web-login/terminate", json={"target": target, "confirmation": confirmation})
+            assert stale.status_code == 409 and stale.json()["error"] == "web_browser_changed"
+            assert backend["active"] == replacement["id"]
+
+            current = (await other.post("/admin/api/web-login/active", json={})).json()
+            closed = await admin_post(other, "web-login/terminate", json=current)
+            assert closed.status_code == 200 and backend["active"] is None
+            assert (await http.post("/admin/api/web-login/frame", json={"id": replacement["id"]})).status_code == 409
+            assert not list(socket_dir.glob("*.proxy"))
+            assert not backend["reads"] and "cookies" not in backend["actions"]
+            assert not any(c["id"] == form["id"] for c in (await state(http))["connections"])
+
+
+async def test_browser_worker_reports_active_id_and_closes_only_that_window(socket_dir, monkeypatch):
+    from agent_gateway.browser_worker import Browser, make_app
+
+    async def start(self, _driver, body):
+        self.id, self.expires = body["id"], body["expires"]
+
+    monkeypatch.setattr(Browser, "start", start)
+    app = make_app(socket_dir / "control.sock")
+    app.state.driver = None
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://browser") as client:
+        window = "a" * 24
+        assert (await client.post("/active", json={})).json() == {"id": None}
+        started = await client.post("/start", json={"id": window, "expires": time.time() + 60, "viewport": {}})
+        assert started.status_code == 200
+        assert (await client.post("/active", json={})).json() == {"id": window}
+        assert (await client.post("/close", json={"id": "b" * 24})).status_code == 410
+        assert (await client.post("/active", json={})).json() == {"id": window}
+        assert (await client.post("/close", json={"id": window})).status_code == 200
+        assert (await client.post("/active", json={})).json() == {"id": None}
+
+
 async def test_proxy_tunnels_public_https_but_rejects_private_addresses(socket_dir, monkeypatch):
     from agent_gateway import browser_tunnel
     resolved = []
@@ -177,6 +244,12 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         await page.get_by_label("服务", exact=True).select_option("web")
         await page.get_by_label("连接器名称", exact=True).fill("amazon-orders")
         await playwright.expect(page.locator('input[type="file"]')).not_to_be_visible()
+        backend["active"] = "a" * 24  # A worker survived a Gateway restart.
+        await page.get_by_role("button", name="登录网站", exact=True).tap()
+        conflict = page.get_by_role("dialog", name="已有网站登录窗口", exact=True)
+        await conflict.get_by_role("button", name="强制终止", exact=True).tap()
+        await playwright.expect(conflict).not_to_be_visible()
+        assert backend["active"] is None
         await page.get_by_role("button", name="登录网站", exact=True).tap()
         login_box = page.get_by_role("dialog", name="网站登录", exact=True)
         image = login_box.get_by_role("img", name="可操作的网站登录页")

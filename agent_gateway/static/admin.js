@@ -190,7 +190,8 @@ const messages = {
   web_session_storage_failed: ['The updated session could not be saved. Check the gateway storage and import a fresh session.', '更新后的会话无法保存。请检查网关存储，再导入新会话。'],
   web_browser_sign_in_required: ['No session for this website was available to save. Finish signing in and try again.', '没有可保存的该网站会话。请完成登录后再保存。'],
   web_browser_unavailable: ['The sign-in browser could not start. Check the Gateway browser service.', '登录浏览器无法启动，请检查网关的浏览器服务。'],
-  web_browser_in_use: ['Another website sign-in is already open. Close it or wait for it to expire.', '已有一个网站登录窗口。请关闭它或等待过期。'],
+  web_browser_in_use: ['A website sign-in is already open.', '已有一个网站登录窗口。'],
+  web_browser_changed: ['The active window changed. Try again to review the current window.', '占用中的登录窗口已更换，请重试。'],
   web_browser_expired: ['This sign-in window expired. Open a new one and try again.', '此次登录窗口已过期，请重新打开。'],
   web_browser_timeout: ['The login browser stopped responding. Refresh it or open a new window.', '登录浏览器响应超时，请刷新或重新打开窗口。'],
   web_browser_failed: ['The login page could not be loaded or operated. Refresh it and try again.', '无法加载或操作登录页，请刷新后重试。'],
@@ -1213,8 +1214,13 @@ function connectorForm(existing, reauthorize = false) {
       const file = credentials.AGwSessionUpload.files[0];
       if (!file) {
         const display = {width: window.innerWidth, height: window.innerHeight, touch: navigator.maxTouchPoints > 0};
-        const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, ...payload.settings, display});
-        showWebsiteLogin(flow, box);
+        try {
+          const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, ...payload.settings, display});
+          showWebsiteLogin(flow, box);
+        } catch (error) {
+          if (error.code !== 'web_browser_in_use') throw error;
+          await showWebsiteLoginConflict();
+        }
         return;
       }
       if (file.size > 60000) throw new Error(tr('The browser session file exceeds 60 KB.', '浏览器会话文件超过 60 KB。'));
@@ -1246,6 +1252,24 @@ function connectorForm(existing, reauthorize = false) {
   form.addEventListener('change', updateSave);
   updateSave();
 }
+async function showWebsiteLoginConflict() {
+  const {target} = await api('web-login/active', {});
+  if (!target) {
+    notify(tr('The previous window closed. Try signing in again.', '旧登录窗口已关闭，请重新登录。'));
+    return;
+  }
+  const box = modal(tr('Website sign-in already open', '已有网站登录窗口'));
+  el(box, 'p', tr('Force terminating closes the window and discards its unsaved sign-in. Saved connections are kept.',
+    '强制终止会关闭窗口并放弃未保存的登录。已保存的连接会保留。'), 'muted');
+  const actions = el(box, 'div', undefined, 'actions');
+  button(actions, tr('Cancel', '取消'), () => box.close());
+  button(actions, tr('Force terminate', '强制终止'), async () => {
+    await api('web-login/terminate', {target});
+    box.close();
+    notify(tr('Previous sign-in closed. You can start a new one.', '旧登录窗口已关闭，可以重新登录。'));
+  }, 'danger');
+}
+
 function showWebsiteLogin(flow, connector) {
   const box = modal(tr('Website sign-in', '网站登录'));
   box.classList.add('website-login');

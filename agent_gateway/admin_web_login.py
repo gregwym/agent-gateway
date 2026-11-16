@@ -7,6 +7,7 @@ import secrets
 import stat
 import time
 from contextlib import suppress
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -15,7 +16,7 @@ import httpx2 as httpx
 
 from .admin_config import CONNECTOR_NAME, kind_of, make_connection
 from .browser_tunnel import connect
-from .browser_worker import HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
+from .browser_worker import FLOW, HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
 from .connectors.web import import_session
 from .passkey import Refused
 from .plugins import connector_plugins
@@ -52,15 +53,53 @@ class WebsiteLogin:
         except (httpx.HTTPError, ValueError, OSError):
             raise Refused("web_browser_unavailable" if action == "start" else "web_browser_failed", 422) from None
 
-    async def close(self):
+    def _release_proxy(self):
         flow, self.flow = self.flow, None
         if flow:
             flow["proxy"].close()
             for task in flow["tunnels"].copy():
                 task.cancel()
             flow["path"].unlink(missing_ok=True)
+        return flow
+
+    async def close(self):
+        if flow := self._release_proxy():
             with anyio.move_on_after(3, shield=True), suppress(Refused):
                 await self.worker("close", {"id": flow["id"]})
+
+    @staticmethod
+    def _termination_target(ident):
+        # Do not return the control handle to a different administrator session.
+        return sha256(ident.encode("ascii")).hexdigest()
+
+    async def _active_id(self):
+        # The browser can outlive a Gateway restart. Ask the worker even if
+        # this Gateway does not own a proxy or know the original session.
+        ident = (await self.worker("active", {})).get("id")
+        if ident is not None and (not isinstance(ident, str) or not FLOW.fullmatch(ident)):
+            raise Refused("web_browser_failed", 422)
+        if self.flow and self.flow["id"] != ident:
+            self._release_proxy()
+        return ident
+
+    async def terminate(self, body, token):
+        target = body.get("target")
+        if set(body) != {"target"} or not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{64}", target):
+            raise Refused("web_browser_input", 400)
+        async with self.lock:
+            self.admin.auth.session(token)
+            ident = await self._active_id()
+            if ident is None:
+                return {"ok": True}
+            if self._termination_target(ident) != target:
+                raise Refused("web_browser_changed", 409)
+            await self.worker("close", {"id": ident})
+            if self.flow:
+                self._release_proxy()
+            else:
+                (Path(self.socket).parent / (ident + ".proxy")).unlink(missing_ok=True)
+            self.admin.runtime.gateway.audit.write("website_login_terminated")
+            return {"ok": True}
 
     async def expire(self, logout=None):
         async with self.lock:
@@ -154,6 +193,11 @@ class WebsiteLogin:
 
     async def input(self, operation, body, session, token):
         async with self.lock:
+            if operation == "active":
+                if body:
+                    raise Refused("web_browser_input", 400)
+                ident = await self._active_id()
+                return {"target": self._termination_target(ident) if ident else None}
             flow = self.flow
             if not flow or flow["id"] != body.get("id") or flow["session"] != session["id"] or flow["expires"] <= time.time():
                 raise Refused("web_browser_expired", 409)

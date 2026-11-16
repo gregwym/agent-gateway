@@ -219,12 +219,14 @@ def make_app(path):
             return JSONResponse({"ok": True})
         try:
             body = await request.json()
-            ident = body["id"]
-            if not isinstance(ident, str) or not FLOW.fullmatch(ident):
-                return JSONResponse({}, 400)
             async with browser.lock:
                 if browser.id and browser.expires <= time.time():
                     await browser.close()
+                if op == "active":
+                    return JSONResponse({"id": browser.id}) if body == {} else JSONResponse({}, 400)
+                ident = body["id"]
+                if not isinstance(ident, str) or not FLOW.fullmatch(ident):
+                    return JSONResponse({}, 400)
                 if op == "start":
                     if browser.id:
                         return JSONResponse({}, 409)

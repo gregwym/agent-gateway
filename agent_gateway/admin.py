@@ -55,7 +55,8 @@ def needs_admin_confirmation(operation, body):
     return operation in {
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
-        "settings/gmail-oauth", "web-login/start", "web-catalog/publisher", "web-catalog/origins",
+        "settings/gmail-oauth", "web-login/start", "web-login/terminate",
+        "web-catalog/publisher", "web-catalog/origins",
     }
 
 
@@ -982,7 +983,8 @@ class AdminController:
                     return response
                 if operation == "registry/search":
                     return _json(await registry.search(body), 200)
-                if operation.startswith("web-login/") and operation != "web-login/start":
+                browser_control = operation in ("web-login/start", "web-login/terminate")
+                if operation.startswith("web-login/") and not browser_control:
                     return _json(await self.website_login.input(operation.split("/", 1)[1], body, session, token), 200)
                 async with self.editing():
                     session = self.auth.session(token)  # may have expired while waiting
@@ -993,8 +995,12 @@ class AdminController:
                             return _json({"error": "admin_confirmation_required", "confirmation": ceremony}, 403)
                         proof = body.pop("confirmation")
                         self.auth.confirm(session, operation, body, revision, proof)
-                    if operation != "web-login/start":
+                    if not browser_control:
                         return _json(await self.operate(operation, body, session), 200)
+                # Browser calls may save the session under the admin mutex.
+                # Do not hold that mutex while acquiring the browser lock.
+                if operation == "web-login/terminate":
+                    return _json(await self.website_login.terminate(body, token), 200)
                 result = await self.website_login.start(body, session, request.headers.get("user-agent"))
                 return _json(result, 200)
             except Refused as exc:
