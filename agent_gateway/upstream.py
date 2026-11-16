@@ -63,12 +63,13 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
     if conn.oauth_ref and oauth is None and auth is None:
         from .passkey import Refused
         raise Refused("oauth_reauthorization_required", 401)
-    from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+    from .web_profiles import ORIGINS_ENV, PROFILE_ENV, SESSION_ENV, WebProfile, api_origins
     if conn.plugin and PROFILE_ENV in conn.env:
         from .connectors._base import build_server
         from .connectors.web import SiteSession
         web = (web_sessions.get(conn, secrets) if web_sessions else
-               SiteSession(WebProfile.saved(conn.env[PROFILE_ENV]), secrets[conn.secret_env[SESSION_ENV]]))
+               SiteSession(WebProfile.saved(conn.env[PROFILE_ENV]), secrets[conn.secret_env[SESSION_ENV]],
+                           extra_origins=api_origins(conn.env.get(ORIGINS_ENV, "[]"))))
         async with _client(conn, build_server(conn.service, web.tools())) as client:
             yield client
     elif conn.transport == "stdio":

@@ -95,10 +95,10 @@ class Browser:
             await self.close()
             return {}
         if op == "cookies":
-            host = urlsplit(body["origin"]).hostname
-            cookies = [cookie for cookie in await self.context.cookies()
-                       if cookie["domain"] == host or (cookie["domain"].startswith(".")
-                                                      and host_allowed(host, (cookie["domain"][1:],)))]
+            hosts = [urlsplit(origin).hostname for origin in (body["origin"], *body.get("api_origins", []))]
+            cookies = [cookie for cookie in await self.context.cookies() if any(
+                       cookie["domain"] == host or (cookie["domain"].startswith(".")
+                                                    and host_allowed(host, (cookie["domain"][1:],))) for host in hosts)]
             return {"cookies": cookies}
         page = self.context.pages[-1] if self.context.pages else None
         if page is None:

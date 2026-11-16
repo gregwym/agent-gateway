@@ -180,6 +180,10 @@ const messages = {
   duplicate_connector: ['This connector name already exists. Choose another name.', '此连接器名称已存在，请使用其他名称。'],
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
+  website_origin_invalid: ['Enter up to eight distinct public HTTPS origins, with no paths or port numbers.', '请输入公网 HTTPS 网站地址，不含路径或端口，最多八个 API 地址。'],
+  website_catalog_revision_missing: ['This revision is no longer available.', '这个版本已不在保留范围内。'],
+  website_catalog_publisher_needs_access: ['Give this agent access to the website connection first.', '请先授予这个 Agent 使用此网站连接的权限。'],
+  web_origin_not_approved: ['This API origin is not approved for this connection.', '此连接尚未获准访问这个 API 地址。'],
   web_session_busy: ['Another request is in progress. Try again shortly.', '这个网站正有请求在执行，请稍后重试。'],
   web_session_storage_failed: ['The updated session could not be saved. Check the gateway storage and import a fresh session.', '更新后的会话无法保存。请检查网关存储，再导入新会话。'],
   web_browser_sign_in_required: ['No session for this website was available to save. Finish signing in and try again.', '没有可保存的该网站会话。请完成登录后再保存。'],
@@ -726,6 +730,10 @@ function connectorDetails(id) {
       notify(conn.kind === 'web' ? tr('Site reachable. Sign-in was not tested.', '网站可达，未验证登录状态。') : remote ? tr('MCP check passed.', 'MCP 验证通过。') : tr('Read check passed.', '读取验证通过。'));
     }, 'primary', tr('Testing connection…', '正在验证连接…'));
     button(actions, tr('Rename', '改名'), () => renameConnector(conn, box));
+    if (conn.kind === 'web') button(actions, tr('API description', 'API 描述'), async () => {
+      const initial = await api('web-catalog/view', {id});
+      websiteCatalog(conn, initial);
+    });
     if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
@@ -742,6 +750,70 @@ function connectorDetails(id) {
   }
   populate();
 }
+
+function websiteCatalog(conn, initial) {
+  const id = conn.id, box = modal(tr('API description', 'API 描述') + ' · ' + id), content = el(box, 'div');
+  async function reload(catalogRevision) {
+    populate(await api('web-catalog/view', {id, ...(catalogRevision ? {catalog_revision: catalogRevision} : {})}));
+  }
+  function populate(view) {
+    const revision = state.revision;
+    content.replaceChildren();
+    const form = el(content, 'section', undefined, 'stack');
+    const agents = state.clients.filter(agent => agent.household === conn.household && conn.access[agent.id] !== 'none');
+    const options = [['', tr('No maintainer', '无维护者')], ...agents.map(agent => [agent.id, agent.id])];
+    if (view.writer && !agents.some(agent => agent.id === view.writer))
+      options.push([view.writer, view.writer + tr(' (no website access)', '（无网站访问权限）')]);
+    const writer = select(form, tr('Maintainer', '维护者'), 'catalog_writer', options, view.writer || '');
+    button(form, tr('Save maintainer', '保存维护者'), async () => {
+      await mutate('web-catalog/publisher', {id, client: writer.value || null, revision});
+      await reload(); notify(tr('Maintainer saved.', '维护者已保存。'));
+    });
+
+    const current = view.current;
+    const section = el(content, 'section', undefined, 'catalog-content');
+    if (!current) el(section, 'p', tr('No API description published yet.', '尚未发布 API 描述。'), 'muted');
+    else {
+      const revisions = view.history.map(r => [String(r.revision), '#' + r.revision + ' · ' + r.agent + ' · ' + new Date(r.published_at * 1000).toLocaleString()]);
+      const version = select(section, tr('Revision', '版本'), 'catalog_revision', revisions, String(current.revision));
+      version.addEventListener('change', () => reload(Number(version.value)).catch(error => showError(version, error)));
+      const changes = el(section, 'details');
+      el(changes, 'summary', tr('Changes in this revision', '本版改动'));
+      const labels = {added: tr('Added', '新增'), changed: tr('Changed', '修改'), removed: tr('Removed', '删除')};
+      for (const [key, label] of Object.entries(labels)) {
+        if (!current.changes[key].length) continue;
+        el(changes, 'p', label);
+        const list = el(changes, 'ul');
+        for (const item of current.changes[key].slice(0, 25)) el(list, 'li', item);
+        if (current.changes[key].length > 25) el(list, 'li', '+' + (current.changes[key].length - 25));
+      }
+      if (current.changes.other) el(changes, 'p', tr('Other parts of the document changed.', '文档的其他部分也有改动。'));
+      if (view.diff) el(changes, 'pre', view.diff);
+      else if (current.revision > 1) el(changes, 'p', tr('Select the previous revision to compare the descriptions.', '可选择上一个版本，对照查看完整描述。'), 'muted');
+      const doc = el(section, 'details');
+      el(doc, 'summary', current.format === 'graphql' ? 'GraphQL SDL' : 'OpenAPI');
+      el(doc, 'pre', typeof current.document === 'string' ? current.document : JSON.stringify(current.document, null, 2));
+    }
+    const origins = el(content, 'details');
+    el(origins, 'summary', tr('API origins', 'API 域名'));
+    el(origins, 'p', view.origin);
+    const allowed = new Set(view.api_origins);
+    const suggestions = (current?.origins || []).filter(origin => origin !== view.origin);
+    const entries = [...new Set([...allowed, ...suggestions])];
+    const choices = entries.map(origin => [origin, checkbox(origins, origin, allowed.has(origin))]);
+    const extra = field(origins, tr('Add an HTTPS origin', '添加 HTTPS 地址'), 'extra_api_origin', '', 'url');
+    extra.placeholder = 'https://api.example.com';
+    button(origins, tr('Save API origins', '保存 API 域名'), async () => {
+      const next = choices.filter(([, input]) => input.checked).map(([origin]) => origin);
+      if (extra.value.trim()) next.push(extra.value.trim());
+      await mutate('web-catalog/origins', {id, origins: next, revision});
+      await reload(); notify(tr('API origins saved.', 'API 域名已保存。'));
+    });
+    button(content, tr('Refresh', '刷新'), () => reload());
+  }
+  populate(initial);
+}
+
 function registryPicker(onSelect) {
   const box = modal(tr('Search MCP Registry', '搜索 MCP Registry'));
   const form = el(box, 'form');
@@ -949,15 +1021,22 @@ function connectorForm(existing, reauthorize = false) {
       const web = kind.value === 'web';
       const options = (state.plugins || []).filter(p => web === (p.kind === 'web')).map(p =>
         [p.id, web ? p.label : p.label + ' · ' + (p.kind === 'stdio' ? 'stdio MCP' : 'CLI')]);
+      if (web) options.push(['custom-website', tr('Other website', '其他网站')]);
       if (existing && !options.some(([id]) => id === existing.settings.plugin)) options.push([existing.settings.plugin, existing.settings.plugin]);
       settings.plugin = select(dynamic, web ? tr('Website', '网站') : tr('Installed connector', '已安装的连接器'), 'plugin', options, existing?.settings.plugin || options[0]?.[0]);
       settings.plugin.disabled = !!existing;
       const fields = el(dynamic, 'div');
       const render = () => {
         fields.replaceChildren(); credentials = {};
+        delete settings.origin;
         const plugin = state.plugins.find(p => p.id === settings.plugin.value);
         if (web) {
           const site = existing?.website || plugin;
+          if (settings.plugin.value === 'custom-website') {
+            settings.origin = field(fields, tr('Website HTTPS address', '网站 HTTPS 地址'), 'website_origin', site?.origin || '', 'url');
+            settings.origin.required = true;
+            settings.origin.readOnly = Boolean(existing);
+          }
           if (site?.experimental) el(fields, 'p', tr('Experimental', '实验功能'), 'hint');
           if (!state.website_login) el(fields, 'p', tr('The sign-in browser is offline. You can still import a session under Advanced.', '登录浏览器暂不可用。仍可在高级选项中导入会话。'), 'hint');
           const advanced = el(fields, 'details');
@@ -1075,7 +1154,7 @@ function connectorForm(existing, reauthorize = false) {
     if (payload.kind === 'web') {
       const file = credentials.AGwSessionUpload.files[0];
       if (!file) {
-        const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, plugin: payload.settings.plugin});
+        const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, ...payload.settings});
         showWebsiteLogin(flow, box);
         return;
       }

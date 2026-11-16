@@ -19,7 +19,7 @@ from .browser_worker import HEIGHT, KEYS, WIDTH, ZOOM_LEVELS
 from .connectors.web import import_session
 from .passkey import Refused
 from .plugins import connector_plugins
-from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+from .web_profiles import CUSTOM_PROFILE, PROFILE_ENV, SESSION_ENV, WebProfile, connection_origins, website_origin
 
 # Additional network origins for first-party sign-in and assets. These are never
 # accepted as destinations supplied by an Agent.
@@ -75,7 +75,7 @@ class WebsiteLogin:
     async def start(self, body, session):
         admin = self.admin
         body = dict(body)
-        if set(body) != {"revision", "id", "owner", "plugin"}:
+        if set(body) - {"origin"} != {"revision", "id", "owner", "plugin"}:
             raise Refused("invalid_connector", 400)
         admin._revision(body)
         gateway = admin.runtime.gateway
@@ -89,18 +89,27 @@ class WebsiteLogin:
             if kind_of(previous) != "web" or previous.owner != owner or previous.plugin != plugin_id:
                 raise Refused("connector_identity_is_fixed", 409)
             profile = WebProfile.saved(previous.env[PROFILE_ENV])
+            extra_origins = connection_origins(previous)[1:]
         else:
+            extra_origins = []
             if len(gateway.cfg.connections) >= 50:
                 raise Refused("connector_limit", 400)
-            plugins = connector_plugins(admin.store.base.admin.plugins_dir)
-            plugin = plugins.get(plugin_id) if isinstance(plugin_id, str) else None
-            if not plugin or plugin.kind != "web":
-                raise Refused("local_plugin_unavailable", 400)
-            profile = WebProfile.model_validate(plugin.web)
+            if plugin_id == CUSTOM_PROFILE:
+                try:
+                    profile = WebProfile(origin=website_origin(body.get("origin")))
+                except ValueError:
+                    raise Refused("website_origin_invalid", 400) from None
+            else:
+                plugins = connector_plugins(admin.store.base.admin.plugins_dir)
+                plugin = plugins.get(plugin_id) if isinstance(plugin_id, str) else None
+                if not plugin or plugin.kind != "web":
+                    raise Refused("local_plugin_unavailable", 400)
+                profile = WebProfile.model_validate(plugin.web)
         if not self.available():
             raise Refused("web_browser_unavailable", 503)
         host = urlsplit(profile.origin).hostname
         navigation, assets = BUNDLED.get(host, ((host,), ()))
+        api_hosts = [urlsplit(origin).hostname for origin in extra_origins]
         expires = min(time.time() + 600, session["expires"])
         if expires < time.time() + 15:
             raise Refused("login_required", 401)
@@ -120,7 +129,7 @@ class WebsiteLogin:
                     return
                 tunnels.add(task)
                 try:
-                    await connect(reader, writer, navigation + assets)
+                    await connect(reader, writer, navigation + assets, exact=api_hosts)
                 finally:
                     tunnels.discard(task)
 
@@ -130,7 +139,7 @@ class WebsiteLogin:
             except OSError:
                 raise Refused("web_browser_unavailable", 503) from None
             self.flow = {"id": ident, "session": session["id"], "expires": expires, "profile": profile,
-                         "path": path, "proxy": proxy, "tunnels": tunnels, "body": body}
+                         "path": path, "proxy": proxy, "tunnels": tunnels, "body": body, "api_origins": extra_origins}
             try:
                 await self.worker("start", {"id": ident, "expires": expires,
                                            "url": profile.origin + "/",
@@ -176,9 +185,9 @@ class WebsiteLogin:
     async def finish(self, flow, token):
         admin = self.admin
         profile = flow["profile"]
-        cookies = await self.worker("cookies", {"id": flow["id"], "origin": profile.origin})
+        cookies = await self.worker("cookies", {"id": flow["id"], "origin": profile.origin, "api_origins": flow["api_origins"]})
         try:
-            candidate = import_session(json.dumps(cookies), profile)
+            candidate = import_session(json.dumps(cookies), profile, flow["api_origins"])
         except (ValueError, RecursionError):
             raise Refused("web_browser_sign_in_required", 422) from None
         # Saving the session does not contact the website.
@@ -190,7 +199,8 @@ class WebsiteLogin:
             cfg, _, values = admin.store.effective(state)
             plugins = connector_plugins(admin.store.base.admin.plugins_dir)
             payload = {"id": form["id"], "kind": "web", "owner": form["owner"],
-                       "settings": {"plugin": form["plugin"]}, "credentials": {SESSION_ENV: candidate}}
+                       "settings": {"plugin": form["plugin"], **({"origin": profile.origin} if "origin" in form else {})},
+                       "credentials": {SESSION_ENV: candidate}}
             conn, added = make_connection(payload, cfg, values, plugins=plugins)
             # The profile used for the authorization must be the one being saved.
             if WebProfile.saved(conn.env[PROFILE_ENV]) != profile:

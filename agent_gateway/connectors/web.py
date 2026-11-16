@@ -13,14 +13,14 @@ import threading
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
-from http.cookiejar import Cookie, CookieJar
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlsplit
 from urllib.request import Request
 
 from graphql import GraphQLError, OperationDefinitionNode, FragmentDefinitionNode, OperationType, parse
 
-from ..web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile
+from ..web_profiles import ORIGINS_ENV, PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile, api_origins
 from ._base import ConnectorError, Tool, integer, serve, setting, string
 
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -37,9 +37,9 @@ _COOKIE_VALUE = re.compile(r"^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]{1,8192}
 _TLS = ssl.create_default_context()
 
 
-def import_session(raw, profile):
+def import_session(raw, profile, extra_origins=()):
     """Accept a cookie array or a Playwright storageState, discarding other sites and storage."""
-    host = urlsplit(profile.origin).hostname
+    hosts = tuple(urlsplit(origin).hostname for origin in (profile.origin, *extra_origins))
     if len(raw.encode("utf-8")) > 60_000:
         raise ValueError("browser session too large")
     data = json.loads(raw)
@@ -54,8 +54,9 @@ def import_session(raw, profile):
         if not isinstance(domain, str) or len(domain) > 255:
             continue
         domain = domain.lower()
-        if domain != host and not (domain.startswith(".") and "." in domain[1:] and
-                                   (domain[1:] == host or host.endswith(domain))):
+        if item.get("partitionKey") or not any(
+                domain == host or (domain.startswith(".") and "." in domain[1:] and
+                                   (domain[1:] == host or host.endswith(domain))) for host in hosts):
             continue
         name, value, path = item.get("name"), item.get("value"), item.get("path", "/")
         expires = item.get("expires", item.get("expirationDate", -1))
@@ -66,8 +67,7 @@ def import_session(raw, profile):
             continue
         if expires != -1 and expires <= time.time():
             continue
-        # The client is fixed to this HTTPS host; imported parent domain cookies are re-bound to it.
-        kept[name, path] = {"name": name, "value": value, "path": path, "domain": host, "expires": int(expires)}
+        kept[name, path, domain] = {"name": name, "value": value, "path": path, "domain": domain, "expires": int(expires)}
     if not kept:
         raise ValueError("no unexpired cookies for this site")
     return json.dumps(list(kept.values()), separators=(",", ":"), ensure_ascii=True)
@@ -131,6 +131,7 @@ class RequestPlan:
     offset: int = 0
     max_chars: int = MAX_TEXT
     body_version: str | None = None
+    origin: str | None = None
 
 
 def _invalid(message):
@@ -250,7 +251,7 @@ def plan_request(tool, args):
     if not read and (offset or version is not None):
         raise _invalid("Only reads can request another response page; replaying a write could change data twice.")
     return RequestPlan(method, target, headers, body, "read" if read else "write", follow_redirects,
-                       offset, args.get("max_chars", MAX_TEXT), version)
+                       offset, args.get("max_chars", MAX_TEXT), version, args.get("origin"))
 
 
 def _same_origin_location(origin, current_path, locations):
@@ -280,6 +281,7 @@ def build_tools(handler=None):
               "the same request and body_version; the site is fetched again and changes are reported. "
               "Cross-site redirects are blocked.")
     paging = {
+        "origin": string("An approved HTTPS origin returned for this connection. Omit to use its login site.", 255),
         "offset": integer("Read response from this character offset. Use next_offset from the previous page.", 0, _MAX_OFFSET, 0),
         "max_chars": integer("Maximum characters of the response body to return.", 1, MAX_TEXT, MAX_TEXT),
         "body_version": string("Optional body_version from the previous page. Reject if the response changed.", 64, r"^[a-f0-9]{64}$"),
@@ -304,25 +306,47 @@ def build_tools(handler=None):
     ]
 
 
+class _WebsiteCookies(DefaultCookiePolicy):
+    def __init__(self, shared_domains):
+        super().__init__(strict_ns_domain=self.DomainStrictNonDomain)
+        self.shared_domains = shared_domains
+
+    def set_ok(self, cookie, request):
+        if not super().set_ok(cookie, request):
+            return False
+        if cookie.has_nonstandard_attr("Partitioned") or cookie.has_nonstandard_attr("partitioned"):
+            return False
+        if cookie.domain_specified and cookie.domain not in self.shared_domains:
+            # A response may refresh a browser-authorized shared scope. It
+            # cannot introduce a new scope shared across approved origins.
+            cookie.domain = urlsplit(request.full_url).hostname
+            cookie.domain_initial_dot = cookie.domain_specified = False
+        return True
+
+
 class SiteSession:
-    def __init__(self, profile, raw, *, fetch=None, persist=None, redactions=()):
+    def __init__(self, profile, raw, *, fetch=None, persist=None, redactions=(), extra_origins=()):
         self.profile = profile
-        self.host = urlsplit(profile.origin).hostname
-        self.jar = CookieJar()
+        self.origins = frozenset((profile.origin, *extra_origins))
+        host = urlsplit(profile.origin).hostname
+        items = json.loads(raw)
+        shared = {item["domain"] for item in items if item.get("domain", "").startswith(".")}
+        self.jar = CookieJar(_WebsiteCookies(shared))
         self.fetch = fetch or _fetch
         self.persist = persist
         self.lock = threading.Lock()
         self.seen_secrets = set(redactions)
-        for item in json.loads(raw):
+        for item in items:
+            domain = item.get("domain", host)
             self.jar.set_cookie(Cookie(
                 version=0, name=item["name"], value=item["value"], port=None, port_specified=False,
-                domain=self.host, domain_specified=False, domain_initial_dot=False, path=item["path"],
+                domain=domain, domain_specified=domain.startswith("."), domain_initial_dot=domain.startswith("."), path=item["path"],
                 path_specified=True, secure=True, expires=None if item["expires"] == -1 else item["expires"],
                 discard=item["expires"] == -1, comment=None, comment_url=None, rest={"HttpOnly": None}))
         self._remember_cookies()
 
     def _cookies(self):
-        return json.dumps([{"name": c.name, "value": c.value, "path": c.path,
+        return json.dumps([{"name": c.name, "value": c.value, "path": c.path, "domain": c.domain,
                             "expires": c.expires if c.expires is not None else -1} for c in self.jar],
                           separators=(",", ":"), ensure_ascii=True)
 
@@ -358,12 +382,15 @@ class SiteSession:
     def _request(self, plan):
         started = time.monotonic()
         target = plan.target
+        origin = plan.origin if plan.origin is not None else self.profile.origin
+        if origin not in self.origins:
+            raise ConnectorError("This API origin is not approved for the connection.", "web_origin_not_approved")
         visited = {target}
         follow = plan.follow_redirects
         while True:
             if time.monotonic() - started >= 23:
                 raise ConnectorError("The Web request timed out.", "connector_timeout")
-            result, location = self._request_hop(plan, target, started)
+            result, location = self._request_hop(origin, plan, target, started)
             if follow is None and result.get("location_redacted"):
                 follow = True
             if location is None or not follow or result["status"] not in _REDIRECT_STATUSES:
@@ -383,8 +410,8 @@ class SiteSession:
             target = location
             visited.add(target)
 
-    def _request_hop(self, plan, target, started):
-        request = Request(self.profile.origin + target, headers={
+    def _request_hop(self, origin, plan, target, started):
+        request = Request(origin + target, headers={
             "User-Agent": "Agent-Gateway/1.0", "Accept-Encoding": "identity",
             **plan.headers,
         }, method=plan.method)
@@ -423,7 +450,7 @@ class SiteSession:
                           if (value := headers.get(name)) and len(value) <= 1024}:
                 result["headers"] = fields
             if 300 <= status < 400 and (locations := headers.get_all("Location", [])):
-                location = _same_origin_location(self.profile.origin, target, locations)
+                location = _same_origin_location(origin, target, locations)
                 if location is None:
                     result["redirect_blocked"] = True
                 elif self._redact(location) != location:
@@ -463,7 +490,7 @@ class SiteSession:
             return result, None
 
         try:
-            return self.fetch(self.host, target, plan.method, dict(request.header_items()), plan.body, receive)
+            return self.fetch(urlsplit(origin).hostname, target, plan.method, dict(request.header_items()), plan.body, receive)
         except TimeoutError:
             raise ConnectorError("The Web request timed out.", "connector_timeout") from None
         except ssl.SSLError:
@@ -479,7 +506,7 @@ class SiteSession:
 
 def main():
     profile = WebProfile.saved(setting(PROFILE_ENV))
-    session = SiteSession(profile, setting(SESSION_ENV))
+    session = SiteSession(profile, setting(SESSION_ENV), extra_origins=api_origins(setting(ORIGINS_ENV, "[]")))
     serve(urlsplit(profile.origin).hostname, session.tools())
 
 

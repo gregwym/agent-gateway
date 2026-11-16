@@ -27,14 +27,14 @@ async def tunnel(left, right):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def connect(reader, writer, domains):
+async def connect(reader, writer, domains, *, exact=()):
     peer = None
     try:
         async with asyncio.timeout(12):
             header = await reader.readuntil(b"\r\n\r\n")
             match = _TARGET.fullmatch(header.split(b"\r\n", 1)[0])
             host = match[1].decode().lower() if match else ""
-            if not host or not host_allowed(host, domains):
+            if not host or (host not in exact and not host_allowed(host, domains)):
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 await writer.drain()
                 return

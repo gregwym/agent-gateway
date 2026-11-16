@@ -228,8 +228,8 @@ class ConnectionCfg(_Model):
         if self.plugin and self.transport != "stdio":
             raise ValueError(f"{where}: local plugins require stdio")
         if self.plugin and "AGW_WEB_PROFILE" in self.env:
-            from .web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile
-            WebProfile.saved(self.env[PROFILE_ENV])
+            from .web_profiles import SESSION_ENV, WEB_TOOLS, connection_origins
+            connection_origins(self)
             if set(self.secret_env) != {SESSION_ENV}:
                 raise ValueError(f"{where}: Website connections require one browser session")
             if any(t.access is not None for t in self.tools if t.upstream in WEB_TOOLS):

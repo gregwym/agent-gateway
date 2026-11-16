@@ -185,6 +185,7 @@ class Gateway:
         self.policy = Policy(cfg)
         self.approver: Approver = approver or make_approver(cfg, audit)
         self.oauth = oauth
+        self.website_catalogs = None
         self.scrubber = Scrubber(list(secrets.values()), (lambda: oauth.sensitive) if oauth else None)
         self.upstreams: dict[str, Upstream] = {}
         self.routes: dict[str, ToolRoute] = {}
@@ -254,6 +255,9 @@ class Gateway:
             background = arguments.get("background", False)
             if existing := dispatcher.existing_key(ctx.request, key):
                 return dispatcher.submission(ctx, existing, key_value, background=background)
+            from .web_catalog import DESCRIPTIONS
+            if self.website_catalogs and arguments["tool"] in DESCRIPTIONS:
+                return await self._submit_website_description(ctx, dispatcher, who, arguments, key, discovery_audit)
             choices = discovery.candidates(self, who, arguments)
             if not choices:
                 discovery_audit("deny", "unknown_tool")
@@ -311,6 +315,72 @@ class Gateway:
             done("error", "internal_error", detail=type(exc).__name__)
             return _error("The gateway failed to process this call.")
 
+    async def _submit_website_description(self, ctx, dispatcher, who, args, key, audit):
+        from .passkey import Refused
+        from .request_store import QueueFull
+        from .web_catalog import DESCRIPTIONS, PUBLISH_DESCRIPTION
+
+        client = next(c for c in self.cfg.clients if c.id == who.client_id)
+        name, fields = args["tool"], args["arguments"]
+        conn = self.website_catalogs.connection(self, client, args["connection"], name)
+        if conn is None:
+            audit("deny", "unknown_tool")
+            raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
+        if "variant" in args or not Draft202012Validator(DESCRIPTIONS[name][1]).is_valid(fields):
+            audit("deny", "invalid_arguments")
+            return _error("Invalid API description arguments; check the schema from gateway_search_tools.")
+        try:
+            if name == PUBLISH_DESCRIPTION:
+                self.website_catalogs.check_publication(fields)
+            call = self._website_description_request(client, conn, name, fields)
+            job = dispatcher.store.enqueue(call, key)
+        except Refused as exc:
+            audit("deny", exc.code)
+            return self._catalog_result({"error": exc.code})
+        except QueueFull:
+            audit("deny", "too_many_queued")
+            return _error("Too many queued operations. Check existing keys before starting more.")
+        dispatcher.notify()
+        self.audit.write("tool_call", client=client.id, tool=name, connection=conn.id, decision="queued", request_id=job)
+        return dispatcher.submission(ctx, job, args["idempotency_key"], background=args.get("background", False))
+
+    def _website_description_request(self, client, conn, name, fields):
+        return ApprovalRequest(principal=client.subject, client_id=client.id, tool=name,
+                               connection=conn.id, service=conn.service, account=conn.account,
+                               upstream_tool=name, arguments_sha256=arguments_digest(fields), arguments=fields,
+                               owner=conn.owner, configuration_revision=self.configuration_revision,
+                               client_token_sha256=client.token_sha256, background=True)
+
+    def _catalog_result(self, data):
+        data = self.scrubber.data(data)
+        payload = json.dumps(data, ensure_ascii=False)
+        if len(payload.encode()) > self.cfg.server.max_result_bytes // 2:
+            return _error("The API description is larger than the configured MCP result limit.")
+        return types.CallToolResult(content=[types.TextContent(type="text", text=payload)],
+                                    structured_content=data, is_error="error" in data)
+
+    def _run_website_description(self, row, client, done):
+        from .passkey import Refused
+        from .web_catalog import GET_DESCRIPTION
+
+        name = row["tool"]
+        conn = self.website_catalogs.connection(self, client, row["connection"], name)
+        fields = json.loads(row["arguments"])
+        if (not conn or row["approvers"] != "[]"
+                or self._website_description_request(client, conn, name, fields).binding != row["binding"]):
+            done("deny", "configuration_changed")
+            return None
+        try:
+            if name == GET_DESCRIPTION:
+                data = self.website_catalogs.get_description(conn, fields.get("revision"))
+            else:
+                data = self.website_catalogs.publish(conn, self.website_catalogs.binding(conn.id), client.id, fields)
+        except Refused as exc:
+            data = {"error": exc.code}
+        result = self._catalog_result(data)
+        done("allow", data.get("error", "catalog_operation"), is_error=bool(result.is_error))
+        return result
+
     def _prepare_call(self, client_id, route, arguments, done):
         problem = self.problem(route)
         if problem is not None or route.exposed is None:
@@ -354,12 +424,15 @@ class Gateway:
         return final_arguments, upstream_arguments
 
     def _request_effect(self, principal, client_id, route, arguments, done):
-        from .web_profiles import is_website
+        from .web_profiles import connection_origins, is_website
         operation = None
         if is_website(route.conn):
             from .connectors.web import ConnectorError, plan_request
             try:
                 plan = plan_request(route.tool.upstream, arguments)
+                if plan.origin is not None and plan.origin not in connection_origins(route.conn):
+                    done("deny", "web_origin_not_approved")
+                    return _error("This API origin is not approved for the connection.")
                 if plan.follow_redirects is True and (route.tool.pin or route.tool.allow_values):
                     done("deny", "web_redirect_restricted")
                     return _error("This tool has argument restrictions. Submit each redirect target as a separate request.")
@@ -461,6 +534,11 @@ class Gateway:
                              upstream_tool=row["upstream_tool"], **({"approval": row["id"]} if approval_required else {"request_id": row["id"]}), decision=decision,
                              reason=reason, duration_ms=int((time.monotonic() - started) * 1000), **extra)
 
+        from .web_catalog import DESCRIPTIONS
+        if (self.website_catalogs and row["tool"] in DESCRIPTIONS and route is None
+                and client and client.subject == row["principal"] and row["revision"] == self.configuration_revision):
+            result = self._run_website_description(row, client, done)
+            return result, outcome
         if (not client or client.subject != row["principal"] or not route
                 or row["revision"] != self.configuration_revision
                 or (approval_required and set(self.cfg.approvers_of(route.conn)) != set(json.loads(row["approvers"])))):

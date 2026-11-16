@@ -5,7 +5,7 @@ import threading
 
 from .connectors.web import SiteSession
 from .credentials import EncryptedFileStore
-from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile
+from .web_profiles import PROFILE_ENV, SESSION_ENV, WebProfile, connection_origins
 
 
 def session_ref(conn, values):
@@ -25,7 +25,8 @@ class WebSessions:
     def get(self, conn, values):
         ref = session_ref(conn, values)
         with self.lock:
-            if ref not in self.live:
+            origins = connection_origins(conn)
+            if ref not in self.live or self.live[ref].origins != frozenset(origins):
                 raw, redactions = values[conn.secret_env[SESSION_ENV]], ()
                 if ref in self.file.names():
                     record = json.loads(self.file.get(ref))
@@ -37,7 +38,7 @@ class WebSessions:
                         if self.live.get(ref) is session:
                             self.file.set(ref, json.dumps({"cookies": raw, "redactions": sorted(redactions)}))
 
-                session = self.live[ref] = SiteSession(profile, raw, persist=persist, redactions=redactions)
+                session = self.live[ref] = SiteSession(profile, raw, persist=persist, redactions=redactions, extra_origins=origins[1:])
             return self.live[ref]
 
     def prune(self, cfg, values):

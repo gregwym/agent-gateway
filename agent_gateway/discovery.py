@@ -8,7 +8,8 @@ import mcp_types as types
 
 from .admin_config import kind_of, mailbox_metadata
 from .approval_dispatch import KEY_PROPERTY, WAIT_PROPERTY
-from .web_profiles import PROFILE_ENV, WebProfile
+from .web_catalog import DESCRIPTIONS
+from .web_profiles import connection_origins
 
 SEARCH_TOOLS = "gateway_search_tools"
 SEARCH_CONNECTIONS = "gateway_search_connections"
@@ -99,13 +100,27 @@ def search_tools(gateway, who, args):
         items.append({"name": name, "description": routes[0].exposed.description or definition.get("description", ""),
                       "inputSchema": routes[0].exposed.input_schema, "connection_count": len({r.conn.id for r in routes}),
                       "note": "Connection restrictions can differ. Search connections for this tool to get its exact permitted parameters."})
+    catalog = gateway.website_catalogs
+    # Description maintenance is on demand. It does not clutter the ordinary
+    # tool list but is discoverable by name and from website connections.
+    if catalog and args.get("query"):
+        client = next(c for c in gateway.cfg.clients if c.id == who.client_id)
+        for name, (description, schema) in DESCRIPTIONS.items():
+            if not matches(args["query"], name, description, "catalog OpenAPI GraphQL"):
+                continue
+            conns = [conn for conn in gateway.cfg.connections
+                     if (not args.get("connection") or args["connection"] == conn.id)
+                     and catalog.connection(gateway, client, conn.id, name)]
+            if conns:
+                items.append({"name": name, "description": description, "inputSchema": schema, "connection_count": len(conns)})
     return page(items, args, "tools")
 
 
 def search_connections(gateway, who, args):
     grouped = {}
+    catalog_tool = args.get("tool") in DESCRIPTIONS
     for route in permitted(gateway, who):
-        if args.get("tool") and args["tool"] != shared_name(route):
+        if args.get("tool") and not catalog_tool and args["tool"] != shared_name(route):
             continue
         grouped.setdefault(route.conn.id, []).append(route)
     items = []
@@ -113,17 +128,25 @@ def search_connections(gateway, who, args):
         conn = routes[0].conn
         owner = gateway.cfg.name_of(conn.owner)
         mailbox = mailbox_metadata(conn)
-        origin = WebProfile.saved(conn.env[PROFILE_ENV]).origin if kind_of(conn) == "web" else None
-        if not matches(args.get("query", ""), name, conn.service, owner, origin or "", mailbox.get("email", ""),
+        origins = connection_origins(conn) if kind_of(conn) == "web" else []
+        origin = origins[0] if origins else None
+        if catalog_tool:
+            client = next(c for c in gateway.cfg.clients if c.id == who.client_id)
+            if not gateway.website_catalogs or not gateway.website_catalogs.connection(gateway, client, conn.id, args["tool"]):
+                continue
+        if not matches(args.get("query", ""), name, conn.service, owner, *origins, mailbox.get("email", ""),
                        mailbox.get("sender_email", ""), *mailbox.get("aliases", ())):
             continue
         item = {"connection": name, "service": conn.service, "owner": owner,
                 "tool_count": len({shared_name(r) for r in routes}), **mailbox}
         if origin:
             item["origin"] = origin
+            item["api_origins"] = origins[1:]
+            if gateway.website_catalogs:
+                item["api_catalog"] = gateway.website_catalogs.metadata(conn, who.client_id)
         if who.client_id in conn.mailbox_access:
             item["mailbox_paths_restricted"] = True
-        if args.get("tool"):
+        if args.get("tool") and not catalog_tool:
             item["variants"] = []
             for route in sorted(routes, key=lambda r: r.tool.name):
                 tool = route.tool.name

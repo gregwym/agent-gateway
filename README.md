@@ -144,7 +144,9 @@ connections share `web_http_request` and `web_graphql_request`. An Agent selects
 a connection, supplies the relative path and request, and interprets the
 response. The Gateway attaches the saved session and applies the connection's
 read/write policy. Sign in from the admin page on a phone or computer.
-Amazon US and Weee! are experimental sign-in presets.
+Choose a sign-in preset or enter a public HTTPS origin. Administrators can approve additional API origins for the same
+connection. A designated Agent can publish an optional OpenAPI or GraphQL description through `gateway_call_tool`;
+descriptions never change grants. See [website setup and API descriptions](docs/deployment.md#网站会话).
 
 See [product requirements](docs/requirements.md) and
 [remote connection setup](docs/deployment.md#remote-mcp).

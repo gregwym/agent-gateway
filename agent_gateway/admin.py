@@ -28,7 +28,8 @@ from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .plugins import MANIFEST_ENV, connector_plugins
 from .upstream import list_all_tools, open_client
 from .web_errors import connector_failure, failure_response, probe_error
-from .web_profiles import PROFILE_ENV, WebProfile
+from .web_catalog import WebsiteCatalogs
+from .web_profiles import ORIGINS_ENV, PROFILE_ENV, WebProfile, api_origins, connection_origins
 
 
 _ADMIN_PAGE_HEADERS = {**_PAGE_HEADERS, "Content-Security-Policy":
@@ -50,7 +51,7 @@ def needs_admin_confirmation(operation, body):
     return operation in {
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
-        "settings/gmail-oauth", "web-login/start",
+        "settings/gmail-oauth", "web-login/start", "web-catalog/publisher", "web-catalog/origins",
     }
 
 
@@ -69,6 +70,7 @@ class AdminController:
         from .web_sessions import WebSessions
         self.web_sessions = WebSessions(self.store.base)
         self.website_login = WebsiteLogin(self)
+        self.website_catalogs = WebsiteCatalogs(self)
         self.mcp_oauth = MCPConsent(self)
         from .admin_oauth import GoogleConsent
         self.google = GoogleConsent(self)
@@ -81,6 +83,7 @@ class AdminController:
         cfg, lock, values = self.store.effective(state)
         result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver, self.oauth, self.web_sessions)
         from .catalog_sync import catalog_revision
+        result.website_catalogs = self.website_catalogs
         result.configuration_revision = "web:" + str(state["revision"]) + ":" + catalog_revision(cfg, lock)
         return result
 
@@ -97,6 +100,10 @@ class AdminController:
                 except Exception:
                     self.runtime.gateway.audit.write("oauth_cleanup_failed", reason="storage_unavailable")
                 self.prune_web_sessions(self.runtime.gateway)
+                try:
+                    self.website_catalogs.prune()
+                except OSError:
+                    self.runtime.gateway.audit.write("website_catalog_cleanup_failed", reason="storage_unavailable")
                 pending = {f["ref"] for f in self.mcp_oauth.flows.values()} | {d.get("oauth_ref") for d in self.drafts.values()}
                 for ref, record in list(self.oauth.records.items()):
                     if ref not in self.oauth.persisted and ref not in pending and record["created"] + 600 <= now:
@@ -337,12 +344,18 @@ class AdminController:
             return await self.save_connection(state, cfg, conn, added, previous)
         return self.preview_result(state, conn, added, flow["definitions"], session)
 
+    def website_connection(self, name):
+        conn = next((c for c in self.runtime.gateway.cfg.connections if c.id == name and kind_of(c) == "web"), None)
+        if not conn:
+            raise Refused("not_found", 404)
+        return conn
+
     @staticmethod
     def website(conn):
         if kind_of(conn) != "web":
             return None
         spec = WebProfile.saved(conn.env[PROFILE_ENV])
-        return {"origin": spec.origin, "experimental": spec.experimental}
+        return {"origin": spec.origin, "api_origins": connection_origins(conn)[1:], "experimental": spec.experimental}
 
     def connection_settings(self, conn):
         settings = settings_of(conn)
@@ -371,6 +384,44 @@ class AdminController:
             result = await self.operate("connections/save", connector, session, gmail_email=account)
             del self.google.flows[key]
             return {**result, "google_account": account}
+        if operation == "web-catalog/view":
+            conn = self.website_connection(body.get("id"))
+            version = body.get("catalog_revision")
+            if set(body) - {"id", "catalog_revision"} or version is not None and type(version) is not int:
+                raise Refused("invalid_argument", 400)
+            return {**self.website_catalogs.view(conn, version), **self.website(conn)}
+        if operation == "web-catalog/origins":
+            self._revision(body)
+            if set(body) != {"id", "origins", "revision"}:
+                raise Refused("invalid_argument", 400)
+            conn = self.website_connection(body["id"])
+            current = connection_origins(conn)
+            try:
+                origins = [o for o in api_origins(json.dumps(body["origins"])) if o != current[0]]
+            except ValueError:
+                raise Refused("website_origin_invalid", 400) from None
+            if origins == current[1:]:
+                return {"revision": self.store.state["revision"]}
+            state = self.store.candidate()
+            raw = next(c for c in state["config"]["connections"] if c["id"] == conn.id)
+            raw["env"][ORIGINS_ENV] = json.dumps(origins)
+            return await self._commit(state, operation)
+        if operation == "web-catalog/publisher":
+            self._revision(body)
+            if set(body) != {"id", "client", "revision"}:
+                raise Refused("invalid_argument", 400)
+            conn = self.website_connection(body["id"])
+            gateway = self.runtime.gateway
+            writer = body["client"]
+            client = next((c for c in gateway.cfg.clients if c.id == writer), None)
+            if writer is not None and (not client or not self.website_catalogs.eligible(gateway, client, conn)):
+                raise Refused("website_catalog_publisher_needs_access", 400)
+            binding = self.website_catalogs.binding(conn.id)
+            if writer == (binding or {}).get("writer"):
+                return {"revision": self.store.state["revision"]}
+            state = self.store.candidate()
+            self.website_catalogs.set_writer(state, conn.id, writer)
+            return await self._commit(state, operation)
         if operation == "connections/mailboxes":
             if set(body) != {"id"}:
                 raise Refused("invalid_argument", 400)
@@ -578,6 +629,9 @@ class AdminController:
                 if any(c["id"] == renamed for c in raw["clients"]):
                     raise Refused("duplicate_client", 400)
                 client["id"] = renamed
+                for binding in state.get("website_catalogs", {}).values():
+                    if binding.get("writer") == name:
+                        binding["writer"] = renamed
                 for rule in raw["policy"]:
                     rule["clients"] = [renamed if c == name else c for c in rule["clients"]]
                 for conn in raw["connections"]:
@@ -589,6 +643,9 @@ class AdminController:
                 client["token_sha256"] = hash_token(token)
             else:
                 raw["clients"].remove(client)
+                for binding in state.get("website_catalogs", {}).values():
+                    if binding.get("writer") == name:
+                        binding["writer"] = None
                 raw["policy"] = [{**r, "clients": [c for c in r["clients"] if c != name]}
                                  for r in raw["policy"] if any(c != name for c in r["clients"])]
                 for conn in raw["connections"]:
@@ -617,6 +674,9 @@ class AdminController:
                     rule["connection"] = renamed
             state["locks"][renamed] = copy.deepcopy(lock.entries.get(name, {}))
             state["locks"].pop(name, None)
+            catalogs = state.get("website_catalogs", {})
+            if name in catalogs:
+                catalogs[renamed] = catalogs.pop(name)
             metadata = state.get("bundled_catalog", {})
             if name in metadata:
                 metadata[renamed] = metadata.pop(name)
@@ -684,6 +744,7 @@ class AdminController:
             raw["connections"] = [c for c in raw["connections"] if c["id"] != name]
             raw["policy"] = [p for p in raw["policy"] if p["connection"] != name]
             state["locks"].pop(name, None)
+            state.get("website_catalogs", {}).pop(name, None)
             referenced = {n for c in raw["connections"] for n in [*c.get("secret_env", {}).values(),
                           *c.get("secret_headers", {}).values(), c.get("bearer_secret")] if n}
             state["secrets"] = {k: v for k, v in state["secrets"].items() if k in referenced}

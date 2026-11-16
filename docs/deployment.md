@@ -520,7 +520,7 @@ stdio MCP 示例：
 
 ### 网站会话
 
-在手机或电脑打开「连接器 → 添加连接器 → 网站」，选择站点后点「登录网站」。在登录页点选输入框，
+在手机或电脑打开「连接器 → 添加连接器 → 网站」，选择站点预设或用「其他网站」输入登录地址，再点「登录网站」。在登录页点选输入框，
 再用下方的输入框输入账号、密码或验证码。可用「− / +」调整网页大小。登录后点「保存会话」。
 网关加密保存会话。旧会话失效时，在「编辑设置」中点「重新登录」。「验证网站连通性」只检查
 网站能否响应，不判断是否已登录。新连接默认不向 Agent 开放。
@@ -533,8 +533,10 @@ Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据�
 导入后删除文件。备份包括 `admin.enc` 和存在时的 `admin.enc.web-sessions`。
 
 所有网站连接共用 `web_http_request` 和 `web_graphql_request`。Agent 指定连接与相对路径，读取
-HTTP 状态和文本响应。网关只向该连接的 HTTPS 来源发送 Cookie，不返回 Cookie 请求头或响应头，
-跨站跳转也不返回目标。当首个跳转地址因 Cookie 脱敏被隐藏时，HTTP GET、HEAD 会在网关内跟随最多
+HTTP 状态和文本响应。默认请求登录网站；也可以显式传入发现结果中的 `origin` 或 `api_origins` 地址。管理员在连接器详情的
+「API 描述 → API 域名」批准额外的 HTTPS 来源。只发送作用域与该来源及路径相符的 Cookie，不返回
+Cookie 请求头或响应头。旧会话的 Cookie 已绑定到原登录主机，新增来源后可能需要重新登录。请求不跟随
+跨来源跳转，也不会返回此类跳转目标。当首个跳转地址因 Cookie 脱敏被隐藏时，HTTP GET、HEAD 会在网关内跟随最多
 四次同源跳转。`follow_redirects: true` 也会跟随可见地址，`false` 只检查单次响应。有限制参数的
 工具仍须逐次提交请求。跟随跳转后会返回脱敏的 `final_path`，可用于区分登录页和请求的页面。
 长文本以字符分页；读操作可把 `next_offset` 作为下一次的 `offset`，同时传回 `body_version`，
@@ -546,8 +548,24 @@ HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理。HTTP 的 POST、P
 协议对读写的约定；对提供权限范围的服务，优先使用站点自身的最小权限账号。升级后，旧订单工具的
 授权不会转给通用工具；已保存的会话可继续使用。
 
-新增站点可用 `kind: "web"` 的主机清单，`web` 只需指定 `origin`（例如
-`"https://service.example.com"`）。Amazon US 和 Weee! 是实验性的登录预设。
+也可用 `kind: "web"` 的主机清单部署预设，`web` 只需指定 `origin`。Amazon US 和 Weee! 是实验性的登录预设。
+
+API 描述是可选的。把接口路径、参数和结构记录在 OpenAPI 3.1 文档或 GraphQL SDL 中，只用模拟示例。
+Gateway 不从请求或响应生成描述，也不根据描述放宽访问或审批。OpenAPI 只检查支持的文档结构，不解析外部引用。
+
+在连接器详情的「API 描述」中，可以选一个已经拥有此网站访问权限的 Agent 作为维护者。
+能访问网站的 Agent 可以读取描述；只有维护者可以发布。用 `gateway_search_tools` 搜索 `API description`，
+或查 `gateway_search_connections` 返回的 `api_catalog`：
+
+| `gateway_call_tool` 的 `tool` | `arguments` | 返回 |
+| --- | --- | --- |
+| `web_get_api_description` | `{}`，或指定正整数 `revision` | `revision`、`format`、`document`。未发布时版本为 0、文档为 null |
+| `web_publish_api_description` | `base_revision`、`format`、完整 `document` | 新版本及改动；基于旧版本更新时返回 `catalog_revision_conflict` 和 `current_revision` |
+
+两个操作都传 `connection` 和 `idempotency_key`。发布时 `format` 是 `openapi`（JSON 对象，
+YAML 文件需要先转 JSON）或 `graphql`（SDL 文本）。描述每份最多约 192 KB，保留最近五个版本。
+后台显示版本、改动和文档，并将 OpenAPI 中的 HTTPS 域名作为待选项。保存域名和更换维护者需管理员
+通行密钥确认；描述发布无需逐次确认。备份时保留 `admin.enc.web-catalogs`（如存在）。
 
 ## 9. 日常操作
 

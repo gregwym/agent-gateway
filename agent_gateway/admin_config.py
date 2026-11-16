@@ -30,12 +30,14 @@ CONNECTION_ACCESS = {
 }
 CONNECTOR_NAME = r"[a-z][a-z0-9_-]{0,31}"
 from .admin_remote import SPEC, make_remote
-from .plugins import SPEC as LOCAL_SPEC
-from .web_profiles import PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile, is_website
+from .plugins import SPEC as LOCAL_SPEC, Plugin
+from .web_profiles import (
+    CUSTOM_PROFILE, PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile, connection_origins, is_website, website_origin,
+)
 
 CATALOG = {
     "remote": SPEC,
-    "web": {**LOCAL_SPEC, "label": "Website / 网站", "probe": ("http_request", {"method": "HEAD", "path": "/"})},
+    "web": {**LOCAL_SPEC, "label": "Website / 网站", "fields": ["plugin", "origin"], "probe": ("http_request", {"method": "HEAD", "path": "/"})},
     "imap": {"label": "Mail / 邮箱 (IMAP + SMTP)",
              "fields": ["username", "host", "port", "smtp_host", "smtp_port", "smtp_security", "smtp_username", "smtp_sender",
                         "mailbox_email", "mailbox_aliases"], "secrets": ["password"],
@@ -324,7 +326,14 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
                 raise Refused("connector_identity_is_fixed", 409)
             allowed_secrets = previous.secret_env
         else:
-            plugin = (plugins or {}).get(plugin_id)
+            if kind == "web" and plugin_id == CUSTOM_PROFILE:
+                try:
+                    profile = WebProfile(origin=website_origin(settings.get("origin")))
+                except ValueError:
+                    raise Refused("website_origin_invalid", 400) from None
+                plugin = Plugin(id=CUSTOM_PROFILE, label="Website", kind="web", web=profile.model_dump())
+            else:
+                plugin = (plugins or {}).get(plugin_id)
             if plugin is None or (kind == "web") != (plugin.kind == "web"):
                 raise Refused("local_plugin_unavailable", 400)
             allowed_secrets = plugin.credential_slots()
@@ -380,7 +389,7 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
             profile = (WebProfile.saved(previous.env[PROFILE_ENV]) if previous
                        else WebProfile.model_validate(plugin.web))
             try:
-                provided = {SESSION_ENV: import_session(provided[SESSION_ENV], profile)}
+                provided = {SESSION_ENV: import_session(provided[SESSION_ENV], profile, connection_origins(previous)[1:] if previous else ())}
             except (ValueError, RecursionError):
                 raise Refused("web_session_invalid", 400) from None
         refs = {}

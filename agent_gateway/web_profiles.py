@@ -12,6 +12,8 @@ from .plugins import ManifestModel
 
 SESSION_ENV = "AGW_WEB_SESSION"
 PROFILE_ENV = "AGW_WEB_PROFILE"
+ORIGINS_ENV = "AGW_WEB_API_ORIGINS"
+CUSTOM_PROFILE = "custom-website"
 WEB_TOOLS = ("http_request", "graphql_request")
 
 
@@ -56,3 +58,21 @@ def bundled_profiles():
         "amazon-us": ("Amazon US · experimental", WebProfile(origin="https://www.amazon.com", experimental=True)),
         "weee-orders": ("Weee! · experimental", WebProfile(origin="https://www.weee.com", experimental=True)),
     }
+
+
+def website_origin(value):
+    if not isinstance(value, str):
+        raise ValueError("Expected a website URL")
+    return WebProfile(origin=value.strip().rstrip("/")).origin
+
+
+def api_origins(raw):
+    values = json.loads(raw)
+    if not isinstance(values, list) or len(values) > 8:
+        raise ValueError("Choose no more than eight API origins")
+    return list(dict.fromkeys(website_origin(value) for value in values))
+
+
+def connection_origins(conn):
+    profile = WebProfile.saved(conn.env[PROFILE_ENV])
+    return [profile.origin, *(origin for origin in api_origins(conn.env.get(ORIGINS_ENV, "[]")) if origin != profile.origin)]
