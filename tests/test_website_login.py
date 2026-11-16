@@ -54,7 +54,8 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
                 return {"cookies": []}
             return {"cookies": [{"name": "auth", "domain": site, "value": SECRET},
                                 {"name": "auth", "domain": "evil.test", "value": "unrelated-password"}]}
-        return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"]}
+        return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"],
+                "editable": bool(backend["taps"])}
 
     monkeypatch.setattr(web, "_fetch", fetch)
     monkeypatch.setattr(WebsiteLogin, "worker", worker)
@@ -218,6 +219,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
             release.set()
         await playwright.expect(login_box.get_by_label("输入到选中的框")).to_have_value("")
         await playwright.expect(login_box.get_by_role("button", name="输入", exact=True)).to_be_enabled()
+        await playwright.expect(login_box.get_by_label("输入到选中的框")).to_have_attribute("placeholder", "已选中网页输入框，在此输入")
         backend["auth"] = True
         await login_box.get_by_role("button", name="保存会话", exact=True).tap()
         row = page.locator('tr[data-connection="amazon-orders"]')
@@ -234,7 +236,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
 
 @pytest.mark.browser
 async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, monkeypatch):
-    from agent_gateway.browser_worker import Browser, WIDTH
+    from agent_gateway.browser_worker import Browser, NoFocusedInput, WIDTH
     playwright = pytest.importorskip("playwright.async_api")
     async with playwright.async_playwright() as driver:
         chromium = await driver.chromium.launch()
@@ -282,6 +284,29 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
             await view.use("text", {"text": "simulated@example.test"})
             await playwright.expect(email).to_be_focused()
             await playwright.expect(email).to_have_value("simulated@example.test")
+
+            # A site can enable its password field on touch. Mouse input
+            # leaves it read-only. Also exercise a separate sign-in frame.
+            await page.route("https://credentials.example/password", lambda route: route.fulfill(
+                content_type="text/html",
+                body='<input aria-label="Password" type="password" readonly '
+                     'ontouchstart="this.readOnly=false; this.focus()">'))
+            await page.evaluate("""() => {
+                const frame = document.createElement('iframe');
+                frame.src = 'https://credentials.example/password';
+                document.body.replaceChildren(frame);
+            }""")
+            password = page.frame_locator("iframe").get_by_label("Password")
+            bounds = await password.bounding_box()
+            x, y = int(bounds["x"] + 5), int(bounds["y"] + bounds["height"] / 2)
+            await page.mouse.click(x, y)
+            with pytest.raises(NoFocusedInput):
+                await view.use("text", {"text": "simulated-secret"})
+            selected = await view.use("tap", {"x": x, "y": y})
+            assert selected["editable"] is True
+            await view.use("text", {"text": "simulated-secret"})
+            await playwright.expect(password).to_have_value("simulated-secret")
+
             await view.context.add_cookies([
                 {"name": "account", "value": "keep", "url": "https://signin.example"},
                 {"name": "api", "value": "keep", "url": "https://api.signin.example"},

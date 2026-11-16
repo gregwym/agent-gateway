@@ -181,6 +181,8 @@ const messages = {
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   website_origin_invalid: ['Enter up to eight distinct public HTTPS origins, with no paths or port numbers.', '请输入公网 HTTPS 网站地址，不含路径或端口，最多八个 API 地址。'],
+  web_post_read_proposal_missing: ['This proposal is no longer available.', '该提案已不可用。'],
+  web_post_read_proposal_stale: ['This proposal can no longer be approved. Ask the Agent to submit it again.', '这条提案已无法审批，请让 Agent 重新提交。'],
   website_catalog_revision_missing: ['This revision is no longer available.', '这个版本已不在保留范围内。'],
   website_catalog_publisher_needs_access: ['Give this agent access to the website connection first.', '请先授予这个 Agent 使用此网站连接的权限。'],
   web_origin_not_approved: ['This API origin is not approved for this connection.', '此连接尚未获准访问这个 API 地址。'],
@@ -192,6 +194,7 @@ const messages = {
   web_browser_expired: ['This sign-in window expired. Open a new one and try again.', '此次登录窗口已过期，请重新打开。'],
   web_browser_timeout: ['The login browser stopped responding. Refresh it or open a new window.', '登录浏览器响应超时，请刷新或重新打开窗口。'],
   web_browser_failed: ['The login page could not be loaded or operated. Refresh it and try again.', '无法加载或操作登录页，请刷新后重试。'],
+  web_browser_select_field: ['No editable field is selected. Tap the field or use Tab, then press Type again.', '还没有选中可输入的网页字段。点选字段或用 Tab 切换，再按「输入」。'],
   web_browser_input: ['This browser action is invalid. Try again.', '浏览器操作无效，请重试。'],
   web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
   web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
@@ -484,6 +487,11 @@ function render() {
     });
   }
   ({overview, members, agents, connections, permissions, settings: systemSettings})[tab]();
+  const params = new URLSearchParams(location.search);
+  if (tab === 'connections' && params.has('review_post_reads') && params.has('proposal')) {
+    history.replaceState(null, '', tabUrls.connections);
+    websitePostReads(params.get('review_post_reads'), params.get('proposal')).catch(error => showError(app, error));
+  }
 }
 function overview() {
   const hero = el(app, 'section', undefined, 'hero'); el(hero, 'p', tr('Ready when you are', '准备就绪'), 'eyebrow');
@@ -735,6 +743,7 @@ function connectorDetails(id) {
       const initial = await api('web-catalog/view', {id});
       websiteCatalog(conn, initial);
     });
+    if (conn.kind === 'web') button(actions, tr('POST read rules', 'POST 读取规则'), () => websitePostReads(id));
     if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
@@ -750,6 +759,50 @@ function connectorDetails(id) {
     button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permissions will also be removed.', '工具和权限也会一并移除。'), async () => { await mutate('connections/remove', {id}); box.close(); }), 'danger');
   }
   populate();
+}
+
+async function websitePostReads(id, proposalId = null) {
+  const request = {id, ...(proposalId ? {proposal: proposalId} : {})};
+  const initial = await api('web-post-reads/view', request);
+  const box = modal(tr('POST read rules', 'POST 读取规则') + ' · ' + id), content = el(box, 'div');
+  const reload = async () => populate(await api('web-post-reads/view', request));
+  function endpoint(parent, rule) { el(parent, 'code', 'POST ' + rule.origin + rule.path, 'url'); }
+  function populate({active, proposal, revision}) {
+    content.replaceChildren();
+    el(content, 'h3', tr('Agent proposal', 'Agent 提案'));
+    if (!proposal) el(content, 'p', tr('No proposal yet.', '暂无提案。'), 'muted');
+    else {
+      el(content, 'p', proposal.agent + ' · ' + proposal.reason);
+      const list = el(content, 'ul');
+      for (const rule of proposal.endpoints) endpoint(el(list, 'li'), rule);
+      if (proposal.status === 'pending_admin_review') {
+        el(content, 'p', tr('Approve these paths only if every request to them is read-only, regardless of body. Existing read permissions will apply.',
+          '只有在这些路径无论请求体是什么都只会读取时，才应批准。批准后按现有的读取权限处理。'), 'muted');
+        const actions = el(content, 'div', undefined, 'actions');
+        const decide = async decision => {
+          await mutate('web-post-reads/decide', {id, proposal: proposal.id, decision, revision});
+          await reload();
+        };
+        button(actions, tr('Approve as read', '批准为读取'), () => decide('approve'), 'primary');
+        button(actions, tr('Reject', '拒绝'), () => decide('reject'));
+      } else {
+        const labels = {approved: tr('Approved', '已批准'), rejected: tr('Rejected', '已拒绝'),
+          stale: tr('No longer reviewable. Ask the Agent to submit again.', '提案已无法审批，请让 Agent 重新提交。')};
+        el(content, 'p', labels[proposal.status], 'muted');
+      }
+    }
+    el(content, 'h3', tr('Active rules', '生效规则'));
+    if (!active.length) el(content, 'p', tr('None', '无'), 'muted');
+    for (const rule of active) {
+      const row = el(content, 'div', undefined, 'row');
+      endpoint(row, rule);
+      button(row, tr('Remove rule', '移除规则'), async () => {
+        await mutate('web-post-reads/remove', {id, ...rule, revision});
+        await reload();
+      });
+    }
+  }
+  populate(initial);
 }
 
 function websiteCatalog(conn, initial) {
@@ -1206,7 +1259,8 @@ function showWebsiteLogin(flow, connector) {
   status.setAttribute('role', 'status');
   const keyboard = el(box, 'form', undefined, 'login-keyboard');
   const input = field(keyboard, tr('Type into the selected field', '输入到选中的框'), 'login_input', '', 'password');
-  input.placeholder = tr('Tap a field above, then type here', '点选网页输入框，再在此输入');
+  const chooseField = tr('Tap a field above, then type here', '点选网页输入框，再在此输入');
+  input.placeholder = chooseField;
   input.setAttribute('autocapitalize', 'none'); input.spellcheck = false;
   input.maxLength = 2048;
   const send = el(keyboard, 'button', tr('Type', '输入'));
@@ -1236,6 +1290,7 @@ function showWebsiteLogin(flow, connector) {
       lastImage = result.image;
     }
     host.textContent = result.host || flow.host;
+    input.placeholder = result.editable ? tr('Field selected. Type here.', '已选中网页输入框，在此输入') : chooseField;
     status.textContent = '';
     zoom = result.zoom ?? zoom;
     zoomLabel.textContent = zoom + '%';
@@ -1280,7 +1335,12 @@ function showWebsiteLogin(flow, connector) {
     input.blur();
     sending = send.disabled = true;
     try { await perform('text', {text}); }
-    catch (error) { if (box.open) showError(box, error); }
+    catch (error) {
+      if (box.open) {
+        if (error.code === 'web_browser_select_field' && !input.value) input.value = text;
+        showError(box, error);
+      }
+    }
     finally { sending = send.disabled = false; }
   });
   const changeZoom = step => action('zoom', () => {

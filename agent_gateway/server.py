@@ -318,7 +318,7 @@ class Gateway:
     async def _submit_website_description(self, ctx, dispatcher, who, args, key, audit):
         from .passkey import Refused
         from .request_store import QueueFull
-        from .web_catalog import DESCRIPTIONS, PUBLISH_DESCRIPTION
+        from .web_catalog import DESCRIPTIONS, PROPOSE_POST_READS, PUBLISH_DESCRIPTION
 
         client = next(c for c in self.cfg.clients if c.id == who.client_id)
         name, fields = args["tool"], args["arguments"]
@@ -328,10 +328,12 @@ class Gateway:
             raise MCPError(types.INVALID_PARAMS, _UNKNOWN_TOOL)
         if "variant" in args or not Draft202012Validator(DESCRIPTIONS[name][1]).is_valid(fields):
             audit("deny", "invalid_arguments")
-            return _error("Invalid API description arguments; check the schema from gateway_search_tools.")
+            return _error("Invalid website management arguments; check the schema from gateway_search_tools.")
         try:
             if name == PUBLISH_DESCRIPTION:
                 self.website_catalogs.check_publication(fields)
+            elif name == PROPOSE_POST_READS:
+                self.website_catalogs.check_post_reads(conn, fields)
             call = self._website_description_request(client, conn, name, fields)
             job = dispatcher.store.enqueue(call, key)
         except Refused as exc:
@@ -361,7 +363,7 @@ class Gateway:
 
     def _run_website_description(self, row, client, done):
         from .passkey import Refused
-        from .web_catalog import GET_DESCRIPTION
+        from .web_catalog import GET_DESCRIPTION, PUBLISH_DESCRIPTION
 
         name = row["tool"]
         conn = self.website_catalogs.connection(self, client, row["connection"], name)
@@ -373,8 +375,10 @@ class Gateway:
         try:
             if name == GET_DESCRIPTION:
                 data = self.website_catalogs.get_description(conn, fields.get("revision"))
-            else:
+            elif name == PUBLISH_DESCRIPTION:
                 data = self.website_catalogs.publish(conn, self.website_catalogs.binding(conn.id), client.id, fields)
+            else:
+                data = self.website_catalogs.propose_post_reads(conn, client.id, fields)
         except Refused as exc:
             data = {"error": exc.code}
         result = self._catalog_result(data)
@@ -430,13 +434,18 @@ class Gateway:
             from .connectors.web import ConnectorError, plan_request
             try:
                 plan = plan_request(route.tool.upstream, arguments)
-                if plan.origin is not None and plan.origin not in connection_origins(route.conn):
+                origins = connection_origins(route.conn)
+                if plan.origin is not None and plan.origin not in origins:
                     done("deny", "web_origin_not_approved")
                     return _error("This API origin is not approved for the connection.")
                 if plan.follow_redirects is True and (route.tool.pin or route.tool.allow_values):
                     done("deny", "web_redirect_restricted")
                     return _error("This tool has argument restrictions. Submit each redirect target as a separate request.")
                 operation = plan.access
+                if (route.tool.upstream == "http_request" and plan.method == "POST"
+                        and any((rule.origin, rule.path) == (plan.origin or origins[0], plan.target)
+                                for rule in route.conn.web_post_reads)):
+                    operation = "read"
             except ConnectorError as exc:
                 done("deny", exc.code)
                 return _error(str(exc))

@@ -42,6 +42,9 @@ class WebsiteLogin:
                 response = await client.post("/" + action, json=data)
             if response.status_code in (409, 410):
                 raise Refused("web_browser_in_use" if response.status_code == 409 else "web_browser_expired", 409)
+            if (action == "text" and response.status_code == 422
+                    and response.json().get("error") == "web_browser_select_field"):
+                raise Refused("web_browser_select_field", 422)
             response.raise_for_status()
             return response.json()
         except httpx.TimeoutException:

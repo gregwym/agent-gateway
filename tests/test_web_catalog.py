@@ -6,12 +6,12 @@ import pytest
 from mcp import MCPError
 
 from agent_gateway.connectors import web
-from agent_gateway.web_catalog import GET_DESCRIPTION, PUBLISH_DESCRIPTION
+from agent_gateway.web_catalog import GET_DESCRIPTION, PROPOSE_POST_READS, PUBLISH_DESCRIPTION
 from agent_gateway.web_profiles import SESSION_ENV
 from helpers import TOKEN_A, TOKEN_B, agent
 from passkey_helpers import TOKEN_A2
 from test_admin import change, login, setup, state, web_gateway
-from test_discovery import execute, search, wait_for_approval
+from test_discovery import execute, search
 from test_web_connector import payload, response, start_site
 
 pytestmark = pytest.mark.anyio
@@ -127,6 +127,96 @@ async def test_agents_publish_with_version_and_idempotency_without_granting_acce
             assert (await execute(client, GET_DESCRIPTION, "shop", {"revision": 1})).structured_content["document"] == document
 
 
+async def test_post_read_proposal_requires_passkey_and_matches_exact_endpoint(tmp_path, monkeypatch):
+    calls = []
+
+    def fetch(host, target, method, headers, body, receive):
+        calls.append((host, target, method))
+        return response(receive, b'{}', content_type="application/json")
+
+    monkeypatch.setattr(web, "_fetch", fetch)
+    path, port = await start_site(tmp_path)
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, config):
+        key = await setup_site(http, origin, config)
+        assert (await change(http, "web-catalog/origins", id="shop", origins=[API])).status_code == 200
+        assert (await change(http, "web-catalog/publisher", id="shop", client="agent-a")).status_code == 200
+        assert (await change(http, "permissions/connection", connection="shop", client="agent-a2",
+                             access="read_write_approval")).status_code == 200
+
+        rule = {"origin": API, "path": "/orders"}
+        proposal_body = {"endpoints": [rule], "reason": "Lists orders; the body only filters the result."}
+        call = {"method": "POST", **rule}
+        async with (agent(origin + "/mcp", TOKEN_A) as maintainer, agent(origin + "/mcp", TOKEN_A2) as other,
+                    agent(origin + "/mcp", TOKEN_B) as outsider):
+            found = await search(maintainer, "tools", query=PROPOSE_POST_READS, connection="shop")
+            assert [t["name"] for t in found["tools"]] == [PROPOSE_POST_READS]
+            for client in (other, outsider):
+                assert (await search(client, "tools", query=PROPOSE_POST_READS))["total"] == 0
+                with pytest.raises(MCPError, match="Unknown tool"):
+                    await execute(client, PROPOSE_POST_READS, "shop", proposal_body)
+            for invalid in ({**rule, "origin": "https://other.example.test"},
+                            *({**rule, "path": path} for path in ("/orders?x=1", "/%6frders", "/a/../orders", "//orders", "/orders/{id}"))):
+                refused = await execute(maintainer, PROPOSE_POST_READS, "shop", {**proposal_body, "endpoints": [invalid]})
+                assert refused.is_error and refused.structured_content["error"] == "web_post_read_invalid"
+
+            def submit(body=proposal_body):
+                return execute(maintainer, PROPOSE_POST_READS, "shop", body)
+
+            revision = (await state(http))["revision"]
+            first = (await submit()).structured_content
+            assert first["status"] == "pending_admin_review"
+            assert first["review_url"].endswith("review_post_reads=shop&proposal=" + first["proposal_id"])
+            assert (await submit()).structured_content["proposal_id"] == first["proposal_id"]
+            conflicting = await submit({**proposal_body, "endpoints": [{**rule, "path": "/status"}]})
+            assert conflicting.structured_content["error"] == "web_post_read_pending"
+            assert (await execute(maintainer, "web_http_request", "shop", call)).is_error
+            assert (await state(http))["revision"] == revision and not calls
+            reject = await change(http, "web-post-reads/decide", id="shop", proposal=first["proposal_id"], decision="reject")
+            assert reject.json()["status"] == "rejected"
+            assert (await execute(maintainer, "web_http_request", "shop", call)).is_error
+
+            second = (await submit()).structured_content
+            assert second["proposal_id"] != first["proposal_id"]
+            view = (await http.post("/admin/api/web-post-reads/view",
+                                    json={"id": "shop", "proposal": second["proposal_id"]})).json()
+            assert view["active"] == [] and view["proposal"]["endpoints"] == [rule]
+            decision = {"id": "shop", "proposal": second["proposal_id"], "decision": "approve"}
+            unconfirmed = await http.post("/admin/api/web-post-reads/decide", json={**decision, "revision": revision})
+            assert unconfirmed.status_code == 403 and unconfirmed.json()["error"] == "admin_confirmation_required"
+            assert (await execute(maintainer, "web_http_request", "shop", call)).is_error and not calls
+            approved = await change(http, "web-post-reads/decide", **decision)
+            assert approved.status_code == 200, approved.text
+
+            assert payload(await execute(maintainer, "web_http_request", "shop", call))["status"] == 200
+            assert calls == [("api.example.test", "/orders", "POST")]
+            assert (await search(maintainer, "connections", query="shop"))["connections"][0]["post_read_endpoints"] == [rule]
+            for changed_call in ({**call, "path": other_path} for other_path in ("/orders/", "/orders?x=1", "/orders/submit", "/%6frders")):
+                assert (await execute(maintainer, "web_http_request", "shop", changed_call)).is_error
+            assert (await execute(maintainer, "web_http_request", "shop", {**call, "origin": MAIN})).is_error
+            assert (await execute(maintainer, "web_graphql_request", "shop",
+                                  {**rule, "query": "mutation { checkout }"})).is_error
+            for args in (call, {**call, "path": "/checkout"}):
+                pending = await execute(other, "web_http_request", "shop", args)
+                assert pending.structured_content["status"] == "pending"
+            assert (await change(http, "permissions/connection", connection="shop", client="agent-a",
+                                 access="read_write")).status_code == 200
+            assert payload(await execute(maintainer, "web_http_request", "shop", call))["status"] == 200
+            for args in ({**call, "path": "/checkout"}, {**call, "path": "/payment"}, {**call, "path": "/cancel"}):
+                pending = await execute(maintainer, "web_http_request", "shop", args)
+                assert pending.structured_content["status"] == "pending"
+            assert len(calls) == 2
+            assert (await change(http, "permissions/connection", connection="shop", client="agent-a",
+                                 access="read")).status_code == 200
+
+    async with web_gateway(tmp_path, path=path, port=port) as (_, http, origin, config):
+        await login(http, key, origin)
+        async with agent(origin + "/mcp", TOKEN_A) as maintainer:
+            assert payload(await execute(maintainer, "web_http_request", "shop", call))["status"] == 200
+            assert (await change(http, "web-catalog/origins", id="shop", origins=[])).status_code == 200
+            assert (await change(http, "web-catalog/origins", id="shop", origins=[API])).status_code == 200
+            assert (await execute(maintainer, "web_http_request", "shop", call)).is_error
+
+
 @pytest.mark.browser
 async def test_mobile_admin_reviews_catalog_versions_and_approves_origin(tmp_path):
     from test_admin_feedback_browser import admin_page, playwright
@@ -187,6 +277,16 @@ async def test_mobile_admin_reviews_catalog_versions_and_approves_origin(tmp_pat
         async with agent(origin + "/mcp", TOKEN_A) as writer:
             entries = await search(writer, "connections", query="shop")
             assert entries["connections"][0]["api_origins"] == [API]
+            result = await execute(writer, PROPOSE_POST_READS, "shop", {
+                "endpoints": [{"origin": API, "path": "/orders"}], "reason": "Lists orders."
+            })
+            await page.goto(result.structured_content["review_url"])
+            rules = page.get_by_role("dialog", name="POST 读取规则 · shop", exact=True)
+            await playwright.expect(rules.get_by_text("POST " + API + "/orders", exact=True)).to_be_visible()
+            await rules.get_by_role("button", name="批准为读取", exact=True).tap()
+            await playwright.expect(rules.get_by_text("已批准", exact=True)).to_be_visible()
+            await rules.get_by_role("button", name="移除规则", exact=True).tap()
+            await playwright.expect(rules.get_by_text("无", exact=True)).to_be_visible()
 
 
 def test_graphql_description_reports_type_changes_and_rejects_tokens():

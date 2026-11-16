@@ -21,6 +21,33 @@ ZOOM_LEVELS = (50, 67, 80, 100, 125, 150, 200)
 FLOW = re.compile(r"[0-9a-f]{24}")
 
 
+class NoFocusedInput(Exception):
+    pass
+
+
+async def has_focused_input(page):
+    # Follow the active element into a frame or shadow root, without reading
+    # any text, names or values from the form.
+    frame = page.main_frame
+    while frame is not None:
+        focus = await frame.evaluate_handle("""() => {
+            let node = document.activeElement;
+            while (node?.shadowRoot?.activeElement) node = node.shadowRoot.activeElement;
+            return node;
+        }""")
+        try:
+            if await focus.evaluate("""node => !!node && !node.matches(':disabled, [readonly]') &&
+                (node.isContentEditable || node.tagName === 'TEXTAREA' ||
+                 node.tagName === 'INPUT' && ['text', 'password', 'email', 'tel', 'url', 'search', 'number'].includes(node.type))
+            """):
+                return True
+            element = focus.as_element()
+            frame = await element.content_frame() if element else None
+        finally:
+            await focus.dispose()
+    return False
+
+
 class Browser:
     def __init__(self, path):
         self.path = path
@@ -112,8 +139,10 @@ class Browser:
         if op in {"tap", "text", "key", "scroll"} and current.scheme != "https":
             raise ValueError("sign-in destination not allowed")
         if op == "tap":
-            await page.mouse.click(body["x"], body["y"])
+            await page.touchscreen.tap(body["x"], body["y"])
         elif op == "text":
+            if not await has_focused_input(page):
+                raise NoFocusedInput
             await page.keyboard.insert_text(body["text"])
         elif op == "key":
             await page.keyboard.press(body["key"])
@@ -146,9 +175,11 @@ class Browser:
                         else if (style.zoom !== String(factor)) style.zoom = factor;
                     }""", self.zoom / 100)
                 picture = await page.screenshot(type="jpeg", quality=75, timeout=5000)
+                editable = parts.scheme == "https" and await has_focused_input(page)
                 if self.context.pages[-1:] == [page] and page.url == url:
                     return {"image": base64.b64encode(picture).decode("ascii"),
-                            "host": parts.hostname if parts.scheme == "https" else None, "zoom": self.zoom or 100}
+                            "host": parts.hostname if parts.scheme == "https" else None,
+                            "zoom": self.zoom or 100, "editable": editable}
             except Error:
                 if attempt == 2:
                     raise
@@ -205,6 +236,8 @@ def make_app(path):
                     return JSONResponse({}, 410)
                 async with asyncio.timeout(9):
                     return JSONResponse(await browser.use(op, body))
+        except NoFocusedInput:
+            return JSONResponse({"error": "web_browser_select_field"}, 422)
         except Exception:
             # Exceptions may contain a page URL or typed text.
             return JSONResponse({}, 422)

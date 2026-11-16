@@ -28,7 +28,7 @@ from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .plugins import MANIFEST_ENV, connector_plugins
 from .upstream import list_all_tools, open_client
 from .web_errors import connector_failure, failure_response, probe_error
-from .web_catalog import WebsiteCatalogs
+from .web_catalog import PROPOSE_POST_READS, WebsiteCatalogs
 from .web_profiles import ORIGINS_ENV, PROFILE_ENV, WebProfile, api_origins, connection_origins
 
 
@@ -43,6 +43,8 @@ def admin_page():
 
 
 def needs_admin_confirmation(operation, body):
+    if operation == "web-post-reads/decide":
+        return body.get("decision") == "approve"
     if operation == "permissions/save":
         return body.get("effect") != "deny"
     if operation == "permissions/connection":
@@ -384,6 +386,53 @@ class AdminController:
             result = await self.operate("connections/save", connector, session, gmail_email=account)
             del self.google.flows[key]
             return {**result, "google_account": account}
+        if operation == "web-post-reads/view":
+            proposal_id = body.get("proposal")
+            if set(body) - {"id", "proposal"} or (proposal_id is not None and
+                    (not isinstance(proposal_id, str) or not re.fullmatch(r"[0-9a-f]{32}", proposal_id))):
+                raise Refused("invalid_argument", 400)
+            conn = self.website_connection(body.get("id"))
+            proposal = self.website_catalogs.post_read_proposal(conn, proposal_id)
+            return {"active": [rule.model_dump() for rule in conn.web_post_reads], "proposal": proposal,
+                    "revision": self.store.state["revision"]}
+        if operation == "web-post-reads/decide":
+            self._revision(body)
+            proposal_id, decision = body.get("proposal"), body.get("decision")
+            if (set(body) != {"id", "proposal", "decision", "revision"} or decision not in ("approve", "reject")
+                    or not isinstance(proposal_id, str) or not re.fullmatch(r"[0-9a-f]{32}", proposal_id)):
+                raise Refused("invalid_argument", 400)
+            conn = self.website_connection(body["id"])
+            proposal = self.website_catalogs.post_read_proposal(conn, proposal_id)
+            if proposal["status"] != "pending_admin_review":
+                raise Refused("web_post_read_proposal_stale", 409)
+            gateway = self.runtime.gateway
+            author = next((c for c in gateway.cfg.clients if c.id == proposal["agent"]), None)
+            if not author or not self.website_catalogs.connection(gateway, author, conn.id, PROPOSE_POST_READS):
+                raise Refused("web_post_read_proposal_stale", 409)
+            if decision == "reject":
+                self.website_catalogs.save_post_read_proposal(conn, {**proposal, "rejected": True})
+                gateway.audit.write("website_post_reads_rejected", connection=conn.id, proposal=proposal_id)
+                return {"status": "rejected"}
+            state = self.store.candidate()
+            raw = next(c for c in state["config"]["connections"] if c["id"] == conn.id)
+            raw["web_post_reads"] = [rule.model_dump() for rule in conn.web_post_reads] + proposal["endpoints"]
+            result = await self._commit(state, operation)
+            self.runtime.gateway.audit.write("website_post_reads_approved", connection=conn.id, proposal=proposal_id,
+                                             count=len(proposal["endpoints"]))
+            return result
+        if operation == "web-post-reads/remove":
+            self._revision(body)
+            if set(body) != {"id", "origin", "path", "revision"}:
+                raise Refused("invalid_argument", 400)
+            conn = self.website_connection(body["id"])
+            rules = [rule.model_dump() for rule in conn.web_post_reads
+                     if (rule.origin, rule.path) != (body["origin"], body["path"])]
+            if len(rules) == len(conn.web_post_reads):
+                raise Refused("not_found", 404)
+            state = self.store.candidate()
+            raw = next(c for c in state["config"]["connections"] if c["id"] == conn.id)
+            raw["web_post_reads"] = rules
+            return await self._commit(state, operation)
         if operation == "web-catalog/view":
             conn = self.website_connection(body.get("id"))
             version = body.get("catalog_revision")
@@ -405,6 +454,7 @@ class AdminController:
             state = self.store.candidate()
             raw = next(c for c in state["config"]["connections"] if c["id"] == conn.id)
             raw["env"][ORIGINS_ENV] = json.dumps(origins)
+            raw["web_post_reads"] = [rule.model_dump() for rule in conn.web_post_reads if rule.origin in [current[0], *origins]]
             return await self._commit(state, operation)
         if operation == "web-catalog/publisher":
             self._revision(body)

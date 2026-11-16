@@ -569,6 +569,22 @@ YAML 文件需要先转 JSON）或 `graphql`（SDL 文本）。描述每份最�
 后台显示版本、改动和文档，并将 OpenAPI 中的 HTTPS 域名作为待选项。保存域名和更换维护者需管理员
 通行密钥确认；描述发布无需逐次确认。备份时保留 `admin.enc.web-catalogs`（如存在）。
 
+如果某个网站用 POST 读取数据，维护者可以在 `gateway_call_tool` 里调用
+`web_propose_post_reads`，传入 `connection`、`idempotency_key` 和以下 `arguments`：
+
+```json
+{
+  "endpoints": [{"origin": "https://api.example.com", "path": "/orders/query"}],
+  "reason": "This endpoint lists orders; all request bodies only filter results."
+}
+```
+
+Agent 将返回的 `review_url` 交给管理员。管理员打开链接并用通行密钥批准，也可以在
+「连接器 → 详情 → POST 读取规则」查看提案和撤销规则。每个连接可有一条待审提案，有效期 24 小时。
+批准后，只有匹配域名和精确路径（不含查询参数）的 HTTP POST 请求使用该 Agent 已有的读取权限；
+应仅批准对任意请求体都只读的接口。其他 HTTP 路径和 GraphQL 的判断不变。Agent 可以通过
+`gateway_search_connections` 查看生效的 `post_read_endpoints`。
+
 ## 9. 日常操作
 
 启用网页管理时，优先使用 `/admin/` 完成成员、Token、连接器和权限操作；`agw check` 会显示包含网页覆盖的有效配置。
