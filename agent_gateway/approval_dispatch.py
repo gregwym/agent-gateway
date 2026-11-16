@@ -14,12 +14,15 @@ from .auth import caller_of
 KEY_PROPERTY = {"type": "string", "pattern": r"^[A-Za-z0-9._~-]{1,128}$",
                 "description": "Use a new UUID for each operation. Reuse it on retries and when checking the result."}
 WAIT_PROPERTY = {"type": "integer", "minimum": 0, "maximum": 25, "default": 20,
-                 "description": "Maximum time to wait for an existing operation. Use 0 to check immediately."}
+                 "description": "Maximum time to wait for a result. Use 0 to return immediately."}
+BACKGROUND_PROPERTY = {"type": "boolean", "default": False,
+                       "description": "Return immediately. Approval requirements still apply."}
 WATCH_VALIDATOR = Draft202012Validator({
-    "type": "object", "properties": {"idempotency_key": KEY_PROPERTY, "wait_seconds": WAIT_PROPERTY},
+    "type": "object", "properties": {"idempotency_key": KEY_PROPERTY, "wait_seconds": WAIT_PROPERTY,
+                                     "background": BACKGROUND_PROPERTY},
     "required": ["idempotency_key"], "additionalProperties": False,
 })
-SUBMIT_FIELDS = {"tool", "connection", "arguments", "variant", "background"}
+SUBMIT_FIELDS = {"tool", "connection", "arguments", "variant"}
 ACTIVE = {"queued", "pending", "approved", "running"}
 RESULT_TTL = 600
 RESULT_LIMIT = 16 * 1024 * 1024
@@ -181,8 +184,9 @@ class ApprovalDispatcher:
 
     async def watch(self, request, args, *, raw=False):
         if not WATCH_VALIDATOR.is_valid(args):
-            raise MCPError(types.INVALID_PARAMS, "To check an operation, pass only idempotency_key and optional wait_seconds")
-        deadline = time.monotonic() + args.get("wait_seconds", 20)
+            raise MCPError(types.INVALID_PARAMS,
+                           "To check an operation, pass idempotency_key and optional wait_seconds or background")
+        deadline = time.monotonic() + (0 if args.get("background") else args.get("wait_seconds", 20))
         key = args["idempotency_key"]
         while True:
             gw, client = self._caller(request)

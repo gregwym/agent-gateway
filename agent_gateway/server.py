@@ -643,7 +643,8 @@ def build_app(gateway: Gateway) -> Starlette:
         async with runtime.lease() as current:
             result = await current.call_tool(ctx, params, dispatcher)
         if isinstance(result, WaitForResult):
-            return await dispatcher.watch(ctx.request, {"idempotency_key": result.key}, raw=True)
+            wait = {"wait_seconds": args["wait_seconds"]} if "wait_seconds" in args else {}
+            return await dispatcher.watch(ctx.request, {"idempotency_key": result.key, **wait}, raw=True)
         return result
     server: Server[Any] = Server(
         "agent-gateway",

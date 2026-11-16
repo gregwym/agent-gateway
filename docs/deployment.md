@@ -221,7 +221,8 @@ docker compose run --rm admin approval enroll person_a
 
 **一次审批**：调用 `gateway_call_tool` 时，为这次操作生成一个 `idempotency_key`（如 UUID）。审批人核对
 `approval_url` 中的参数并用 Passkey 批准，Gateway 自动执行一次。用同一个 key 查询状态和结果。
-`wait_seconds: 0` 可立即查询；默认最多等 20 秒。原始结果最多在内存中保留 10 分钟，状态可跨重启查询。
+提交和查询都可用 `wait_seconds` 限制等待时间；默认最多等 20 秒。`background: true` 立即返回。
+原始结果最多在内存中保留 10 分钟，状态可跨重启查询。
 支持 MCP Tasks 和 URL elicitation 的客户端也可以跟踪原调用。遇到响应超时，继续使用原 key；
 如果执行状态未知，先核对上游。
 

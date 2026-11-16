@@ -7,7 +7,7 @@ import re
 import mcp_types as types
 
 from .admin_config import kind_of, mailbox_metadata
-from .approval_dispatch import KEY_PROPERTY, WAIT_PROPERTY
+from .approval_dispatch import BACKGROUND_PROPERTY, KEY_PROPERTY, SUBMIT_FIELDS, WAIT_PROPERTY
 from .web_catalog import DESCRIPTIONS
 from .web_profiles import connection_origins
 
@@ -51,20 +51,20 @@ TOOLS = [
         name=CALL_TOOL,
         description="Execute a permitted tool: generate a new idempotency_key for each intended operation and pass "
                     "tool, connection and arguments. Reuse the same key if a response is lost. "
-                    "Set background=true to return immediately. Share any approval_url with the approver; "
+                    "Set wait_seconds to limit the wait or background=true to return immediately. Share any approval_url with the approver; "
                     "the Gateway runs the action after Passkey approval. To get status and results, call this "
-                    "same tool with only the original idempotency_key and optional wait_seconds.",
+                    "same tool with the original idempotency_key and optional wait_seconds or background.",
         input_schema={
             **schema({"tool": text("Shared tool name from gateway_search_tools.", 128),
                       "connection": text("Connection ID from gateway_search_connections.", 48),
                       "arguments": {"type": "object", "description": "Parameters for the selected tool and connection."},
-                      "background": {"type": "boolean", "default": False, "description": "Queue the call. Approval requirements still apply."},
+                      "background": BACKGROUND_PROPERTY,
                       "variant": text("Optional variant ID from gateway_search_connections.", 64),
                       "idempotency_key": KEY_PROPERTY,
                       "wait_seconds": WAIT_PROPERTY}, ("idempotency_key",)),
             "oneOf": [
-                {"required": ["tool", "connection", "arguments"], "not": {"required": ["wait_seconds"]}},
-                {"not": {"anyOf": [{"required": [key]} for key in ("tool", "connection", "arguments", "background", "variant")]}},
+                {"required": ["tool", "connection", "arguments"]},
+                {"not": {"anyOf": [{"required": [key]} for key in sorted(SUBMIT_FIELDS)]}},
             ],
         },
         annotations=types.ToolAnnotations(read_only_hint=False),

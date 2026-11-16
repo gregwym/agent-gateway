@@ -194,11 +194,13 @@ async def test_watch_works_for_direct_calls_and_keeps_them_private(tmp_path, mon
     async with web_gateway(tmp_path, path=await prepare(tmp_path, raw), port=port) as (_gw, http, origin, path):
         await setup(http, origin, path)
         async with agent(origin + '/mcp', TOKEN_A) as client, agent(origin + '/mcp', TOKEN_B) as other:
-            reply = await execute(client, 'notes_list_notes', 'notes-a', {'folder': 'inbox'}, background=True)
+            reply = await execute(client, 'notes_list_notes', 'notes-a', {'folder': 'inbox'}, wait_seconds=0)
             info = reply.structured_content
             assert not reply.is_error and info['status'] == 'queued' and 'approval_url' not in info
             request_id = info['idempotency_key']
-            assert (await wait_for_approval(client, request_id, 0)).structured_content['status'] == 'queued'
+            immediate = await client.call_tool("gateway_call_tool", {
+                "idempotency_key": request_id, "background": True, "wait_seconds": 20})
+            assert immediate.structured_content['status'] == 'queued'
             assert (await Page(origin, origin).view(request_id))[0] == 404
             with pytest.raises(MCPError):
                 await wait_for_approval(other, request_id, 0)

@@ -79,10 +79,11 @@ async def test_agents_publish_with_version_and_idempotency_without_granting_acce
             entries = await search(writer, "connections", query="shop", tool=PUBLISH_DESCRIPTION)
             assert entries["connections"][0]["api_catalog"]["publish_tool"] == PUBLISH_DESCRIPTION
 
-            result = await execute(writer, PUBLISH_DESCRIPTION, "shop", body, background=True,
+            result = await execute(writer, PUBLISH_DESCRIPTION, "shop", body, background=True, wait_seconds=20,
                                    idempotency_key="publish-one")
             assert result.structured_content["status"] in {"queued", "running", "succeeded"}
-            watched = await wait_for_approval(writer, "publish-one")
+            watched = await writer.call_tool("gateway_call_tool", {
+                "idempotency_key": "publish-one", "background": False, "wait_seconds": 20})
             assert watched.structured_content["status"] == "succeeded"
             assert watched.structured_content["result"]["revision"] == 1
             retry = await execute(writer, PUBLISH_DESCRIPTION, "shop", body, idempotency_key="publish-one")
