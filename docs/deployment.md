@@ -534,8 +534,9 @@ Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据�
 
 所有网站连接共用 `web_http_request` 和 `web_graphql_request`。Agent 指定连接与相对路径，读取
 HTTP 状态和文本响应。网关只向该连接的 HTTPS 来源发送 Cookie，不返回 Cookie 请求头或响应头，
-跨站跳转也不返回目标。HTTP GET、HEAD 可指定 `follow_redirects: true`，由网关跟随最多四次同源跳转，
-即使跳转路径与 Cookie 值重合。有限制参数的工具仍须逐次提交请求。网站若在普通页面中展示
+跨站跳转也不返回目标。当首个跳转地址因 Cookie 脱敏被隐藏时，HTTP GET、HEAD 会在网关内跟随最多
+四次同源跳转。`follow_redirects: true` 也会跟随可见地址，`false` 只检查单次响应。有限制参数的
+工具仍须逐次提交请求。网站若在普通页面中展示
 额外的敏感信息，该页面也属于获授权 Agent 可读取的数据范围。
 
 HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理。HTTP 的 POST、PUT、PATCH、DELETE

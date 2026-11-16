@@ -334,6 +334,11 @@ class Gateway:
         final_arguments = {**arguments, **route.tool.pin}
         scope = route.conn.mailbox_access.get(client_id)
         upstream_arguments = final_arguments
+        if route.tool.pin or route.tool.allow_values:
+            from .web_profiles import is_website
+            if (is_website(route.conn) and route.tool.upstream == "http_request"
+                    and "follow_redirects" not in final_arguments):
+                upstream_arguments = {**final_arguments, "follow_redirects": False}
         if scope is not None and not is_mail_send(route.conn, route.tool):
             from .catalog_sync import bundled_kind
             from .connectors._mail_scope import ARGUMENT, TOOLS, in_folder
@@ -355,7 +360,7 @@ class Gateway:
             from .connectors.web import ConnectorError, plan_request
             try:
                 plan = plan_request(route.tool.upstream, arguments)
-                if plan.follow_redirects and (route.tool.pin or route.tool.allow_values):
+                if plan.follow_redirects is True and (route.tool.pin or route.tool.allow_values):
                     done("deny", "web_redirect_restricted")
                     return _error("This tool has argument restrictions. Submit each redirect target as a separate request.")
                 operation = plan.access

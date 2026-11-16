@@ -124,7 +124,7 @@ class RequestPlan:
     headers: dict[str, str]
     body: bytes | None
     access: str
-    follow_redirects: bool = False
+    follow_redirects: bool | None = False  # None follows only when the Location would be hidden.
 
 
 def _invalid(message):
@@ -202,13 +202,16 @@ def plan_request(tool, args):
     parts = _target(target)
     headers = _request_headers(args.get("headers", {}))
     body = None
+    follow_redirects = False
     try:
         if tool == "http_request":
             method = args.get("method")
             if method not in _METHODS:
                 raise _invalid("Unsupported HTTP method.")
             read = method in _READ_METHODS
-            if args.get("follow_redirects") and method not in ("GET", "HEAD"):
+            if method in ("GET", "HEAD"):
+                follow_redirects = args.get("follow_redirects")
+            elif args.get("follow_redirects"):
                 raise _invalid("Only HTTP GET and HEAD can follow redirects.")
             _http_query(parts, read)
             if "body" in args:
@@ -237,8 +240,7 @@ def plan_request(tool, args):
         raise _invalid("The request body could not be encoded.") from None
     if body is not None and len(body) > MAX_BODY:
         raise _invalid("The request body is too large.")
-    return RequestPlan(method, target, headers, body, "read" if read else "write",
-                       bool(args.get("follow_redirects")) if tool == "http_request" else False)
+    return RequestPlan(method, target, headers, body, "read" if read else "write", follow_redirects)
 
 
 def _same_origin_location(origin, current_path, locations):
@@ -265,14 +267,15 @@ def build_tools(handler=None):
                "additionalProperties": string("Header value", 1024, r"^[\x20-\x7e]+$")}
     http, graphql = WEB_TOOLS
     result = " Returns the HTTP status and text body. Cross-site redirects are blocked."
-    redirects = (" Set follow_redirects=true on GET or HEAD to follow up to four same-site redirects, even when the "
-                 "destination is hidden by credential redaction. Otherwise a safe relative location is returned if available.")
+    redirects = (" GET and HEAD follow up to four same-origin redirects when the first destination is hidden "
+                 "by credential redaction. Set follow_redirects=true to follow visible destinations too, or false "
+                 "to inspect the first redirect without following it.")
     return [
         Tool(http, "Make an HTTP request to the connection's website. GET, HEAD and OPTIONS are reads; POST, PUT, PATCH and DELETE are writes." + result + redirects,
              lambda args: handler(http, args),
              {"path": path, "method": {"type": "string", "enum": list(_METHODS)}, "headers": headers,
               "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for write methods."},
-              "follow_redirects": {"type": "boolean", "default": False, "description": "Follow same-site GET or HEAD redirects inside the Gateway."}},
+              "follow_redirects": {"type": "boolean", "description": "Follow same-origin GET or HEAD redirects. If omitted, follow only when the first destination is hidden."}},
              ("path", "method"), read_only=False),
         Tool(graphql, "Send a GraphQL request to the connection's website. A selected query is a read and a mutation is a write." + result,
              lambda args: handler(graphql, args),
@@ -335,11 +338,14 @@ class SiteSession:
         started = time.monotonic()
         target = plan.target
         visited = {target}
+        follow = plan.follow_redirects
         while True:
             if time.monotonic() - started >= 23:
                 raise ConnectorError("The Web request timed out.", "connector_timeout")
             result, location = self._request_hop(plan, target, started)
-            if location is None or not plan.follow_redirects or result["status"] not in _REDIRECT_STATUSES:
+            if follow is None and result.get("location_redacted"):
+                follow = True
+            if location is None or not follow or result["status"] not in _REDIRECT_STATUSES:
                 if len(visited) > 1:
                     result["redirects_followed"] = len(visited) - 1
                 return result

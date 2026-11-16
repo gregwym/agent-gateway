@@ -195,8 +195,14 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
                {"name": "site_lang", "value": "zh", "domain": "www.weee.com"}]
 
     def fetch(host, target, method, headers, body, receive):
-        assert host == "www.weee.com" and method == "GET" and body is None
+        assert host == "www.weee.com" and method in ("GET", "HEAD") and body is None
         seen.append((target, headers["Cookie"]))
+        if target == "/":
+            return response(receive, status=307, location="/zh/home")
+        if target == "/zh/home":
+            return response(receive, status=302, location="/home")
+        if target == "/home":
+            return response(receive, b"<h1>Simulated home</h1>")
         if target == "/account/my_orders":
             return response(receive, status=307, location="/zh/account/my_orders", rotate=refreshed)
         if target == "/zh/account/my_orders":
@@ -224,9 +230,11 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
             tools = (await search(client, "tools", query="web_http_request"))["tools"]
             assert tools[0]["inputSchema"]["properties"]["follow_redirects"]["type"] == "boolean"
 
-            async def request(path, *, follow=True, method="GET"):
-                return await execute(client, "web_http_request", "retail",
-                                     {"method": method, "path": path, "follow_redirects": follow})
+            async def request(path, *, follow=None, method="GET"):
+                args = {"method": method, "path": path}
+                if follow is not None:
+                    args["follow_redirects"] = follow
+                return await execute(client, "web_http_request", "retail", args)
 
             first = payload(await request("/account/my_orders", follow=False))
             assert first["status"] == 307 and first["location_redacted"] and "location" not in first
@@ -237,15 +245,21 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
             assert "auth=" + refreshed in seen[-1][1] and "site_lang=zh" in seen[-1][1]
             assert all(token not in str(r) + str(first) + gw.audit_text() for token in (original, refreshed))
 
+            home = payload(await request("/"))
+            assert home["status"] == 200 and home["redirects_followed"] == 2
+            assert home["body"] == "<h1>Simulated home</h1>"
+            head = payload(await request("/", method="HEAD"))
+            assert head["status"] == 200 and head["redirects_followed"] == 2 and head["body"] == ""
+
             external = payload(await request("/external"))
             assert external["status"] == 307 and external["redirect_blocked"] and "location" not in external
             assert seen[-1][0] == "/external"
-            assert (await request("/override")).is_error and seen[-1][0] == "/override"
-            assert (await request("/loop")).is_error and seen[-1][0] == "/loop"
-            limit = await request("/step-0")
+            assert (await request("/override", follow=True)).is_error and seen[-1][0] == "/override"
+            assert (await request("/loop", follow=True)).is_error and seen[-1][0] == "/loop"
+            limit = await request("/step-0", follow=True)
             assert limit.is_error and "redirect limit" in text_of(limit)
             assert [p for p, c in seen if p.startswith("/step-")] == [f"/step-{i}" for i in range(5)]
-            assert (await request("/account/my_orders", method="POST")).is_error
+            assert (await request("/account/my_orders", method="POST", follow=True)).is_error
             assert seen[-1][0] == "/step-4"
 
             conn = next(c for c in (await state(http))["connections"] if c["id"] == "retail")
@@ -253,9 +267,13 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
             restricted = await change(http, "tools/restrict", connection="retail", tool=name,
                                       allow_values={"path": ["/account/my_orders"]})
             assert restricted.status_code == 200, restricted.text
-            blocked = await request("/account/my_orders")
+            blocked = await request("/account/my_orders", follow=True)
             assert blocked.is_error and "argument restrictions" in text_of(blocked)
             assert seen[-1][0] == "/step-4"
+            before = len(seen)
+            no_implicit_follow = payload(await request("/account/my_orders"))
+            assert no_implicit_follow["status"] == 307 and no_implicit_follow["location_redacted"]
+            assert [target for target, cookie in seen[before:]] == ["/account/my_orders"]
 
 
 
