@@ -989,7 +989,7 @@ class AdminController:
                         self.auth.confirm(session, operation, body, revision, proof)
                     if operation != "web-login/start":
                         return _json(await self.operate(operation, body, session), 200)
-                result = await self.website_login.start(body, session)
+                result = await self.website_login.start(body, session, request.headers.get("user-agent"))
                 return _json(result, 200)
             except Refused as exc:
                 return _json({"error": exc.code, **({"incident": exc.incident} if exc.incident else {})}, exc.status)

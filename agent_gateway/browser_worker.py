@@ -69,12 +69,12 @@ class Browser:
             with suppress(Exception):
                 await browser.close()
 
-    async def new_context(self, driver):
-        # Request the site's phone layout while keeping screenshot and input coordinates
-        # aligned, including on pages without an HTML viewport tag.
+    async def new_context(self, viewport, touch, user_agent):
+        self.touch = touch
+        # Use the admin browser's CSS viewport and UA while keeping the
+        # screenshot at CSS pixel scale for input mapping.
         return await self.browser.new_context(
-            viewport={"width": WIDTH, "height": HEIGHT},
-            user_agent=driver.devices["Pixel 7"]["user_agent"], has_touch=True,
+            viewport=viewport, user_agent=user_agent, has_touch=touch,
             accept_downloads=False, service_workers="block")
 
     async def start(self, driver, body):
@@ -106,7 +106,7 @@ class Browser:
             args=["--disable-quic", "--disable-sync", "--disable-background-networking",
                   "--disable-extensions", "--disable-crash-reporter", "--disable-breakpad",
                   "--disk-cache-size=1048576"])
-        self.context = await self.new_context(driver)
+        self.context = await self.new_context(body["viewport"], body["touch"], body["user_agent"])
 
         async def guard(route):
             request = route.request
@@ -139,7 +139,10 @@ class Browser:
         if op in {"tap", "text", "key", "scroll"} and current.scheme != "https":
             raise ValueError("sign-in destination not allowed")
         if op == "tap":
-            await page.touchscreen.tap(body["x"], body["y"])
+            if self.touch:
+                await page.touchscreen.tap(body["x"], body["y"])
+            else:
+                await page.mouse.click(body["x"], body["y"])
         elif op == "text":
             if not await has_focused_input(page):
                 raise NoFocusedInput
@@ -231,7 +234,7 @@ def make_app(path):
                     except BaseException:
                         await browser.close()
                         raise
-                    return JSONResponse({"width": WIDTH, "height": HEIGHT})
+                    return JSONResponse(body["viewport"])
                 if browser.id != ident:
                     return JSONResponse({}, 410)
                 async with asyncio.timeout(9):

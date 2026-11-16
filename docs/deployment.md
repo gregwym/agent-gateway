@@ -550,6 +550,8 @@ HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理。HTTP 的 POST、P
 协议对读写的约定；对提供权限范围的服务，优先使用站点自身的最小权限账号。升级后，旧订单工具的
 授权不会转给通用工具；已保存的会话可继续使用。
 
+远程登录窗口沿用当前管理页的 User-Agent 和视口大小；网页由服务器上的 Chromium 渲染。
+
 也可用 `kind: "web"` 的主机清单部署预设，`web` 只需指定 `origin`。Amazon US 和 Weee! 是实验性的登录预设。
 
 API 描述是可选的。把接口路径、参数和结构记录在 OpenAPI 3.1 文档或 GraphQL SDL 中，只用模拟示例。

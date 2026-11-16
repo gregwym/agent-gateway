@@ -48,6 +48,7 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
             backend["zoom"] = data["percent"]
         if action == "start":
             assert data["url"] == "https://" + site + "/"
+            backend["display"] = {key: data[key] for key in ("user_agent", "viewport", "touch")}
         if action == "cookies":
             assert data["origin"] == "https://" + site
             if not backend["cookie_ready"]:
@@ -165,7 +166,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
     # deterministic simulated site.
     async with playwright.async_playwright() as driver:
         browser = await driver.chromium.launch()
-        page = await browser.new_page(viewport={"width": 420, "height": 620})
+        page = await browser.new_page(viewport=driver.devices["iPhone 15"]["viewport"])
         await page.set_content('<main style="background:yellow;height:100vh">Simulated sign-in website</main>')
         jpeg = base64.b64encode(await page.screenshot(type="jpeg")).decode()
         await browser.close()
@@ -181,10 +182,15 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         image = login_box.get_by_role("img", name="可操作的网站登录页")
         await playwright.expect(image).to_be_visible()
         await image.evaluate("node => node.decode()")
+        assert backend["display"] == await page.evaluate("""() => ({
+            user_agent: navigator.userAgent, viewport: {width: innerWidth, height: innerHeight},
+            touch: navigator.maxTouchPoints > 0
+        })""")
         assert await login_box.evaluate("""node => {
             const rect = node.getBoundingClientRect(), image = node.querySelector('img').getBoundingClientRect();
+            const viewer = node.querySelector('.login-view').getBoundingClientRect();
             return rect.left === 0 && rect.width === innerWidth && rect.height >= visualViewport.height - 1
-                && image.width === innerWidth;
+                && image.width <= viewer.width && image.bottom <= viewer.bottom + 1;
         }""")
         await login_box.get_by_role("button", name="放大网页").tap()
         await playwright.expect(login_box.locator('.login-zoom')).to_have_text("125%")
@@ -243,15 +249,19 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
         try:
             view = Browser(socket_dir / "control.sock")
             view.browser = chromium
-            view.context = await view.new_context(driver)
+            viewport = {"width": WIDTH, "height": 750}
+            ua = "TestBrowser/1.2 Mobile"
+            view.context = await view.new_context(viewport, True, ua)
             view.zoom = None
             page = await view.context.new_page()
             await page.route("https://*.example/**", lambda route: route.fulfill(
                 content_type="text/html",
                 body=('<button style="width:100px">Continue</button><p>Before</p><input type="email">'
-                      if "Mobile" in route.request.headers.get("user-agent", "") else "<p>Desktop page</p>")))
+                      if route.request.headers.get("user-agent") == ua else "<p>Other UA</p>")))
             await page.goto("https://signin.example/")
-            assert await page.evaluate("() => [innerWidth, navigator.maxTouchPoints > 0]") == [WIDTH, True]
+            assert await page.evaluate("() => [innerWidth, innerHeight, navigator.maxTouchPoints > 0, navigator.userAgent]") == [
+                WIDTH, viewport["height"], True, ua]
+
             await page.get_by_role("button").evaluate(
                 "node => node.onclick = () => document.querySelector('p').textContent = 'Clicked'")
             result = await view.use("zoom", {"percent": 150})
@@ -315,5 +325,18 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
             exported = await view.use("cookies", {"origin": "https://signin.example",
                                                     "api_origins": ["https://api.signin.example"]})
             assert {cookie["name"] for cookie in exported["cookies"]} == {"account", "api"}
+
+            desktop_ua = "TestDesktop/2.0"
+            view.zoom = None
+            view.context = await view.new_context({"width": 1280, "height": 870}, False, desktop_ua)
+            desktop = await view.context.new_page()
+            await desktop.route("https://signin.example/", lambda route: route.fulfill(
+                content_type="text/html",
+                body='<input type="password">' if route.request.headers.get("user-agent") == desktop_ua else "<p>Other UA</p>"))
+            await desktop.goto("https://signin.example/")
+            assert await desktop.evaluate("() => [innerWidth, navigator.maxTouchPoints, navigator.userAgent]") == [
+                1280, 0, desktop_ua]
+            bounds = await desktop.locator("input").bounding_box()
+            assert (await view.use("tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)}))["editable"]
         finally:
             await chromium.close()

@@ -67,11 +67,20 @@ class WebsiteLogin:
             if self.flow and (self.flow["expires"] <= time.time() or self.flow["session"] == logout):
                 await self.close()
 
-    async def start(self, body, session):
+    async def start(self, body, session, user_agent=None):
         admin = self.admin
         body = dict(body)
-        if set(body) - {"origin"} != {"revision", "id", "owner", "plugin"}:
+        if set(body) - {"origin", "display"} != {"revision", "id", "owner", "plugin"}:
             raise Refused("invalid_connector", 400)
+        display = body.pop("display", {"width": WIDTH, "height": HEIGHT, "touch": False})
+        if (not isinstance(display, dict) or set(display) != {"width", "height", "touch"}
+                or type(display["touch"]) is not bool
+                or any(type(display[key]) is not int or display[key] <= 0 for key in ("width", "height"))):
+            raise Refused("web_browser_input", 400)
+        viewport = {"width": min(1600, max(240, display["width"])),
+                    "height": min(1200, max(240, display["height"]))}
+        if not user_agent or not re.fullmatch(r"[\x20-\x7e]{1,1024}", user_agent):
+            user_agent = None
         admin._revision(body)
         gateway = admin.runtime.gateway
         name, owner, plugin_id = (body.get(k) for k in ("id", "owner", "plugin"))
@@ -132,15 +141,16 @@ class WebsiteLogin:
             except OSError:
                 raise Refused("web_browser_unavailable", 503) from None
             self.flow = {"id": ident, "session": session["id"], "expires": expires, "profile": profile,
-                         "path": path, "proxy": proxy, "tunnels": tunnels, "body": body, "api_origins": extra_origins}
+                         "path": path, "proxy": proxy, "tunnels": tunnels, "body": body, "api_origins": extra_origins,
+                         "viewport": viewport}
             try:
-                await self.worker("start", {"id": ident, "expires": expires,
-                                           "url": profile.origin + "/"})
+                await self.worker("start", {"id": ident, "expires": expires, "url": profile.origin + "/",
+                                            "viewport": viewport, "touch": display["touch"], "user_agent": user_agent})
             except BaseException:
                 with anyio.CancelScope(shield=True):
                     await self.close()
                 raise
-            return {"id": ident, "width": WIDTH, "height": HEIGHT, "host": host, "zoom_levels": ZOOM_LEVELS}
+            return {"id": ident, **viewport, "host": host, "zoom_levels": ZOOM_LEVELS}
 
     async def input(self, operation, body, session, token):
         async with self.lock:
@@ -164,7 +174,7 @@ class WebsiteLogin:
             if operation not in spec or body.keys() != {"id", *spec[operation]}:
                 raise Refused("web_browser_input", 400)
             if ("x" in body and not (type(body["x"]) is type(body["y"]) is int
-                    and 0 <= body["x"] < WIDTH and 0 <= body["y"] < HEIGHT)
+                    and 0 <= body["x"] < flow["viewport"]["width"] and 0 <= body["y"] < flow["viewport"]["height"])
                     or "dy" in body and not all(type(body[key]) is int and -1200 <= body[key] <= 1200
                                                 for key in ("dx", "dy"))
                     or "text" in body and not (isinstance(body["text"], str) and 0 < len(body["text"]) <= 2048

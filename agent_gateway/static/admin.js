@@ -1208,7 +1208,8 @@ function connectorForm(existing, reauthorize = false) {
     if (payload.kind === 'web') {
       const file = credentials.AGwSessionUpload.files[0];
       if (!file) {
-        const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, ...payload.settings});
+        const display = {width: window.innerWidth, height: window.innerHeight, touch: navigator.maxTouchPoints > 0};
+        const flow = await api('web-login/start', {revision, id: payload.id, owner: payload.owner, ...payload.settings, display});
         showWebsiteLogin(flow, box);
         return;
       }
@@ -1244,6 +1245,7 @@ function connectorForm(existing, reauthorize = false) {
 function showWebsiteLogin(flow, connector) {
   const box = modal(tr('Website sign-in', '网站登录'));
   box.classList.add('website-login');
+  box.style.setProperty('--login-frame-width', flow.width + 'px');
   const [heading, close] = box.children;
   const bar = el(box, 'div', undefined, 'login-bar');
   heading.remove();
@@ -1364,6 +1366,7 @@ function showWebsiteLogin(flow, connector) {
     return {x: clamp((event.clientX - rect.left) * flow.width / rect.width, flow.width),
             y: clamp((event.clientY - rect.top) * flow.height / rect.height, flow.height)};
   };
+  const scrollAmount = delta => Math.round(Math.max(-1200, Math.min(1200, delta)));
   picture.addEventListener('pointerdown', event => {
     if (event.button !== 0 || !picture.src || pointer) return;
     pointer = {id: event.pointerId, ...coordinate(event)};
@@ -1372,7 +1375,7 @@ function showWebsiteLogin(flow, connector) {
   picture.addEventListener('pointerup', event => {
     if (pointer?.id !== event.pointerId) return;
     const point = coordinate(event), dx = pointer.x - point.x, dy = pointer.y - point.y;
-    if (Math.hypot(dx, dy) > 20) action('scroll', {x: pointer.x, y: pointer.y, dx: Math.round(dx * 1.6), dy: Math.round(dy * 1.6)});
+    if (Math.hypot(dx, dy) > 20) action('scroll', {x: pointer.x, y: pointer.y, dx: scrollAmount(dx * 1.6), dy: scrollAmount(dy * 1.6)});
     else action('tap', point);
     pointer = null;
   });
@@ -1380,7 +1383,7 @@ function showWebsiteLogin(flow, connector) {
   picture.addEventListener('wheel', event => {
     if (!picture.src) return;
     event.preventDefault();
-    const amount = delta => Math.round(Math.max(-1200, Math.min(1200, delta * (event.deltaMode === 1 ? 25 : 1))));
+    const amount = delta => scrollAmount(delta * (event.deltaMode === 1 ? 25 : 1));
     const dx = amount(event.deltaX), dy = amount(event.deltaY);
     if ((dx || dy) && queued < 4) action('scroll', {...coordinate(event), dx, dy});
   }, {passive: false});

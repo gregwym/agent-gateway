@@ -18,7 +18,7 @@
 .mailbox-scope{margin:12px 0}.mailbox-scope small{display:block}
 
 .connector-save[hidden] { display: none; }
-.website-login { width: min(680px, calc(100vw - 24px)); padding: 0; overflow: hidden; }
+.website-login { width: min(1200px, calc(100vw - 24px), var(--login-frame-width)); height: calc(var(--login-height, 100dvh) - 48px); padding: 0; overflow: hidden; }
 .website-login[open] { display: flex; flex-direction: column; }
 .login-bar, .login-keyboard, .login-controls { display: flex; align-items: center; gap: .4rem; padding: .4rem .65rem; flex: none; }
 .login-bar { border-bottom: 1px solid var(--line); }
@@ -35,12 +35,11 @@
 .login-controls { padding-top: 0; flex-wrap: wrap; }
 .login-controls button { min-width: 37px; min-height: 38px; padding: 6px 9px; }
 .login-zoom { min-width: 3.2em; text-align: center; font-variant-numeric: tabular-nums; }
-.login-frame { display: block; width: min(100%, 530px); height: auto; margin: 0 auto; background: #fff; touch-action: none; user-select: none; }
+.login-frame { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; margin: 0 auto; background: #fff; touch-action: none; user-select: none; }
 .login-frame:not([src]) { display: none; }
 .website-login .operation-error { margin: .3rem .65rem; padding: .4rem .65rem; flex: none; }
 @media (max-width: 640px), (max-height: 520px) and (pointer: coarse) {
   .website-login { position: fixed; inset: var(--login-top, 0px) 0 auto; margin: 0; border: 0; border-radius: 0;
     width: 100%; max-width: none; height: var(--login-height, 100dvh); max-height: none;
     padding-bottom: env(safe-area-inset-bottom); }
-  .login-frame { width: 100%; }
 }
