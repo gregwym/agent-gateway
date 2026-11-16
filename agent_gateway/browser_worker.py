@@ -6,8 +6,10 @@ import re
 import sys
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
+from weakref import WeakKeyDictionary
 
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -34,11 +36,30 @@ class PasswordFocusError(Exception):
     pass
 
 
+ACTION_ERRORS = {
+    "web_browser_closed", "web_browser_still_loading", "web_browser_action_uncertain",
+    "web_browser_capture_failed", "web_browser_navigation_failed", "web_browser_navigation_blocked",
+    "web_browser_navigation_timeout", "web_browser_no_submit", "web_browser_multiple_submit",
+}
+
+
+class BrowserActionError(Exception):
+    pass
+
+
+@dataclass
+class Navigation:
+    request: object = None
+    started: float = 0
+    failure: str | None = None
+    status: int | None = None
+
+
 def is_web_frame(frame):
     return urlsplit(frame.url).scheme == "https" or frame.url in {"about:blank", "about:srcdoc"}
 
 
-async def focused_input_kind(page):
+async def focused_input(page, *, kind_only=True):
     # Follow the active element into a frame or shadow root, without reading
     # any text, names or values from the form.
     frame = page.main_frame
@@ -59,12 +80,16 @@ async def focused_input_kind(page):
                 return null;
             }
             """)
-            if kind:
-                return kind
             element = focus.as_element()
+            if kind:
+                if not kind_only:
+                    focus = None
+                    return element
+                return kind
             frame = await element.content_frame() if element else None
         finally:
-            await focus.dispose()
+            if focus:
+                await focus.dispose()
     return None
 
 
@@ -88,7 +113,7 @@ async def focus_password(page):
         field = fields[0]
         await field.focus()
         if (not await field.evaluate("node => node.getRootNode().activeElement === node")
-                or await focused_input_kind(page) != "password"):
+                or await focused_input(page) != "password"):
             raise PasswordFocusError("web_browser_password_unavailable")
     except Error:
         raise PasswordFocusError("web_browser_password_unavailable") from None
@@ -98,6 +123,30 @@ async def focus_password(page):
                 await field.dispose()
 
 
+async def submit_form(page):
+    field = await focused_input(page, kind_only=False)
+    if not field:
+        raise BrowserActionError("web_browser_no_submit")
+    try:
+        controls = await field.evaluate_handle("""node => Array.from(node.form?.elements || []).filter(el =>
+            (el.tagName === 'BUTTON' || el.tagName === 'INPUT') && el.type === 'submit' &&
+            !el.matches(':disabled') && el.checkVisibility({opacityProperty: true, visibilityProperty: true}))""")
+        try:
+            count = await controls.evaluate("items => items.length")
+            if count != 1:
+                raise BrowserActionError("web_browser_multiple_submit" if count else "web_browser_no_submit")
+            control = await controls.evaluate_handle("items => items[0]")
+            try:
+                # Use native click and form validation, including site click handlers.
+                await control.as_element().click(timeout=3000, no_wait_after=True)
+            finally:
+                await control.dispose()
+        finally:
+            await controls.dispose()
+    finally:
+        await field.dispose()
+
+
 class Browser:
     def __init__(self, path):
         self.path = path
@@ -105,6 +154,7 @@ class Browser:
         self.lock = asyncio.Lock()
         self.relays = set()
         self.browser = self.relay = self.context = None
+        self.navigation = WeakKeyDictionary()
 
     async def close(self):
         self.id = None
@@ -123,9 +173,51 @@ class Browser:
         self.touch = touch
         # Use the admin browser's CSS viewport and UA while keeping the
         # screenshot at CSS pixel scale for input mapping.
-        return await self.browser.new_context(
+        context = await self.browser.new_context(
             viewport=viewport, user_agent=user_agent, has_touch=touch,
             accept_downloads=False, service_workers="block")
+        context.on("page", self.watch_page)
+        return context
+
+    def watch_page(self, page):
+        from playwright.async_api import Error
+
+        nav = self.navigation[page] = Navigation()
+
+        def started(request):
+            with suppress(Error):
+                if request.is_navigation_request() and request.frame == page.main_frame:
+                    nav.request, nav.started = request, time.monotonic()
+                    nav.failure = nav.status = None
+
+        def response(reply):
+            if reply.request == nav.request:
+                nav.status = reply.status
+
+        def finished(request, failed=False):
+            if request != nav.request:
+                return
+            nav.request = None
+            if failed:
+                reason = request.failure
+                if reason == "net::ERR_ABORTED":
+                    return  # Often a redirect, download, or a superseding navigation.
+                nav.failure = {
+                    "net::ERR_TIMED_OUT": "web_browser_navigation_timeout",
+                    "net::ERR_ACCESS_DENIED": "web_browser_navigation_blocked",
+                    "net::ERR_TUNNEL_CONNECTION_FAILED": "web_browser_navigation_blocked",
+                }.get(reason, "web_browser_navigation_failed")
+
+        def committed(frame):
+            # Some pages keep downloading the document after it is usable.
+            if frame == page.main_frame:
+                nav.request = None
+
+        page.on("request", started)
+        page.on("response", response)
+        page.on("requestfinished", finished)
+        page.on("requestfailed", lambda request: finished(request, True))
+        page.on("framenavigated", committed)
 
     async def start(self, driver, body):
         self.id, self.expires = body["id"], body["expires"]
@@ -172,6 +264,15 @@ class Browser:
             await page.goto(body["url"], wait_until="commit", timeout=6500)
 
     async def use(self, op, body):
+        from playwright.async_api import Error
+
+        try:
+            return await self._use(op, body)
+        except Error:
+            # An event might already have been delivered. Do not retry it.
+            raise BrowserActionError("web_browser_action_uncertain") from None
+
+    async def _use(self, op, body):
         if op == "close":
             await self.close()
             return {}
@@ -184,10 +285,16 @@ class Browser:
             return {"cookies": cookies}
         page = self.context.pages[-1] if self.context.pages else None
         if page is None:
-            raise RuntimeError("browser closed")
+            raise BrowserActionError("web_browser_closed")
+        if op == "frame":
+            return await self.frame()
         current = urlsplit(page.url)
-        if op in {"tap", "text", "focus-password", "key", "scroll"} and current.scheme != "https":
-            raise ValueError("sign-in destination not allowed")
+        nav = self.navigation[page]
+        if op in {"tap", "text", "focus-password", "submit-form", "key", "scroll"}:
+            if nav.failure:
+                raise BrowserActionError(nav.failure)
+            if nav.request or current.scheme != "https":
+                raise BrowserActionError("web_browser_still_loading")
         if op == "tap":
             if self.touch:
                 await page.touchscreen.tap(body["x"], body["y"])
@@ -195,8 +302,10 @@ class Browser:
                 await page.mouse.click(body["x"], body["y"])
         elif op == "focus-password":
             await focus_password(page)
+        elif op == "submit-form":
+            await submit_form(page)
         elif op == "text":
-            kind = await focused_input_kind(page)
+            kind = await focused_input(page)
             if body.get("expect_password") and kind != "password":
                 raise PasswordFocusError("web_browser_password_unavailable")
             if not kind:
@@ -210,41 +319,46 @@ class Browser:
         elif op == "zoom":
             self.zoom = body["percent"]
         elif op == "reload":
-            with suppress(Exception):
-                await page.reload(wait_until="commit", timeout=6500)
-        elif op != "frame":
+            await page.reload(wait_until="commit", timeout=6500)
+        else:
             raise ValueError("invalid action")
-        return await self.frame()
+        return {"ok": True}
 
     async def frame(self):
-        from playwright.async_api import Error
+        from playwright.async_api import Error, TimeoutError as BrowserTimeout
 
-        for attempt in range(3):
+        for _ in range(2):
             page = self.context.pages[-1]
             url = page.url
             parts = urlsplit(url)
+            nav = self.navigation[page]
+            if nav.failure:
+                raise BrowserActionError(nav.failure)
+            if nav.request or url == "about:blank":
+                return {"pending": True, "slow": bool(nav.request and time.monotonic() - nav.started > 10)}
             try:
-                if self.zoom is not None and parts.scheme == "https":
-                    # Keep zoom and click coordinates aligned across navigation.
-                    await page.evaluate("""factor => {
-                        const style = document.documentElement?.style;
-                        if (!style) return;
-                        if (factor === 1) style.removeProperty('zoom');
-                        else if (style.zoom !== String(factor)) style.zoom = factor;
-                    }""", self.zoom / 100)
-                picture = await page.screenshot(type="jpeg", quality=75, timeout=5000)
-                kind = await focused_input_kind(page) if parts.scheme == "https" else None
-                if self.context.pages[-1:] == [page] and page.url == url:
-                    return {"image": base64.b64encode(picture).decode("ascii"),
-                            "host": parts.hostname if parts.scheme == "https" else None,
-                            "zoom": self.zoom or 100, "editable": kind is not None, "input_kind": kind}
+                async with asyncio.timeout(2.5):
+                    if self.zoom is not None and parts.scheme == "https":
+                        # Keep zoom and click coordinates aligned across navigation.
+                        await page.evaluate("""factor => {
+                            const style = document.documentElement?.style;
+                            if (!style) return;
+                            if (factor === 1) style.removeProperty('zoom');
+                            else if (style.zoom !== String(factor)) style.zoom = factor;
+                        }""", self.zoom / 100)
+                    picture = await page.screenshot(type="jpeg", quality=75, timeout=2000)
+                    kind = await focused_input(page) if parts.scheme == "https" else None
+                    if self.context.pages[-1:] == [page] and page.url == url and not nav.failure and not nav.request:
+                        return {"image": base64.b64encode(picture).decode("ascii"),
+                                "host": parts.hostname if parts.scheme == "https" else None,
+                                "zoom": self.zoom or 100, "editable": kind is not None, "input_kind": kind,
+                                "site_status": nav.status if nav.status and nav.status >= 400 else None}
+            except (TimeoutError, BrowserTimeout):
+                raise BrowserActionError("web_browser_capture_failed") from None
             except Error:
-                if attempt == 2:
-                    raise
-            # A click can destroy the previous page's script context. Retry
-            # the snapshot after navigation; do not replay the input.
-            await asyncio.sleep(.15)
-        raise RuntimeError("browser page changed before capture")
+                pass  # A navigation can destroy the old page's script context.
+            await asyncio.sleep(.1)
+        raise BrowserActionError("web_browser_capture_failed")
 
 
 def make_app(path):
@@ -300,6 +414,10 @@ def make_app(path):
             return JSONResponse({"error": "web_browser_select_field"}, 422)
         except PasswordFocusError as exc:
             return JSONResponse({"error": str(exc)}, 422)
+        except BrowserActionError as exc:
+            return JSONResponse({"error": str(exc)}, 422)
+        except TimeoutError:
+            return JSONResponse({"error": "web_browser_action_uncertain"}, 422)
         except Exception:
             # Exceptions may contain a page URL or typed text.
             return JSONResponse({}, 422)

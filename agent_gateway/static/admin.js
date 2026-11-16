@@ -199,6 +199,15 @@ const messages = {
   web_browser_password_missing: ['No visible password field was found on this page.', '此页没有找到可见的密码框。'],
   web_browser_password_multiple: ['This page has more than one password field. Select the one you want.', '此页有多个密码框，请点选要输入的那个。'],
   web_browser_password_unavailable: ['The password field is not ready for typing. Select it again before entering your password.', '密码框还不能输入。请重新选中密码框再输入。'],
+  web_browser_closed: ['The website closed its browser tab. Open a new sign-in window.', '网站关闭了浏览器标签页，请重新打开登录窗口。'],
+  web_browser_still_loading: ['The website is still loading. Wait for the page before interacting again.', '网站仍在加载，请等页面更新后再操作。'],
+  web_browser_action_uncertain: ['The browser could not confirm this action. Check the website before trying again.', '浏览器无法确认这次操作，请先查看网页状态再重试。'],
+  web_browser_capture_failed: ['The browser could not update the preview. It will try again without repeating your action.', '浏览器暂时无法更新画面，会继续读取，不会重复提交。'],
+  web_browser_navigation_failed: ['The browser could not connect to the website to load the next page.', '浏览器无法连接网站来加载下一页。'],
+  web_browser_navigation_blocked: ['The browser could not open the next page: the network or HTTPS proxy blocked the connection.', '无法打开下一页：网络或 HTTPS 代理拦截了连接。'],
+  web_browser_navigation_timeout: ['The website did not respond in time while opening the next page.', '加载下一页时，网站没有及时响应。'],
+  web_browser_no_submit: ['The selected field has no available form submit button. Use the website’s controls.', '选中的输入框没有可用的表单提交按钮，请使用网页上的按钮。'],
+  web_browser_multiple_submit: ['This form has multiple submit buttons. Choose one on the website.', '此表单有多个提交按钮，请在网页上点选。'],
   web_browser_input: ['This browser action is invalid. Try again.', '浏览器操作无效，请重试。'],
   web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
   web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
@@ -1290,6 +1299,7 @@ function showWebsiteLogin(flow, connector) {
   picture.alt = tr('Interactive sign-in page', '可操作的网站登录页');
   const status = el(viewer, 'p', tr('Loading sign-in page…', '正在加载登录页…'), 'login-status');
   status.setAttribute('role', 'status');
+  viewer.prepend(status);
   const keyboard = el(box, 'form', undefined, 'login-keyboard');
   const input = field(keyboard, tr('Type into the selected field', '输入到选中的框'), 'login_input', '', 'password');
   const chooseField = tr('Tap a field above, then type here', '点选网页输入框，再在此输入');
@@ -1301,7 +1311,7 @@ function showWebsiteLogin(flow, connector) {
   const tools = el(box, 'div', undefined, 'login-controls');
   const levels = flow.zoom_levels;
   let queue = Promise.resolve(), queued = 0, sending = false;
-  let passwordSelected = false, typingPassword = false;
+  let passwordSelected = false, typingPassword = false, viewReady = false, submitted = false;
   let timer, url, saved = false, pointer, zoom = 100, lastImage;
   function fit() {
     // iOS can shrink the visual viewport without changing CSS viewport units
@@ -1315,6 +1325,12 @@ function showWebsiteLogin(flow, connector) {
   window.visualViewport?.addEventListener('scroll', fit);
   fit();
   function frame(result) {
+    viewReady = !result.pending;
+    if (!viewReady) {
+      status.textContent = result.slow ? tr('The website is taking a while. Check its response before submitting again.', '网站响应较慢，请先确认网站是否已响应，再尝试提交。')
+        : tr('Waiting for the website…', '正在等待网站响应…');
+      return;
+    }
     if (result.image !== lastImage) {
       const bytes = Uint8Array.from(atob(result.image), c => c.charCodeAt(0));
       const previous = url;
@@ -1327,7 +1343,7 @@ function showWebsiteLogin(flow, connector) {
     passwordSelected = result.input_kind === 'password';
     input.placeholder = passwordSelected ? tr('Password field selected. Type here.', '已选中密码框，在此输入')
       : result.editable ? tr('Field selected. Type here.', '已选中网页输入框，在此输入') : chooseField;
-    status.textContent = '';
+    status.textContent = result.site_status ? tr(`The website returned HTTP ${result.site_status}.`, `网站返回了 HTTP ${result.site_status}。`) : '';
     zoom = result.zoom ?? zoom;
     zoomLabel.textContent = zoom + '%';
     smaller.disabled = zoom === levels[0];
@@ -1338,7 +1354,20 @@ function showWebsiteLogin(flow, connector) {
     queue = result.catch(() => {});
     return result;
   }
-  async function perform(op, props = {}) {
+  async function pullView() {
+    try {
+      const result = await api('web-login/frame', {id: flow.id}, 12000);
+      if (box.open && box.isConnected) frame(result);
+    } catch (error) {
+      if (!box.open || !box.isConnected) return;
+      viewReady = false;
+      status.textContent = submitted && error.code === 'web_browser_capture_failed'
+        ? tr('Input was sent to the browser, but the preview has not updated. Check the website before resubmitting.', '操作已送到浏览器，但画面还未更新。请先确认网页状态，再尝试提交。')
+        : errorText(error);
+      if (error.code === 'web_browser_expired' || error.code === 'web_browser_closed') throw error;
+    }
+  }
+  async function perform(op, props = {}, readView = true) {
     if (!box.open) return;
     if (queued >= 8) throw new Error(tr('Wait for the browser to catch up, then try again.', '请等网页响应后再试。'));
     queued++;
@@ -1348,7 +1377,7 @@ function showWebsiteLogin(flow, connector) {
         const body = typeof props === 'function' ? props() : props;
         if (!body) return;
         box.querySelector('.operation-error')?.remove();
-        const result = await api('web-login/' + op, {id: flow.id, ...body}, op === 'save' ? 60000 : 15000);
+        await api('web-login/' + op, {id: flow.id, ...body}, op === 'save' ? 60000 : 15000);
         if (!box.open) return;
         if (op === 'save') {
           saved = true;
@@ -1356,7 +1385,10 @@ function showWebsiteLogin(flow, connector) {
           connector.close();
           await refresh();
           notify(tr('Session saved.', '会话已保存。'));
-        } else frame(result);
+        } else if (readView) {
+          submitted = op === 'submit-form' || op === 'tap' || (op === 'key' && body.key === 'Enter');
+          await pullView();
+        }
       });
     } finally { queued--; }
   }
@@ -1364,15 +1396,21 @@ function showWebsiteLogin(flow, connector) {
     perform(op, props).catch(error => { if (box.open) showError(box, error); });
   }
   input.addEventListener('input', () => { typingPassword = Boolean(input.value) && (typingPassword || passwordSelected); });
-  keyboard.addEventListener('submit', async event => {
-    event.preventDefault();
-    if (!input.value || sending) return;
+  async function sendInput(submit) {
+    if (sending) return;
+    if (!input.value) {
+      if (submit) await perform(...submit);
+      return;
+    }
     const text = input.value, expectPassword = typingPassword || passwordSelected;
     input.value = '';
     typingPassword = false;
     input.blur();
     sending = send.disabled = true;
-    try { await perform('text', expectPassword ? {text, expect_password: true} : {text}); }
+    try {
+      await perform('text', expectPassword ? {text, expect_password: true} : {text}, !submit);
+      if (submit) await perform(...submit);
+    }
     catch (error) {
       if (box.open) {
         if (['web_browser_select_field', 'web_browser_password_unavailable'].includes(error.code) && !input.value) {
@@ -1383,6 +1421,10 @@ function showWebsiteLogin(flow, connector) {
       }
     }
     finally { sending = send.disabled = false; }
+  }
+  keyboard.addEventListener('submit', event => {
+    event.preventDefault();
+    sendInput().catch(error => { if (box.open) showError(box, error); });
   });
   const changeZoom = step => action('zoom', () => {
     const percent = levels[levels.indexOf(zoom) + step];
@@ -1399,7 +1441,8 @@ function showWebsiteLogin(flow, connector) {
   button(tools, tr('Select password field', '选中密码框'), () => perform('focus-password'));
   button(tools, 'Tab', () => perform('key', {key: 'Tab'}));
   button(tools, '⌫', () => perform('key', {key: 'Backspace'})).setAttribute('aria-label', tr('Backspace', '退格'));
-  button(tools, 'Enter', () => perform('key', {key: 'Enter'}));
+  button(tools, 'Enter', () => sendInput(['key', {key: 'Enter'}]));
+  button(tools, tr('Submit form', '提交表单'), () => sendInput(['submit-form']));
   button(tools, tr('Reload', '刷新'), () => perform('reload'));
   const coordinate = (event, rect = picture.getBoundingClientRect()) => {
     const clamp = (n, max) => Math.min(max - 1, Math.max(0, Math.floor(n)));
@@ -1408,7 +1451,7 @@ function showWebsiteLogin(flow, connector) {
   };
   const scrollAmount = delta => Math.round(Math.max(-1200, Math.min(1200, delta)));
   picture.addEventListener('pointerdown', event => {
-    if (event.button !== 0 || !picture.src || pointer) return;
+    if (event.button !== 0 || !viewReady || sending || pointer) return;
     const rect = picture.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     pointer = {id: event.pointerId, rect, clientX: event.clientX, clientY: event.clientY};
@@ -1423,13 +1466,16 @@ function showWebsiteLogin(flow, connector) {
     if (Math.hypot(start.clientX - event.clientX, start.clientY - event.clientY) > 12) {
       const end = coordinate(event, start.rect);
       action('scroll', {...point, dx: scrollAmount((point.x - end.x) * 1.6), dy: scrollAmount((point.y - end.y) * 1.6)});
+    } else if (input.value) {
+      showError(box, new Error(tr('Text is still in the Gateway’s input field. Use Type to send it, or Enter to send and submit.',
+        '文字还在 Gateway 的输入框里。请先点「输入」送到网页，或点 Enter 输入并提交。')));
     } else action('tap', point);
   });
   const clearPointer = event => { if (pointer?.id === event.pointerId) pointer = null; };
   picture.addEventListener('pointercancel', clearPointer);
   picture.addEventListener('lostpointercapture', clearPointer);
   picture.addEventListener('wheel', event => {
-    if (!picture.src) return;
+    if (!viewReady) return;
     event.preventDefault();
     const amount = delta => scrollAmount(delta * (event.deltaMode === 1 ? 25 : 1));
     const dx = amount(event.deltaX), dy = amount(event.deltaY);
@@ -1440,14 +1486,11 @@ function showWebsiteLogin(flow, connector) {
     try {
       // A refresh and user actions share one queue so a slow frame cannot
       // overwrite a later tap or zoom. Refresh never queues behind user input.
-      if (!queued) await enqueue(async () => {
-        const result = await api('web-login/frame', {id: flow.id}, 15000);
-        if (box.open && box.isConnected) frame(result);
-      });
+      if (!queued) await enqueue(pullView);
     } catch (error) {
       if (!box.open || !box.isConnected) return;
       showError(box, error, false);
-      if (error.code === 'web_browser_expired') return;
+      if (error.code === 'web_browser_expired' || error.code === 'web_browser_closed') return;
     }
     if (box.open && box.isConnected) timer = setTimeout(poll, 1700);
   }

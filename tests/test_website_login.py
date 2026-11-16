@@ -69,6 +69,8 @@ def fake_browser(monkeypatch, *, screenshot=None, site="www.amazon.com"):
                 return {"cookies": []}
             return {"cookies": [{"name": "auth", "domain": site, "value": SECRET},
                                 {"name": "auth", "domain": "evil.test", "value": "unrelated-password"}]}
+        if action != "frame":
+            return {"ok": True}
         return {"image": screenshot, "host": "www.amazon.com", "zoom": backend["zoom"],
                 "editable": bool(backend["taps"]) or backend["password_selected"],
                 "input_kind": "password" if backend["password_selected"] else None}
@@ -320,7 +322,7 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         assert backend["taps"][-1] == (backend["display"]["viewport"]["width"] // 4,
                                       backend["display"]["viewport"]["height"] // 2)
         await password_status.fill("simulated-password")
-        await login_box.get_by_role("button", name="输入", exact=True).tap()
+        await login_box.get_by_role("button", name="Enter", exact=True).tap()
         await playwright.expect(login_box.get_by_role("button", name="输入", exact=True)).to_be_enabled()
         backend["auth"] = True
         await login_box.get_by_role("button", name="保存会话", exact=True).tap()
@@ -331,9 +333,15 @@ async def test_mobile_website_enrollment_without_file(tmp_path, socket_dir, monk
         assert backend["inputs"] == ["demo-only-login", "simulated-password"] and len(backend["taps"]) == 2
         assert (backend["actions"].index("scroll") < backend["actions"].index("tap")
                 < backend["actions"].index("text"))
+        assert backend["actions"][backend["actions"].index("focus-password"):].count("key") == 1
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         if directory := os.environ.get("AGW_TEST_ARTIFACTS"):
             await page.screenshot(path=str(Path(directory) / "mobile-website-connected.png"))
+
+
+async def action_view(view, op, body):
+    assert await view.use(op, body) == {"ok": True}
+    return await view.use("frame", {})
 
 
 @pytest.mark.browser
@@ -360,7 +368,7 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
 
             await page.get_by_role("button").evaluate(
                 "node => node.onclick = () => document.querySelector('p').textContent = 'Clicked'")
-            result = await view.use("zoom", {"percent": 150})
+            result = await action_view(view, "zoom", {"percent": 150})
             assert result["zoom"] == 150
             rect = await page.get_by_role("button").bounding_box()
             assert rect["width"] == 150
@@ -378,10 +386,12 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
                 raise playwright.Error("Execution context was destroyed, most likely because of a navigation")
 
             monkeypatch.setattr(page, "evaluate", context_destroyed)
-            result = await view.use("tap", {"x": int(rect["x"] + 40), "y": int(rect["y"] + rect["height"] / 2)})
+            await view.use("tap", {"x": int(rect["x"] + 40), "y": int(rect["y"] + rect["height"] / 2)})
+            await page.wait_for_url("https://identity.example/next")
+            result = await view.use("frame", {})
             assert result["host"] == "identity.example"
             assert (await page.get_by_role("button").bounding_box())["width"] == 150
-            result = await view.use("zoom", {"percent": 67})
+            result = await action_view(view, "zoom", {"percent": 67})
             assert result["zoom"] == 67
             assert (await page.get_by_role("button").bounding_box())["width"] == 67
             email = page.get_by_role("textbox")
@@ -408,7 +418,7 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
             await page.mouse.click(x, y)
             with pytest.raises(NoFocusedInput):
                 await view.use("text", {"text": "simulated-secret"})
-            selected = await view.use("tap", {"x": x, "y": y})
+            selected = await action_view(view, "tap", {"x": x, "y": y})
             assert selected["editable"] is True
             await view.use("text", {"text": "simulated-secret"})
             await playwright.expect(password).to_have_value("simulated-secret")
@@ -433,7 +443,7 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir, 
             assert await desktop.evaluate("() => [innerWidth, navigator.maxTouchPoints, navigator.userAgent]") == [
                 1280, 0, desktop_ua]
             bounds = await desktop.locator("input").bounding_box()
-            assert (await view.use("tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)}))["editable"]
+            assert (await action_view(view, "tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)}))["editable"]
         finally:
             await chromium.close()
 
@@ -465,11 +475,11 @@ async def test_password_focus_when_tap_and_tab_cannot_select_it(socket_dir):
             assert (await view.use("frame", {}))["input_kind"] == "text"
             password = page.frame_locator("iframe").get_by_label("Password")
             bounds = await password.bounding_box()
-            result = await view.use("tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)})
+            result = await action_view(view, "tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)})
             assert result["input_kind"] != "password"
-            assert (await view.use("key", {"key": "Tab"}))["input_kind"] != "password"
+            assert (await action_view(view, "key", {"key": "Tab"}))["input_kind"] != "password"
 
-            assert (await view.use("focus-password", {}))["input_kind"] == "password"
+            assert (await action_view(view, "focus-password", {}))["input_kind"] == "password"
             await email.focus()  # A page change or script can steal focus before Type.
             with pytest.raises(PasswordFocusError, match="web_browser_password_unavailable"):
                 await view.use("text", {"text": "simulated-password", "expect_password": True})
@@ -487,5 +497,74 @@ async def test_password_focus_when_tap_and_tab_cannot_select_it(socket_dir):
             await password.evaluate("node => node.hidden = true")
             with pytest.raises(PasswordFocusError, match="web_browser_password_missing"):
                 await view.use("focus-password", {})
+        finally:
+            await view.close()
+
+
+@pytest.mark.browser
+@pytest.mark.parametrize("action", ["Enter", "tap", "submit-form"])
+async def test_submit_reaches_the_site_once_and_reports_its_response(socket_dir, action):
+    from agent_gateway.browser_worker import Browser, BrowserActionError
+    playwright = pytest.importorskip("playwright.async_api")
+    async with playwright.async_playwright() as driver:
+        view = Browser(socket_dir / "control.sock")
+        view.browser = await driver.chromium.launch()
+        try:
+            view.context = await view.new_context({"width": 390, "height": 620}, True, "TestBrowser")
+            view.zoom = None
+            page = await view.context.new_page()
+            form = "https://signin.example/"
+            target = form + "session"
+            posted, release = asyncio.Event(), asyncio.Event()
+            received = []
+
+            async def login_page(route):
+                await route.fulfill(content_type="text/html", body=(
+                    '<form action="/session" method="post">'
+                    '<input name="password" type="password" required>'
+                    '<button name="action" value="sign-in">Sign in</button></form>'))
+
+            async def receive_login(route):
+                received.append((route.request.method, route.request.post_data))
+                posted.set()
+                await release.wait()
+                if action == "tap":
+                    await route.abort("connectionrefused")
+                elif action == "Enter":
+                    await route.fulfill(status=403, content_type="text/html", body="<p>Sign-in blocked</p>")
+                else:
+                    await route.fulfill(content_type="text/html", body="<main>Signed in</main>",
+                                        headers={"Set-Cookie": "session=simulated; Secure; HttpOnly"})
+
+            await page.route(form, login_page)
+            await page.route(target, receive_login)
+            await page.goto(form)
+            await view.use("focus-password", {})
+            await view.use("text", {"text": "simulated-password", "expect_password": True})
+            if action == "Enter":
+                op, body = "key", {"key": "Enter"}
+            elif action == "tap":
+                bounds = await page.get_by_role("button", name="Sign in").bounding_box()
+                op, body = "tap", {"x": int(bounds["x"] + 5), "y": int(bounds["y"] + 5)}
+            else:
+                op, body = "submit-form", {}
+            try:
+                assert await asyncio.wait_for(view.use(op, body), 2) == {"ok": True}
+                await asyncio.wait_for(posted.wait(), 2)
+                assert (await view.use("frame", {}))["pending"]
+            finally:
+                release.set()
+            if action == "tap":
+                await page.wait_for_event("requestfailed", predicate=lambda req: req.url == target)
+                with pytest.raises(BrowserActionError, match="web_browser_navigation_failed"):
+                    await view.use("frame", {})
+            else:
+                await page.wait_for_url(target)
+                result = await view.use("frame", {})
+                assert result["image"] and result["site_status"] == (403 if action == "Enter" else None)
+                if action == "submit-form":
+                    await playwright.expect(page.locator("main")).to_have_text("Signed in")
+                    assert (await view.use("cookies", {"origin": form}))["cookies"][0]["name"] == "session"
+            assert received == [("POST", "password=simulated-password&action=sign-in")]
         finally:
             await view.close()
