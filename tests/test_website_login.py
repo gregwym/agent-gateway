@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import os
+import socket
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -113,22 +114,45 @@ async def test_website_session_save_is_private_and_independent_of_read_checks(tm
         assert not list(socket_dir.glob("*.proxy"))
 
 
-async def test_proxy_refuses_other_hosts_and_ports(socket_dir, monkeypatch):
+async def test_proxy_tunnels_public_https_but_rejects_private_addresses(socket_dir, monkeypatch):
     from agent_gateway import browser_tunnel
-    attempted = []
-    monkeypatch.setattr(browser_tunnel, "_public_socket", lambda address, *_: attempted.append(address))
-    async def proxy(rd, wr):
-        await connect(rd, wr, ("www.amazon.com",))
+    resolved = []
+    connect_socket, upstream = socket.socketpair()
+    resolve = socket.getaddrinfo
+
+    def dns(host, port, *args, **kwargs):
+        resolved.append((host, port))
+        IPs = {"router.example": ("192.168.2.7",),
+               "mixed.example": ("1.1.1.1", "100.64.1.2")}.get(host, (host,))
+        return [record for ip in IPs for record in resolve(ip, port, *args, **kwargs)]
+
+    def dial(address, *args):
+        if address == ("auth.idp.example", 443):
+            return connect_socket
+        return web._public_socket(address, *args)
+
+    monkeypatch.setattr(socket, "getaddrinfo", dns)
+    monkeypatch.setattr(browser_tunnel, "_public_socket", dial)
     path = socket_dir / "proxy.sock"
-    async with await asyncio.start_unix_server(proxy, path):
-        for opening in (b"CONNECT www.amazon.com.evil.test:443 HTTP/1.1", b"CONNECT 127.0.0.1:443 HTTP/1.1",
-                        b"CONNECT www.amazon.com:8080 HTTP/1.1", b"GET https://www.amazon.com HTTP/1.1"):
-            rd, wr = await asyncio.open_unix_connection(path)
-            wr.write(opening + b"\r\n\r\n")
-            assert (await rd.read()).startswith(b"HTTP/1.1 403")
-            wr.close()
-            await wr.wait_closed()
-    assert attempted == []
+    with connect_socket, upstream:
+        async with await asyncio.start_unix_server(connect, path):
+            reader, writer = await asyncio.open_unix_connection(path)
+            writer.write(b"CONNECT auth.idp.example:443 HTTP/1.1\r\n\r\n")
+            assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 200")
+            upstream.sendall(b"simulated-https-reply")
+            assert await reader.readexactly(21) == b"simulated-https-reply"
+            writer.close()
+            await writer.wait_closed()
+
+            for opening in (b"CONNECT router.example:443 HTTP/1.1", b"CONNECT mixed.example:443 HTTP/1.1",
+                            b"CONNECT 127.0.0.1:443 HTTP/1.1", b"CONNECT auth.idp.example:8080 HTTP/1.1",
+                            b"GET http://auth.idp.example/ HTTP/1.1"):
+                reader, writer = await asyncio.open_unix_connection(path)
+                writer.write(opening + b"\r\n\r\n")
+                assert (await reader.read()).startswith(b"HTTP/1.1 403")
+                writer.close()
+                await writer.wait_closed()
+    assert resolved == [("router.example", 443), ("mixed.example", 443), ("127.0.0.1", 443)]
 
 
 @pytest.mark.browser
@@ -217,9 +241,9 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
         try:
             view = Browser(socket_dir / "control.sock")
             view.context = await chromium.new_context(viewport={"width": 420, "height": 620})
-            view.navigation, view.zoom = ("signin.example",), None
+            view.zoom = None
             page = await view.context.new_page()
-            await page.route("https://signin.example/**", lambda route: route.fulfill(
+            await page.route("https://*.example/**", lambda route: route.fulfill(
                 content_type="text/html",
                 body='<button style="width:100px">Continue</button><p>Before</p><input type="email">'))
             await page.goto("https://signin.example/")
@@ -231,9 +255,8 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
             assert rect["width"] == 150
             await view.use("tap", {"x": rect["x"] + 140, "y": rect["y"] + rect["height"] / 2})
             await playwright.expect(page.locator("p")).to_have_text("Clicked")
-            # A subsequent navigation (for example password to verification code)
-            # maintains zoom in the new page without rewriting the click mapping.
-            await page.goto("https://signin.example/next")
+            # A separate identity provider keeps the same zoom and click mapping.
+            await page.goto("https://identity.example/next")
             await view.use("frame", {})
             assert (await page.get_by_role("button").bounding_box())["width"] == 150
             result = await view.use("zoom", {"percent": 67})
@@ -245,5 +268,13 @@ async def test_zoom_reflows_the_browser_and_taps_still_hit_the_page(socket_dir):
             await view.use("text", {"text": "simulated@example.test"})
             await playwright.expect(email).to_be_focused()
             await playwright.expect(email).to_have_value("simulated@example.test")
+            await view.context.add_cookies([
+                {"name": "account", "value": "keep", "url": "https://signin.example"},
+                {"name": "api", "value": "keep", "url": "https://api.signin.example"},
+                {"name": "identity", "value": "discard", "url": "https://identity.example"},
+            ])
+            exported = await view.use("cookies", {"origin": "https://signin.example",
+                                                    "api_origins": ["https://api.signin.example"]})
+            assert {cookie["name"] for cookie in exported["cookies"]} == {"account", "api"}
         finally:
             await chromium.close()

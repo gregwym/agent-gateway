@@ -525,8 +525,9 @@ stdio MCP 示例：
 网关加密保存会话。旧会话失效时，在「编辑设置」中点「重新登录」。「验证网站连通性」只检查
 网站能否响应，不判断是否已登录。新连接默认不向 Agent 开放。
 
-Compose 的 `browser` 服务提供短时登录窗口；它不挂载网关数据，也没有直接网络访问。登录窗口仅供
-管理员使用，关闭后清除浏览器数据。依赖手机本机通行密钥的站点登录方式无法在此窗口使用。
+Compose 的 `browser` 服务提供管理员专用的临时登录窗口，可加载公网 HTTPS 资源并跟随登录跳转。
+它不挂载网关数据，也不能访问内网。保存时只保留连接站点和已批准 API 来源范围内的 Cookie，
+关闭窗口后清除临时浏览器数据。依赖手机本机通行密钥的站点登录方式无法在此窗口使用。
 
 「高级：导入会话文件」支持 Cookie JSON 数组或 Playwright `storageState`。也可用
 `python -m examples.export_web_session amazon-us ./browser-session.json`（Weee 用 `weee-orders`）。

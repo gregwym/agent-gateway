@@ -3,13 +3,10 @@ import asyncio
 import re
 from contextlib import suppress
 
+from .connectors._base import ConnectorError
 from .connectors.web import _public_socket
 
 _TARGET = re.compile(rb"CONNECT ([a-zA-Z0-9.-]{1,253}):443 HTTP/1\.[01]")
-
-
-def host_allowed(host, domains):
-    return any(host == domain or host.endswith("." + domain) for domain in domains)
 
 
 async def tunnel(left, right):
@@ -27,17 +24,17 @@ async def tunnel(left, right):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def connect(reader, writer, domains, *, exact=()):
+async def connect(reader, writer):
     peer = None
     try:
         async with asyncio.timeout(12):
             header = await reader.readuntil(b"\r\n\r\n")
             match = _TARGET.fullmatch(header.split(b"\r\n", 1)[0])
-            host = match[1].decode().lower() if match else ""
-            if not host or (host not in exact and not host_allowed(host, domains)):
+            if not match:
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 await writer.drain()
                 return
+            host = match[1].decode().lower()
             # DNS answers are validated and pinned by the same connector helper.
             # Run the bounded network connect off the application event loop.
             def dial():
@@ -50,6 +47,10 @@ async def connect(reader, writer, domains, *, exact=()):
             dialing = asyncio.create_task(asyncio.to_thread(dial))
             try:
                 sock = await asyncio.shield(dialing)
+            except ConnectorError:
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                return
             except BaseException:
                 def discard(task):
                     with suppress(Exception):

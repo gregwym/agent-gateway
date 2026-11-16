@@ -21,15 +21,6 @@ from .passkey import Refused
 from .plugins import connector_plugins
 from .web_profiles import CUSTOM_PROFILE, PROFILE_ENV, SESSION_ENV, WebProfile, connection_origins, website_origin
 
-# Additional network origins for first-party sign-in and assets. These are never
-# accepted as destinations supplied by an Agent.
-BUNDLED = {
-    "www.amazon.com": (("www.amazon.com",), ("media-amazon.com", "ssl-images-amazon.com", "amazon.com")),
-    "www.weee.com": (("www.weee.com", "www.sayweee.com", "weee.com", "sayweee.com"),
-                     ("weeecdn.com", "weeecdn.net")),
-}
-
-
 class WebsiteLogin:
     def __init__(self, admin):
         self.admin = admin
@@ -109,8 +100,6 @@ class WebsiteLogin:
         if not self.available():
             raise Refused("web_browser_unavailable", 503)
         host = urlsplit(profile.origin).hostname
-        navigation, assets = BUNDLED.get(host, ((host,), ()))
-        api_hosts = [urlsplit(origin).hostname for origin in extra_origins]
         expires = min(time.time() + 600, session["expires"])
         if expires < time.time() + 15:
             raise Refused("login_required", 401)
@@ -130,7 +119,7 @@ class WebsiteLogin:
                     return
                 tunnels.add(task)
                 try:
-                    await connect(reader, writer, navigation + assets, exact=api_hosts)
+                    await connect(reader, writer)
                 finally:
                     tunnels.discard(task)
 
@@ -143,8 +132,7 @@ class WebsiteLogin:
                          "path": path, "proxy": proxy, "tunnels": tunnels, "body": body, "api_origins": extra_origins}
             try:
                 await self.worker("start", {"id": ident, "expires": expires,
-                                           "url": profile.origin + "/",
-                                           "navigation": navigation})
+                                           "url": profile.origin + "/"})
             except BaseException:
                 with anyio.CancelScope(shield=True):
                     await self.close()

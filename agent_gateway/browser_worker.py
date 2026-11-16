@@ -13,7 +13,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .browser_tunnel import host_allowed, tunnel
+from .browser_tunnel import tunnel
 
 WIDTH, HEIGHT = 420, 620
 KEYS = {"Enter", "Tab", "Backspace", "Escape"}
@@ -46,7 +46,6 @@ class Browser:
         self.id, self.expires = body["id"], body["expires"]
         self.zoom = None
         proxy = self.path.parent / f'{self.id}.proxy'
-        allowed = self.navigation = body["navigation"]
 
         async def relay(reader, writer):
             task = asyncio.current_task()
@@ -77,9 +76,7 @@ class Browser:
 
         async def guard(route):
             request = route.request
-            parts = urlsplit(request.url)
-            if request.is_navigation_request() and (
-                    parts.scheme != "https" or not host_allowed(parts.hostname or "", allowed)):
+            if request.is_navigation_request() and urlsplit(request.url).scheme != "https":
                 await route.abort("accessdenied")
             else:
                 await route.continue_()
@@ -98,14 +95,14 @@ class Browser:
             hosts = [urlsplit(origin).hostname for origin in (body["origin"], *body.get("api_origins", []))]
             cookies = [cookie for cookie in await self.context.cookies() if any(
                        cookie["domain"] == host or (cookie["domain"].startswith(".")
-                                                    and host_allowed(host, (cookie["domain"][1:],))) for host in hosts)]
+                                                    and (host == cookie["domain"][1:] or host.endswith(cookie["domain"])))
+                       for host in hosts)]
             return {"cookies": cookies}
         page = self.context.pages[-1] if self.context.pages else None
         if page is None:
             raise RuntimeError("browser closed")
         current = urlsplit(page.url)
-        if op in {"tap", "text", "key", "scroll"} and (
-                current.scheme != "https" or not host_allowed(current.hostname or "", self.navigation)):
+        if op in {"tap", "text", "key", "scroll"} and current.scheme != "https":
             raise ValueError("sign-in destination not allowed")
         if op == "tap":
             await page.mouse.click(body["x"], body["y"])
@@ -124,7 +121,7 @@ class Browser:
         elif op != "frame":
             raise ValueError("invalid action")
         parts = urlsplit(page.url)
-        if self.zoom is not None and parts.scheme == "https" and host_allowed(parts.hostname or "", self.navigation):
+        if self.zoom is not None and parts.scheme == "https":
             # Apply to the actual page so clickable coordinates stay in the same
             # viewport, and retain the scale when a sign-in step navigates.
             await page.evaluate("""factor => {
