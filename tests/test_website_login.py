@@ -467,7 +467,7 @@ async def test_password_focus_when_tap_and_tab_cannot_select_it(socket_dir):
                 body=('<form onsubmit="event.preventDefault(); this.dataset.submitted = 1">'
                       '<input type="password" style="opacity:0" title="Hidden">'
                       '<input type="password" tabindex="-1" aria-label="Password" '
-                      'ontouchstart="event.preventDefault()">'
+                      'ontouchstart="event.preventDefault()" onkeydown="event.preventDefault()">'
                       '</form>')))
             await page.goto("https://signin.example/")
             email = page.get_by_role("textbox", name="Email")
@@ -485,14 +485,13 @@ async def test_password_focus_when_tap_and_tab_cannot_select_it(socket_dir):
                 await view.use("text", {"text": "simulated-password", "expect_password": True})
             await playwright.expect(email).to_have_value("")
             await view.use("focus-password", {})
+            # A page can intercept key events while still accepting text input.
+            # In that case the old per-key path reported success but entered nothing.
+            await page.keyboard.type("simulated-password")
+            await playwright.expect(password).to_have_value("")
             await view.use("text", {"text": "simulated-password", "expect_password": True})
             await playwright.expect(password).to_have_value("simulated-password")
             assert await page.frame_locator("iframe").locator("form").get_attribute("data-submitted") is None
-            await password.fill("")
-            await password.evaluate("node => node.addEventListener('keyup', () => node.blur(), {once: true})")
-            with pytest.raises(PasswordFocusError, match="web_browser_password_interrupted"):
-                await view.use("text", {"text": "simulated-password", "expect_password": True})
-            await playwright.expect(password).to_have_value("s")
 
             second = page.locator('input[type="password"]')
             await page.evaluate("() => document.body.insertAdjacentHTML('beforeend', '<input type=password>')")
@@ -525,10 +524,8 @@ async def test_submit_reaches_the_site_once_and_reports_its_response(socket_dir,
 
             async def login_page(route):
                 await route.fulfill(content_type="text/html", body=(
-                    '<form action="/session" method="post" '
-                    'onsubmit="if (this.dataset.keySeen !== \'yes\') event.preventDefault()">'
-                    '<input name="password" type="password" required '
-                    'onkeyup="if (event.isTrusted) this.form.dataset.keySeen = \'yes\'">'
+                    '<form action="/session" method="post">'
+                    '<input name="password" type="password" required>'
                     '<label><input id="reveal" type="checkbox" '
                     'onchange="this.form.password.type = this.checked ? \'text\' : \'password\'">'
                     'Show password</label>'

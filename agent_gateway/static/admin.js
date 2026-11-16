@@ -199,7 +199,6 @@ const messages = {
   web_browser_password_missing: ['No visible password field was found on this page.', '此页没有找到可见的密码框。'],
   web_browser_password_multiple: ['This page has more than one password field. Select the one you want.', '此页有多个密码框，请点选要输入的那个。'],
   web_browser_password_unavailable: ['The password field is not ready for typing. Select it again before entering your password.', '密码框还不能输入。请重新选中密码框再输入。'],
-  web_browser_password_interrupted: ['The page changed focus while typing the password. Clear the website password field before trying again.', '输入途中，网站移走了密码框的焦点。重试前请先清空网页里的密码框。'],
   web_browser_closed: ['The website closed its browser tab. Open a new sign-in window.', '网站关闭了浏览器标签页，请重新打开登录窗口。'],
   web_browser_still_loading: ['The website is still loading. Wait for the page before interacting again.', '网站仍在加载，请等页面更新后再操作。'],
   web_browser_action_uncertain: ['The browser could not confirm this action. Check the website before trying again.', '浏览器无法确认这次操作，请先查看网页状态再重试。'],

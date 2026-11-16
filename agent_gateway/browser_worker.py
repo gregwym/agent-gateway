@@ -29,7 +29,6 @@ class NoFocusedInput(Exception):
 
 PASSWORD_FOCUS_ERRORS = {
     "web_browser_password_missing", "web_browser_password_multiple", "web_browser_password_unavailable",
-    "web_browser_password_interrupted",
 }
 
 
@@ -164,25 +163,6 @@ async def submit_form(page):
             await controls.dispose()
     finally:
         await field.dispose()
-
-
-async def type_password(page, text):
-    target = await focused_input(page, kind_only=False)
-    if not target:
-        raise PasswordFocusError("web_browser_password_unavailable")
-    try:
-        # Some forms update their model on keyboard events. insert_text()
-        # only sends an input event. Recheck the target for each key so a
-        # handler moving focus does not receive the rest in another field.
-        for index, character in enumerate(text):
-            if not await target.evaluate("""node => node.isConnected && node.type === 'password' &&
-                node.ownerDocument.hasFocus() && node.getRootNode().activeElement === node &&
-                !node.matches(':disabled, [readonly]')"""):
-                raise PasswordFocusError("web_browser_password_interrupted" if index
-                                         else "web_browser_password_unavailable")
-            await page.keyboard.type(character)
-    finally:
-        await target.dispose()
 
 
 class Browser:
@@ -365,10 +345,9 @@ class Browser:
                 raise PasswordFocusError("web_browser_password_unavailable")
             if not kind:
                 raise NoFocusedInput
-            if kind == "password":
-                await type_password(page, body["text"])
-            else:
-                await page.keyboard.insert_text(body["text"])
+            # The admin sends a completed text buffer, as with pasting. A
+            # website can intercept individual keys without accepting any text.
+            await page.keyboard.insert_text(body["text"])
         elif op == "key":
             await page.keyboard.press(body["key"])
         elif op == "scroll":
