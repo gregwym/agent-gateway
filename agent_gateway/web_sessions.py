@@ -27,18 +27,21 @@ class WebSessions:
         with self.lock:
             origins = connection_origins(conn)
             if ref not in self.live or self.live[ref].origins != frozenset(origins):
-                raw, redactions = values[conn.secret_env[SESSION_ENV]], ()
+                raw, redactions, short_cookies = values[conn.secret_env[SESSION_ENV]], (), ()
                 if ref in self.file.names():
                     record = json.loads(self.file.get(ref))
                     raw, redactions = record["cookies"], record["redactions"]
+                    short_cookies = record.get("short_cookies", ())
                 profile = WebProfile.saved(conn.env[PROFILE_ENV])
 
-                def persist(raw, redactions):
+                def persist(raw, redactions, short_cookies):
                     with self.lock:
                         if self.live.get(ref) is session:
-                            self.file.set(ref, json.dumps({"cookies": raw, "redactions": sorted(redactions)}))
+                            self.file.set(ref, json.dumps({"cookies": raw, "redactions": sorted(redactions),
+                                                           "short_cookies": sorted(short_cookies)}))
 
-                session = self.live[ref] = SiteSession(profile, raw, persist=persist, redactions=redactions, extra_origins=origins[1:])
+                session = self.live[ref] = SiteSession(profile, raw, persist=persist, redactions=redactions,
+                                                      short_cookies=short_cookies, extra_origins=origins[1:])
             return self.live[ref]
 
     def prune(self, cfg, values):

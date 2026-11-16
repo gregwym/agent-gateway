@@ -8,9 +8,10 @@ from urllib.parse import urlencode, urlsplit
 
 from graphql import GraphQLError, build_schema, print_type, validate_schema
 
-from .config import MAX_WEB_POST_READS, WebPostRead
+from .config import MAX_WEB_OPERATION_RULES, WebOperationRule
 from .credentials import EncryptedFileStore
 from .passkey import Refused
+from .web_operations import HTTP_METHODS
 from .web_profiles import WebProfile, connection_origins, is_website
 
 MAX_DOCUMENT = 192_000
@@ -20,9 +21,9 @@ FORMAT_OPENAPI = "openapi"
 FORMAT_GRAPHQL = "graphql"
 GET_DESCRIPTION = "web_get_api_description"
 PUBLISH_DESCRIPTION = "web_publish_api_description"
-PROPOSE_POST_READS = "web_propose_post_reads"
-POST_READ_TTL = 24 * 3600
-MAX_POST_READ_PROPOSAL = 16
+PROPOSE_OPERATION_RULES = "web_propose_operation_rules"
+OPERATION_RULE_TTL = 24 * 3600
+MAX_OPERATION_RULE_PROPOSAL = 16
 DESCRIPTIONS = {
     GET_DESCRIPTION: ("Read the latest or a historical API description for this website connection.",
                       {"type": "object", "properties": {"revision": {"type": "integer", "minimum": 1}}, "additionalProperties": False}),
@@ -33,17 +34,20 @@ DESCRIPTIONS = {
          "properties": {"base_revision": {"type": "integer", "minimum": 0},
                         "format": {"enum": ["openapi", "graphql"]},
                         "document": {"oneOf": [{"type": "object"}, {"type": "string"}]}}}),
-    PROPOSE_POST_READS: (
-        "Propose treating specific HTTP POST endpoints as reads. Only the assigned maintainer may propose. "
-        "Use literal paths on approved origins, and only if every request to that endpoint is read-only. "
-        "The result contains an administrator review URL. Access changes only after Passkey approval. "
-        "Check gateway_search_connections for active post_read_endpoints.",
-        {"type": "object", "required": ["endpoints", "reason"], "additionalProperties": False,
-         "properties": {"endpoints": {"type": "array", "minItems": 1, "maxItems": MAX_POST_READ_PROPOSAL,
-                                     "uniqueItems": True, "items": {
-             "type": "object", "required": ["origin", "path"], "additionalProperties": False,
+    PROPOSE_OPERATION_RULES: (
+        "Propose read or write classifications for HTTP endpoints, e.g. POST as read or GET as write. "
+        "Only the assigned maintainer may propose. Use literal paths on approved origins. "
+        "Propose read only when the endpoint does not change state for any request body. "
+        "The result has an administrator review URL; rules change only after Passkey approval. "
+        "See gateway_search_connections for active operation_rules.",
+        {"type": "object", "required": ["rules", "reason"], "additionalProperties": False,
+         "properties": {"rules": {"type": "array", "minItems": 1, "maxItems": MAX_OPERATION_RULE_PROPOSAL,
+                                  "uniqueItems": True, "items": {
+             "type": "object", "required": ["origin", "method", "path", "access"], "additionalProperties": False,
              "properties": {"origin": {"type": "string", "maxLength": 255},
-                            "path": {"type": "string", "maxLength": 512}}}},
+                            "method": {"enum": list(HTTP_METHODS)},
+                            "path": {"type": "string", "maxLength": 512},
+                            "access": {"enum": ["read", "write"]}}}},
                         "reason": {"type": "string", "minLength": 1, "maxLength": 500}}}),
 }
 
@@ -166,15 +170,15 @@ class WebsiteCatalogs:
     @staticmethod
     def can_propose(gw, client, conn):
         return any(tool.upstream == "http_request"
-                   and gw.policy.effect(client.subject, tool.name, client.id, operation="read") != "deny"
-                   for tool in conn.tools)
+                   and gw.policy.effect(client.subject, tool.name, client.id, operation=access) != "deny"
+                   for tool in conn.tools for access in ("read", "write"))
 
     def metadata(self, conn, client=None, gateway=None):
         binding = self.binding(conn.id)
         can_publish = bool(binding and client and binding.get("writer") == client.id)
         return {"read_tool": GET_DESCRIPTION, "can_publish": can_publish,
                 **({"publish_tool": PUBLISH_DESCRIPTION} if can_publish else {}),
-                **({"propose_post_reads_tool": PROPOSE_POST_READS}
+                **({"propose_operation_rules_tool": PROPOSE_OPERATION_RULES}
                    if can_publish and self.can_propose(gateway, client, conn) else {})}
 
     def view(self, conn, version=None):
@@ -206,10 +210,10 @@ class WebsiteCatalogs:
         conn = next((c for c in gateway.cfg.connections if c.id == name and is_website(c)), None)
         if conn is None or not self.eligible(gateway, client, conn):
             return None
-        if tool in (PUBLISH_DESCRIPTION, PROPOSE_POST_READS):
+        if tool in (PUBLISH_DESCRIPTION, PROPOSE_OPERATION_RULES):
             if (self.binding(conn.id) or {}).get("writer") != client.id:
                 return None
-            if tool == PROPOSE_POST_READS and not self.can_propose(gateway, client, conn):
+            if tool == PROPOSE_OPERATION_RULES and not self.can_propose(gateway, client, conn):
                 return None
         return conn
 
@@ -249,43 +253,44 @@ class WebsiteCatalogs:
                                                revision=record["revision"])
         return {"revision": record["revision"], "changes": record["changes"]}
 
-    def check_post_reads(self, conn, body):
+    def check_operation_rules(self, conn, body):
         try:
-            endpoints = sorted((WebPostRead.model_validate(item).model_dump() for item in body["endpoints"]),
-                               key=lambda item: (item["origin"], item["path"]))
+            rules = sorted((WebOperationRule.model_validate(item) for item in body["rules"]), key=lambda rule: rule.endpoint)
             reason = body["reason"].strip()
+            origins = connection_origins(conn)
             if (not reason or any(ord(c) < 32 or ord(c) == 127 for c in reason)
-                    or not all(row["origin"] in connection_origins(conn) for row in endpoints)):
+                    or any(rule.origin not in origins for rule in rules)
+                    or len({rule.endpoint for rule in rules}) != len(rules)):
                 raise ValueError()
             serialized = json.dumps(body, ensure_ascii=False)
             serialized.encode("utf-8")
         except ValueError:
-            raise Refused("web_post_read_invalid", 400) from None
+            raise Refused("web_operation_rule_invalid", 400) from None
         if (re.search(r"\bagw_[a-zA-Z0-9_-]{43}\b", serialized)
                 or self.admin.runtime.gateway.scrubber.data(body) != body):
             raise Refused("website_catalog_contains_token", 400)
-        return endpoints, reason
+        return rules, reason
 
     def _proposal_file(self, conn):
         binding = self.binding(conn.id)
-        return self.directory / (binding["ref"] + ".post-reads") if binding else None
+        return self.directory / (binding["ref"] + ".operation-rules") if binding else None
 
-    def save_post_read_proposal(self, conn, proposal):
+    def save_operation_rule_proposal(self, conn, proposal):
         EncryptedFileStore(self._proposal_file(conn), self.key_file).set("proposal", json.dumps(proposal))
 
-    def post_read_proposal(self, conn, proposal_id=None):
+    def operation_rule_proposal(self, conn, proposal_id=None):
         path = self._proposal_file(conn)
         proposal = (json.loads(EncryptedFileStore(path, self.key_file).get("proposal"))
                     if path and path.is_file() else None)
         if proposal_id is not None and (not proposal or proposal["id"] != proposal_id):
-            raise Refused("web_post_read_proposal_missing", 404)
+            raise Refused("web_operation_rule_proposal_missing", 404)
         if not proposal:
             return None
-        active = [rule.model_dump() for rule in conn.web_post_reads]
+        active = [rule.model_dump() for rule in conn.web_operation_rules]
         gateway = self.admin.runtime.gateway
         if proposal.get("rejected"):
             status = "rejected"
-        elif all(row in active for row in proposal["endpoints"]):
+        elif all(row in active for row in proposal["rules"]):
             status = "approved"
         elif proposal["revision"] != gateway.configuration_revision or proposal["expires_at"] <= time.time():
             status = "stale"
@@ -293,28 +298,29 @@ class WebsiteCatalogs:
             status = "pending_admin_review"
         return {**proposal, "status": status}
 
-    def propose_post_reads(self, conn, client_id, body):
-        endpoints, reason = self.check_post_reads(conn, body)
-        active = [rule.model_dump() for rule in conn.web_post_reads]
-        endpoints = [row for row in endpoints if row not in active]
-        if not endpoints:
+    def propose_operation_rules(self, conn, client_id, body):
+        rules, reason = self.check_operation_rules(conn, body)
+        active = {rule.endpoint: rule for rule in conn.web_operation_rules}
+        rules = [rule for rule in rules if active.get(rule.endpoint) != rule]
+        if not rules:
             return {"status": "already_active"}
-        if len(active) + len(endpoints) > MAX_WEB_POST_READS:
-            raise Refused("web_post_read_limit", 409)
+        if len(set(active) | {rule.endpoint for rule in rules}) > MAX_WEB_OPERATION_RULES:
+            raise Refused("web_operation_rule_limit", 409)
+        proposed = [rule.model_dump() for rule in rules]
         gateway = self.admin.runtime.gateway
-        existing = self.post_read_proposal(conn)
+        existing = self.operation_rule_proposal(conn)
         if existing and existing["status"] == "pending_admin_review":
-            if existing["endpoints"] != endpoints or existing["agent"] != client_id:
-                raise Refused("web_post_read_pending", 409)
+            if existing["rules"] != proposed or existing["agent"] != client_id:
+                raise Refused("web_operation_rule_pending", 409)
             proposal = existing
         else:
-            proposal = {"id": secrets.token_hex(16), "agent": client_id, "endpoints": endpoints,
+            proposal = {"id": secrets.token_hex(16), "agent": client_id, "rules": proposed,
                         "reason": reason, "revision": gateway.configuration_revision,
-                        "expires_at": int(time.time()) + POST_READ_TTL}
-            self.save_post_read_proposal(conn, proposal)
-            gateway.audit.write("website_post_reads_proposed", client=client_id, connection=conn.id,
-                                proposal=proposal["id"], count=len(endpoints))
-        query = urlencode({"review_post_reads": conn.id, "proposal": proposal["id"]})
+                        "expires_at": int(time.time()) + OPERATION_RULE_TTL}
+            self.save_operation_rule_proposal(conn, proposal)
+            gateway.audit.write("website_operation_rules_proposed", client=client_id, connection=conn.id,
+                                proposal=proposal["id"], count=len(proposed))
+        query = urlencode({"review_operation_rules": conn.id, "proposal": proposal["id"]})
         return {"status": "pending_admin_review", "proposal_id": proposal["id"], "expires_at": proposal["expires_at"],
                 "review_url": gateway.cfg.approvals.origin + "/admin/connections?" + query}
 
@@ -322,7 +328,7 @@ class WebsiteCatalogs:
         active = {binding["ref"] for binding in self.admin.store.state.get("website_catalogs", {}).values()}
         if self.directory.exists():
             for path in self.directory.iterdir():
-                if (match := re.fullmatch(r"([a-f0-9]{32})(?:\.post-reads)?", path.name)) and match[1] not in active:
+                if (match := re.fullmatch(r"([a-f0-9]{32})(?:\.(?:operation-rules|post-reads))?", path.name)) and match[1] not in active:
                     path.unlink(missing_ok=True)
 
     def set_writer(self, state, connection, writer):

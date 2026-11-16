@@ -281,7 +281,8 @@ async def test_follow_locale_redirects_without_exposing_cookie_values(tmp_path, 
 def test_json_redaction_preserves_response_shape(mime):
     profile = bundled_profiles()["weee-orders"][1]
     wire_body = (
-        br'{"result":true,"count":101,"flag":1,"text":"en route",'
+        br'{"result":true,"count":101,"flag":1,"text":"en route","quantity":1,"price2":1.99,'
+        br'"items":[{"quantity":"1","language":"en","echo":"flag=1; language=en","token":"1"}],'
         br'"old":"private\u002dsession-cookie","new":"rotated-session-cookie","price":12.99}'
     )
 
@@ -295,7 +296,9 @@ def test_json_redaction_preserves_response_shape(mime):
 
     assert result["status"] == 200
     assert json.loads(result["body"]) == {
-        "result": True, "count": 101, "flag": "[REDACTED]", "text": "[REDACTED] route",
+        "result": True, "count": 101, "flag": "[REDACTED]", "text": "en route", "quantity": 1, "price2": 1.99,
+        "items": [{"quantity": "1", "language": "[REDACTED]",
+                   "echo": "flag=[REDACTED]; language=[REDACTED]", "token": "[REDACTED]"}],
         "old": "[REDACTED]", "new": "[REDACTED]", "price": 12.99,
     }
 
@@ -307,7 +310,7 @@ async def test_pages_redact_before_slicing_and_detect_a_changed_body(tmp_path, m
     left = heading + "字" * (web.MAX_TEXT - len(heading) - 7) + "<b>"
     right = "</b> <i>en</i> <p>1</p> <p>End</p>"
     site_body = left + secret + right
-    sanitized = left + "[REDACTED]" + right.replace(">en<", ">[REDACTED]<").replace(">1<", ">[REDACTED]<")
+    sanitized = left + "[REDACTED]" + right
     requests = []
 
     def fetch(host, target, method, headers, body, receive):

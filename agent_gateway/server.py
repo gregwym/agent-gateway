@@ -318,7 +318,7 @@ class Gateway:
     async def _submit_website_description(self, ctx, dispatcher, who, args, key, audit):
         from .passkey import Refused
         from .request_store import QueueFull
-        from .web_catalog import DESCRIPTIONS, PROPOSE_POST_READS, PUBLISH_DESCRIPTION
+        from .web_catalog import DESCRIPTIONS, PROPOSE_OPERATION_RULES, PUBLISH_DESCRIPTION
 
         client = next(c for c in self.cfg.clients if c.id == who.client_id)
         name, fields = args["tool"], args["arguments"]
@@ -332,8 +332,8 @@ class Gateway:
         try:
             if name == PUBLISH_DESCRIPTION:
                 self.website_catalogs.check_publication(fields)
-            elif name == PROPOSE_POST_READS:
-                self.website_catalogs.check_post_reads(conn, fields)
+            elif name == PROPOSE_OPERATION_RULES:
+                self.website_catalogs.check_operation_rules(conn, fields)
             call = self._website_description_request(client, conn, name, fields)
             job = dispatcher.store.enqueue(call, key)
         except Refused as exc:
@@ -378,7 +378,7 @@ class Gateway:
             elif name == PUBLISH_DESCRIPTION:
                 data = self.website_catalogs.publish(conn, self.website_catalogs.binding(conn.id), client.id, fields)
             else:
-                data = self.website_catalogs.propose_post_reads(conn, client.id, fields)
+                data = self.website_catalogs.propose_operation_rules(conn, client.id, fields)
         except Refused as exc:
             data = {"error": exc.code}
         result = self._catalog_result(data)
@@ -433,8 +433,9 @@ class Gateway:
         if is_website(route.conn):
             from .connectors.web import ConnectorError, plan_request
             try:
-                plan = plan_request(route.tool.upstream, arguments)
                 origins = connection_origins(route.conn)
+                plan = plan_request(route.tool.upstream, arguments, operation_rules=route.conn.web_operation_rules,
+                                    default_origin=origins[0])
                 if plan.origin is not None and plan.origin not in origins:
                     done("deny", "web_origin_not_approved")
                     return _error("This API origin is not approved for the connection.")
@@ -442,10 +443,6 @@ class Gateway:
                     done("deny", "web_redirect_restricted")
                     return _error("This tool has argument restrictions. Submit each redirect target as a separate request.")
                 operation = plan.access
-                if (route.tool.upstream == "http_request" and plan.method == "POST"
-                        and any((rule.origin, rule.path) == (plan.origin or origins[0], plan.target)
-                                for rule in route.conn.web_post_reads)):
-                    operation = "read"
             except ConnectorError as exc:
                 done("deny", exc.code)
                 return _error(str(exc))

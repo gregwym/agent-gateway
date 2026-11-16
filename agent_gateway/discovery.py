@@ -160,7 +160,7 @@ def search_connections(gateway, who, args):
             if gateway.website_catalogs:
                 client = next(c for c in gateway.cfg.clients if c.id == who.client_id)
                 item["api_catalog"] = gateway.website_catalogs.metadata(conn, client, gateway)
-            item["post_read_endpoints"] = [rule.model_dump() for rule in conn.web_post_reads]
+            item["operation_rules"] = [rule.model_dump() for rule in conn.web_operation_rules]
         if who.client_id in conn.mailbox_access:
             item["mailbox_paths_restricted"] = True
         if args.get("tool") and not catalog_tool:

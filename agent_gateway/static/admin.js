@@ -181,8 +181,8 @@ const messages = {
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   website_origin_invalid: ['Enter up to eight distinct public HTTPS origins, with no paths or port numbers.', '请输入公网 HTTPS 网站地址，不含路径或端口，最多八个 API 地址。'],
-  web_post_read_proposal_missing: ['This proposal is no longer available.', '该提案已不可用。'],
-  web_post_read_proposal_stale: ['This proposal can no longer be approved. Ask the Agent to submit it again.', '这条提案已无法审批，请让 Agent 重新提交。'],
+  web_operation_rule_proposal_missing: ['This proposal is no longer available.', '该提案已不可用。'],
+  web_operation_rule_proposal_stale: ['This proposal can no longer be approved. Ask the Agent to submit it again.', '这条提案已无法审批，请让 Agent 重新提交。'],
   website_catalog_revision_missing: ['This revision is no longer available.', '这个版本已不在保留范围内。'],
   website_catalog_publisher_needs_access: ['Give this agent access to the website connection first.', '请先授予这个 Agent 使用此网站连接的权限。'],
   web_origin_not_approved: ['This API origin is not approved for this connection.', '此连接尚未获准访问这个 API 地址。'],
@@ -488,9 +488,9 @@ function render() {
   }
   ({overview, members, agents, connections, permissions, settings: systemSettings})[tab]();
   const params = new URLSearchParams(location.search);
-  if (tab === 'connections' && params.has('review_post_reads') && params.has('proposal')) {
+  if (tab === 'connections' && params.has('review_operation_rules') && params.has('proposal')) {
     history.replaceState(null, '', tabUrls.connections);
-    websitePostReads(params.get('review_post_reads'), params.get('proposal')).catch(error => showError(app, error));
+    websiteOperationRules(params.get('review_operation_rules'), params.get('proposal')).catch(error => showError(app, error));
   }
 }
 function overview() {
@@ -743,7 +743,7 @@ function connectorDetails(id) {
       const initial = await api('web-catalog/view', {id});
       websiteCatalog(conn, initial);
     });
-    if (conn.kind === 'web') button(actions, tr('POST read rules', 'POST 读取规则'), () => websitePostReads(id));
+    if (conn.kind === 'web') button(actions, tr('HTTP operation rules', 'HTTP 操作规则'), () => websiteOperationRules(id));
     if (remote) button(actions, tr('Review current tools', '审阅当前工具'), async () => {
       showReview(await api('connections/review-tools', {id, revision: state.revision}), box);
     });
@@ -761,12 +761,15 @@ function connectorDetails(id) {
   populate();
 }
 
-async function websitePostReads(id, proposalId = null) {
+async function websiteOperationRules(id, proposalId = null) {
   const request = {id, ...(proposalId ? {proposal: proposalId} : {})};
-  const initial = await api('web-post-reads/view', request);
-  const box = modal(tr('POST read rules', 'POST 读取规则') + ' · ' + id), content = el(box, 'div');
-  const reload = async () => populate(await api('web-post-reads/view', request));
-  function endpoint(parent, rule) { el(parent, 'code', 'POST ' + rule.origin + rule.path, 'url'); }
+  const initial = await api('web-operation-rules/view', request);
+  const box = modal(tr('HTTP operation rules', 'HTTP 操作规则') + ' · ' + id), content = el(box, 'div');
+  const reload = async () => populate(await api('web-operation-rules/view', request));
+  function endpoint(parent, rule) {
+    el(parent, 'code', rule.method + ' ' + rule.origin + rule.path, 'url');
+    el(parent, 'span', rule.access === 'read' ? tr('Read', '读取') : tr('Write', '写入'), 'badge');
+  }
   function populate({active, proposal, revision}) {
     content.replaceChildren();
     el(content, 'h3', tr('Agent proposal', 'Agent 提案'));
@@ -774,16 +777,16 @@ async function websitePostReads(id, proposalId = null) {
     else {
       el(content, 'p', proposal.agent + ' · ' + proposal.reason);
       const list = el(content, 'ul');
-      for (const rule of proposal.endpoints) endpoint(el(list, 'li'), rule);
+      for (const rule of proposal.rules) endpoint(el(list, 'li'), rule);
       if (proposal.status === 'pending_admin_review') {
-        el(content, 'p', tr('Approve these paths only if every request to them is read-only, regardless of body. Existing read permissions will apply.',
-          '只有在这些路径无论请求体是什么都只会读取时，才应批准。批准后按现有的读取权限处理。'), 'muted');
+        el(content, 'p', tr('Rules use the connection’s existing read or write permissions. Approve a read rule only if the endpoint cannot change data.',
+          '规则沿用连接现有的读写权限。只有确认接口不会修改数据时，才批准标为读取。'), 'muted');
         const actions = el(content, 'div', undefined, 'actions');
         const decide = async decision => {
-          await mutate('web-post-reads/decide', {id, proposal: proposal.id, decision, revision});
+          await mutate('web-operation-rules/decide', {id, proposal: proposal.id, decision, revision});
           await reload();
         };
-        button(actions, tr('Approve as read', '批准为读取'), () => decide('approve'), 'primary');
+        button(actions, tr('Approve rules', '批准规则'), () => decide('approve'), 'primary');
         button(actions, tr('Reject', '拒绝'), () => decide('reject'));
       } else {
         const labels = {approved: tr('Approved', '已批准'), rejected: tr('Rejected', '已拒绝'),
@@ -793,13 +796,14 @@ async function websitePostReads(id, proposalId = null) {
     }
     el(content, 'h3', tr('Active rules', '生效规则'));
     if (!active.length) el(content, 'p', tr('None', '无'), 'muted');
-    for (const rule of active) {
+    for (const {origin, method, path, access} of active) {
       const row = el(content, 'div', undefined, 'row');
-      endpoint(row, rule);
-      button(row, tr('Remove rule', '移除规则'), async () => {
-        await mutate('web-post-reads/remove', {id, ...rule, revision});
-        await reload();
-      });
+      endpoint(row, {origin, method, path, access});
+      button(row, tr('Remove rule', '移除规则'), () => confirmAction(tr('Remove this rule?', '移除此规则？'),
+        tr('This endpoint returns to the default classification unless another rule applies.', '如无其他适用规则，此接口将恢复默认分类。'), async () => {
+          await mutate('web-operation-rules/remove', {id, origin, method, path, revision});
+          await reload();
+        }));
     }
   }
   populate(initial);

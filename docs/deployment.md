@@ -543,10 +543,11 @@ Cookie 请求头或响应头。旧会话的 Cookie 已绑定到原登录主机�
 工具仍须逐次提交请求。跟随跳转后会返回脱敏的 `final_path`，可用于区分登录页和请求的页面。
 长文本以字符分页；读操作可把 `next_offset` 作为下一次的 `offset`，同时传回 `body_version`，
 避免拼接不同时刻的响应。每页重新向网站读取；写操作没有续页。网站若在普通页面中展示额外的敏感
-信息，该页面也属于获授权 Agent 可读取的数据范围。
+信息，该页面也属于获授权 Agent 可读取的数据范围。响应正文会遮盖已知的长 Cookie 值；
+短值只在对应 Cookie 字段或明确的凭据上下文中遮盖，以保留数量、价格等普通数据。
 
-HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理。HTTP 的 POST、PUT、PATCH、DELETE
-和 GraphQL mutation 按写处理。读写由请求内容决定，同一连接可分别设置审批。只读依赖网站遵循
+默认将 HTTP 的 GET、HEAD、OPTIONS 和 GraphQL query 按读处理，将 HTTP 的 POST、PUT、PATCH、DELETE
+和 GraphQL mutation 按写处理。同一连接可分别设置审批，HTTP 接口可以用下文的规则覆盖默认分类。只读依赖网站遵循
 协议对读写的约定；对提供权限范围的服务，优先使用站点自身的最小权限账号。升级后，旧订单工具的
 授权不会转给通用工具；已保存的会话可继续使用。
 
@@ -571,21 +572,27 @@ YAML 文件需要先转 JSON）或 `graphql`（SDL 文本）。描述每份最�
 后台显示版本、改动和文档，并将 OpenAPI 中的 HTTPS 域名作为待选项。保存域名和更换维护者需管理员
 通行密钥确认；描述发布无需逐次确认。备份时保留 `admin.enc.web-catalogs`（如存在）。
 
-如果某个网站用 POST 读取数据，维护者可以在 `gateway_call_tool` 里调用
-`web_propose_post_reads`，传入 `connection`、`idempotency_key` 和以下 `arguments`：
+网站维护者可以用 `gateway_call_tool` 调用 `web_propose_operation_rules`，提交接口的读写分类。
+传入 `connection`、`idempotency_key` 和以下 `arguments`：
 
 ```json
 {
-  "endpoints": [{"origin": "https://api.example.com", "path": "/orders/query"}],
-  "reason": "This endpoint lists orders; all request bodies only filter results."
+  "rules": [
+    {"origin": "https://api.example.com", "method": "POST", "path": "/orders/query", "access": "read"},
+    {"origin": "https://api.example.com", "method": "GET", "path": "/orders/cancel", "access": "write"}
+  ],
+  "reason": "POST lists orders; GET cancels an order."
 }
 ```
 
-Agent 将返回的 `review_url` 交给管理员。管理员打开链接并用通行密钥批准，也可以在
-「连接器 → 详情 → POST 读取规则」查看提案和撤销规则。每个连接可有一条待审提案，有效期 24 小时。
-批准后，只有匹配域名和精确路径（不含查询参数）的 HTTP POST 请求使用该 Agent 已有的读取权限；
-应仅批准对任意请求体都只读的接口。其他 HTTP 路径和 GraphQL 的判断不变。Agent 可以通过
-`gateway_search_connections` 查看生效的 `post_read_endpoints`。
+Agent 将返回的 `review_url` 交给管理员。管理员用通行密钥批准，或在「连接器 → 详情 → HTTP 操作规则」
+查看及移除规则。每个连接可有一条待审提案，24 小时内有效。生效规则可通过
+`gateway_search_connections` 的 `operation_rules` 查看。
+
+规则按已批准的域名、HTTP 方法和路径匹配，再应用 Agent 现有的读写权限。读取规则只匹配精确路径，
+且不能带查询参数；只有接口对任意请求体都不会写入时才应批准。写入规则覆盖该路径上的查询参数和
+常见路径变体；标为写入的 GET 也会保护同一路径的 HEAD。重定向到写入接口时，需另发请求。
+GraphQL mutation 始终按写入处理；HTTP 读取规则不会改变 GraphQL 分类。
 
 ## 9. 日常操作
 

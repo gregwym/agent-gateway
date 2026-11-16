@@ -21,6 +21,7 @@ from urllib.request import Request
 from graphql import GraphQLError, OperationDefinitionNode, FragmentDefinitionNode, OperationType, parse
 
 from ..web_profiles import ORIGINS_ENV, PROFILE_ENV, SESSION_ENV, WEB_TOOLS, WebProfile, api_origins
+from ..web_operations import HTTP_METHODS, READ_METHODS, operation_access
 from ._base import ConnectorError, Tool, integer, serve, setting, string
 
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -30,12 +31,16 @@ _MAX_OFFSET = MAX_RESPONSE * len(_REDACTED)
 MAX_BODY = 128_000
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 4
-_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
-_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 _COOKIE_NAME = re.compile(r"^[a-zA-Z0-9!#$%&'*+.^_`|~-]{1,128}$")
 _COOKIE_VALUE = re.compile(r"^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]{1,8192}$")
 _JSON_TOKEN = re.compile(r'"(?:[^"\\]++|\\.)*+"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?')
 _JSON_REDACTED = json.dumps(_REDACTED)
+_JSON_KEY_SEPARATOR = re.compile(r"\s*:\s*")
+_MIN_BODY_SECRET_LENGTH = 8
+_COOKIE_ECHO = re.compile(r"""(?<![\w!#$%&'*+.^`|~-])([\w!#$%&'*+.^`|~-]{1,128})=([^\s;,<>&'"]+)""")
+_CREDENTIAL_FIELDS = {"authorization", "cookie", "cookies", "setcookie", "password", "apikey", "token",
+                      "accesstoken", "refreshtoken", "session", "sessionid", "sessiontoken",
+                      "clientsecret", "secret", "csrftoken", "jwt"}
 _TLS = ssl.create_default_context()
 
 
@@ -206,7 +211,7 @@ def _request_headers(values):
     return headers
 
 
-def plan_request(tool, args):
+def plan_request(tool, args, *, operation_rules=(), default_origin=None):
     target = args.get("path")
     parts = _target(target)
     headers = _request_headers(args.get("headers", {}))
@@ -215,9 +220,9 @@ def plan_request(tool, args):
     try:
         if tool == "http_request":
             method = args.get("method")
-            if method not in _METHODS:
+            if method not in HTTP_METHODS:
                 raise _invalid("Unsupported HTTP method.")
-            read = method in _READ_METHODS
+            read = method in READ_METHODS
             if method in ("GET", "HEAD"):
                 follow_redirects = args.get("follow_redirects")
             elif args.get("follow_redirects"):
@@ -249,10 +254,16 @@ def plan_request(tool, args):
         raise _invalid("The request body could not be encoded.") from None
     if body is not None and len(body) > MAX_BODY:
         raise _invalid("The request body is too large.")
+    access = operation_access(operation_rules, args.get("origin", default_origin), method, target,
+                              "read" if read else "write", allow_read_override=tool == "http_request")
     offset, version = args.get("offset", 0), args.get("body_version")
-    if not read and (offset or version is not None):
+    if access == "write" and (offset or version is not None):
         raise _invalid("Only reads can request another response page; replaying a write could change data twice.")
-    return RequestPlan(method, target, headers, body, "read" if read else "write", follow_redirects,
+    if access == "write":
+        if follow_redirects:
+            raise _invalid("Writes cannot follow redirects. Submit the destination as a separate request.")
+        follow_redirects = False
+    return RequestPlan(method, target, headers, body, access, follow_redirects,
                        offset, args.get("max_chars", MAX_TEXT), version, args.get("origin"))
 
 
@@ -292,10 +303,10 @@ def build_tools(handler=None):
                  "by credential redaction. Set follow_redirects=true to follow visible destinations too, or false "
                  "to inspect the first redirect without following it.")
     return [
-        Tool(http, "Make an HTTP request to the connection's website. GET, HEAD and OPTIONS are reads; POST, PUT, PATCH and DELETE are writes." + result + redirects,
+        Tool(http, "Make an HTTP request to the connection's website. By default GET, HEAD and OPTIONS are reads; POST, PUT, PATCH and DELETE are writes. Approved endpoint rules can change the classification." + result + redirects,
              lambda args: handler(http, args),
-             {"path": path, "method": {"type": "string", "enum": list(_METHODS)}, "headers": headers,
-              "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for write methods."},
+             {"path": path, "method": {"type": "string", "enum": list(HTTP_METHODS)}, "headers": headers,
+              "body": {"type": "string", "maxLength": MAX_BODY, "description": "Optional UTF-8 request body for POST, PUT, PATCH or DELETE."},
               "follow_redirects": {"type": "boolean", "description": "Follow same-origin GET or HEAD redirects. If omitted, follow only when the first destination is hidden."}, **paging},
              ("path", "method"), read_only=False),
         Tool(graphql, "Send a GraphQL request to the connection's website. A selected query is a read and a mutation is a write." + result,
@@ -327,7 +338,7 @@ class _WebsiteCookies(DefaultCookiePolicy):
 
 
 class SiteSession:
-    def __init__(self, profile, raw, *, fetch=None, persist=None, redactions=(), extra_origins=()):
+    def __init__(self, profile, raw, *, fetch=None, persist=None, redactions=(), short_cookies=(), extra_origins=()):
         self.profile = profile
         self.origins = frozenset((profile.origin, *extra_origins))
         host = urlsplit(profile.origin).hostname
@@ -338,6 +349,7 @@ class SiteSession:
         self.persist = persist
         self.lock = threading.Lock()
         self.seen_secrets = set(redactions)
+        self.short_cookies = {tuple(pair) for pair in short_cookies}
         for item in items:
             domain = item.get("domain", host)
             self.jar.set_cookie(Cookie(
@@ -354,46 +366,56 @@ class SiteSession:
 
     def _remember_cookies(self):
         for cookie in self.jar:
-            self._remember(cookie.value)
-        if len(self.jar) > 250 or len(self.seen_secrets) > 2000 or sum(map(len, self.seen_secrets)) > 256_000:
+            self._remember(cookie.value, cookie.name)
+        if (len(self.jar) > 250 or len(self.seen_secrets) > 2000 or len(self.short_cookies) > 2000
+                or sum(map(len, self.seen_secrets)) > 256_000):
             raise ConnectorError("The website exceeded the session cookie limit.", "web_response_limit")
 
-    def _remember(self, value):
+    def _remember(self, value, name):
         if value:
-            self.seen_secrets.update((value, quote(value, safe=""), unquote(value), html.escape(value)))
+            variants = {value, quote(value, safe=""), unquote(value), html.escape(value)} - {""}
+            self.seen_secrets.update(variants)
+            if name:
+                self.short_cookies.update((name.casefold(), v) for v in variants if len(v) < _MIN_BODY_SECRET_LENGTH)
 
-    def _redaction_pattern(self, *, body=False):
-        secrets = sorted(self.seen_secrets - {""}, key=len, reverse=True)
-        if secrets:
-            # In prose/markup a short cookie such as "en" or "1" is often
-            # part of an unrelated word or number. Still mask a literal echo.
-            patterns = [r"(?<!\w)" + re.escape(s) + r"(?!\w)" if body and len(s) < 6 else re.escape(s)
-                        for s in secrets]
-            return re.compile("|".join(patterns))
-        return None
+    def _redaction_pattern(self, *, minimum=1):
+        secrets = sorted((s for s in self.seen_secrets if len(s) >= minimum), key=lambda s: (-len(s), s))
+        return re.compile("|".join(map(re.escape, secrets))) if secrets else None
 
     def _redact(self, value):
         pattern = self._redaction_pattern()
         return pattern.sub(_REDACTED, value) if pattern else value
 
     def _redact_body(self, value, content_type):
-        pattern = self._redaction_pattern(body=True)
-        if not pattern:
+        pattern = self._redaction_pattern(minimum=_MIN_BODY_SECRET_LENGTH)
+        short = {s for s in self.seen_secrets if 0 < len(s) < _MIN_BODY_SECRET_LENGTH}
+        if not pattern and not short:
             return value
+
+        def scrub_echoes(text):
+            def replace_echo(match):
+                name, secret = match.groups()
+                return name + "=" + _REDACTED if (name.casefold(), secret) in self.short_cookies else match[0]
+            return _COOKIE_ECHO.sub(replace_echo, text) if self.short_cookies else text
+
+        def scrub_text(text):
+            return scrub_echoes(pattern.sub(_REDACTED, text) if pattern else text)
+
         if content_type != "application/json" and not content_type.endswith("+json"):
-            return pattern.sub(_REDACTED, value)
+            return scrub_text(value)
         try:
             # Validate without converting potentially large numeric literals.
             json.loads(value, parse_int=str, parse_float=str)
         except (ValueError, RecursionError):
-            return pattern.sub(_REDACTED, value)
+            return scrub_text(value)
 
-        matches = iter(pattern.finditer(value))
+        matches = pattern.finditer(value) if pattern else iter(())
         pending = next(matches, None)
         spans_syntax = False
+        field, field_value_at = None, -1
 
         def replace(token):
-            nonlocal pending, spans_syntax
+            nonlocal pending, spans_syntax, field, field_value_at
             raw = token.group()
             quotes = 1 if raw.startswith('"') else 0
             raw_match = False
@@ -403,32 +425,37 @@ class SiteSession:
                     spans_syntax = True
                 raw_match = True
                 pending = next(matches, None)
-            if not quotes:
-                return _JSON_REDACTED if raw_match else raw
-            if "\\" in raw:
-                # A literal echo may also appear in the string's JSON escapes.
-                if raw_match:
+            decoded = (json.loads(raw) if "\\" in raw else raw[1:-1]) if quotes else raw
+            if quotes and (separator := _JSON_KEY_SEPARATOR.match(value, end)):
+                field, field_value_at = decoded.casefold(), separator.end()
+            elif start == field_value_at and short:
+                # Keep ordinary scalars such as quantity=1. Only a named
+                # cookie or a credential field gives a short match meaning.
+                if (field, decoded) in self.short_cookies or (
+                        re.sub(r"[^a-z0-9]", "", field) in _CREDENTIAL_FIELDS
+                        and (decoded in short or decoded.removeprefix("Bearer ") in short)):
                     return _JSON_REDACTED
-                decoded = json.loads(raw)
-            else:
-                decoded = raw[1:-1]
-            scrubbed = pattern.sub(_REDACTED, decoded)
+            if raw_match and (not quotes or "\\" in raw):
+                return _JSON_REDACTED
+            if not quotes:
+                return raw
+            scrubbed = scrub_text(decoded)
             return json.dumps(scrubbed) if scrubbed != decoded else raw
 
         rendered = _JSON_TOKEN.sub(replace, value)
         # A match across JSON punctuation cannot be replaced within one value.
         return _JSON_REDACTED if spans_syntax or pending else rendered
 
-    def request(self, tool, arguments):
-        plan = plan_request(tool, arguments)
+    def request(self, tool, arguments, *, operation_rules=()):
+        plan = plan_request(tool, arguments, operation_rules=operation_rules, default_origin=self.profile.origin)
         if not self.lock.acquire(timeout=2):
             raise ConnectorError("Another request is in progress for this website session.", "web_session_busy")
         try:
-            return self._request(plan)
+            return self._request(plan, operation_rules)
         finally:
             self.lock.release()
 
-    def _request(self, plan):
+    def _request(self, plan, operation_rules):
         started = time.monotonic()
         target = plan.target
         origin = plan.origin if plan.origin is not None else self.profile.origin
@@ -442,6 +469,11 @@ class SiteSession:
             result, location = self._request_hop(origin, plan, target, started)
             if follow is None and result.get("location_redacted"):
                 follow = True
+            if (location is not None and follow and result["status"] in _REDIRECT_STATUSES and
+                    operation_access(operation_rules, origin, plan.method, location, "read",
+                                     allow_read_override=False) == "write"):
+                result.update(redirect_blocked=True, redirect_reason="destination_is_write")
+                follow = False
             if location is None or not follow or result["status"] not in _REDIRECT_STATUSES:
                 if len(visited) > 1:
                     result["redirects_followed"] = len(visited) - 1
@@ -469,7 +501,7 @@ class SiteSession:
             raise ConnectorError("The website session has expired. Sign in again.", "web_login_required")
         self.jar.add_cookie_header(request)
         prior_state = self._cookies()
-        prior_secrets = len(self.seen_secrets)
+        prior_secrets = (len(self.seen_secrets), len(self.short_cookies))
 
         def receive(status, headers, stream):
             # Track rotated values before looking at the body; they may be echoed within it.
@@ -477,19 +509,21 @@ class SiteSession:
             if sum(map(len, rotating)) > 60_000:
                 raise ConnectorError("The website exceeded the session cookie limit.", "web_response_limit")
             for item in rotating:
-                value = item.split(";", 1)[0].partition("=")[2].strip('"')
+                name, _, value = item.split(";", 1)[0].partition("=")
+                value = value.strip('"')
                 if _COOKIE_VALUE.fullmatch(value):
-                    self._remember(value)
+                    self._remember(value, name if _COOKIE_NAME.fullmatch(name) else None)
             self.jar.extract_cookies(SimpleNamespace(info=lambda: headers), request)
             for cookie in list(self.jar):
                 if not _COOKIE_NAME.fullmatch(cookie.name) or not _COOKIE_VALUE.fullmatch(cookie.value or ""):
                     self.jar.clear(cookie.domain, cookie.path, cookie.name)
             self._remember_cookies()
             current_state = self._cookies()
-            if self.persist and (current_state != prior_state or len(self.seen_secrets) != prior_secrets):
+            if self.persist and (current_state != prior_state or
+                                 (len(self.seen_secrets), len(self.short_cookies)) != prior_secrets):
                 from ..credentials import SecretStoreError
                 try:
-                    self.persist(current_state, self.seen_secrets)
+                    self.persist(current_state, self.seen_secrets, self.short_cookies)
                 except (OSError, SecretStoreError):
                     self.jar.clear()
                     raise ConnectorError("The updated browser session could not be saved.", "web_session_storage_failed") from None
@@ -549,8 +583,8 @@ class SiteSession:
         except (OSError, http.client.HTTPException):
             raise ConnectorError("The website could not be reached.", "connector_network_failed") from None
 
-    def tools(self):
-        return build_tools(self.request)
+    def tools(self, operation_rules=()):
+        return build_tools(lambda tool, args: self.request(tool, args, operation_rules=operation_rules))
 
 
 def main():

@@ -20,6 +20,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .mail_address import email_address
+from .web_operations import HTTP_METHODS
 
 NAME = r"^[a-z][a-z0-9_-]{0,47}$"
 # Deliberately narrower than what MCP allows: no dots, so names survive every client.
@@ -182,12 +183,25 @@ def valid_mailbox_paths(paths):
             and len(set(paths)) == len(paths))
 
 
-MAX_WEB_POST_READS = 64
+MAX_WEB_OPERATION_RULES = 64
 
 
-class WebPostRead(_Model):
+class WebOperationRule(_Model):
     origin: str = Field(max_length=255)
+    method: str
     path: str = Field(max_length=512)
+    access: Literal["read", "write"]
+
+    @field_validator("method")
+    @classmethod
+    def _method(cls, method):
+        if method not in HTTP_METHODS:
+            raise ValueError("Unsupported HTTP method")
+        return method
+
+    @property
+    def endpoint(self):
+        return self.origin, self.method, self.path
 
     @field_validator("path")
     @classmethod
@@ -210,7 +224,7 @@ class ConnectionCfg(_Model):
     mailbox_email: str | None = None
     mailbox_aliases: list[str] = Field(default_factory=list, max_length=50)
     mailbox_access: dict[str, list[str]] = Field(default_factory=dict, max_length=100)
-    web_post_reads: list[WebPostRead] = Field(default_factory=list, max_length=MAX_WEB_POST_READS)
+    web_operation_rules: list[WebOperationRule] = Field(default_factory=list, max_length=MAX_WEB_OPERATION_RULES)
     plugin: str | None = Field(None, pattern=NAME)
     transport: Literal["stdio", "http"]
 
@@ -231,6 +245,20 @@ class ConnectionCfg(_Model):
     verify_interval_seconds: float = Field(300, gt=0)
     tools: list[ToolCfg]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_web_rules(cls, raw):
+        if isinstance(raw, dict) and "web_post_reads" in raw:
+            raw = dict(raw)
+            if "web_operation_rules" in raw:
+                raise ValueError("Use one website operation rules field")
+            previous = raw.pop("web_post_reads")
+            if not isinstance(previous, list) or any(not isinstance(rule, dict) or set(rule) != {"origin", "path"}
+                                                     for rule in previous):
+                raise ValueError("Invalid POST read rules")
+            raw["web_operation_rules"] = [{**rule, "method": "POST", "access": "read"} for rule in previous]
+        return raw
+
     @field_validator("mailbox_email", "mailbox_aliases")
     @classmethod
     def _mail_addresses(cls, value):
@@ -247,15 +275,15 @@ class ConnectionCfg(_Model):
         if self.plugin and "AGW_WEB_PROFILE" in self.env:
             from .web_profiles import SESSION_ENV, WEB_TOOLS, connection_origins
             origins = connection_origins(self)
-            endpoints = {(rule.origin, rule.path) for rule in self.web_post_reads}
-            if len(endpoints) != len(self.web_post_reads) or any(origin not in origins for origin, _ in endpoints):
-                raise ValueError(f"{where}: POST read rules must be unique and use an approved origin")
+            endpoints = {rule.endpoint for rule in self.web_operation_rules}
+            if len(endpoints) != len(self.web_operation_rules) or any(origin not in origins for origin, _, _ in endpoints):
+                raise ValueError(f"{where}: Website operation rules must have unique endpoints on approved origins")
             if set(self.secret_env) != {SESSION_ENV}:
                 raise ValueError(f"{where}: Website connections require one browser session")
             if any(t.access is not None for t in self.tools if t.upstream in WEB_TOOLS):
                 raise ValueError(f"{where}: Website request tools classify each operation automatically")
-        elif self.web_post_reads:
-            raise ValueError(f"{where}: POST read rules require a Website connection")
+        elif self.web_operation_rules:
+            raise ValueError(f"{where}: Website operation rules require a Website connection")
         if self.mailbox_access:
             from .catalog_sync import bundled_kind
             if bundled_kind(self) not in ("imap", "gmail"):

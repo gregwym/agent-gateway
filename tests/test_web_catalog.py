@@ -5,11 +5,12 @@ import json
 import pytest
 from mcp import MCPError
 
+from agent_gateway.config import ConnectionCfg
 from agent_gateway.connectors import web
-from agent_gateway.web_catalog import GET_DESCRIPTION, PROPOSE_POST_READS, PUBLISH_DESCRIPTION
+from agent_gateway.web_catalog import GET_DESCRIPTION, PROPOSE_OPERATION_RULES, PUBLISH_DESCRIPTION
 from agent_gateway.web_profiles import SESSION_ENV
-from helpers import TOKEN_A, TOKEN_B, agent
-from passkey_helpers import TOKEN_A2
+from helpers import TOKEN_A, TOKEN_B, agent, text_of
+from passkey_helpers import Page, TOKEN_A2, request_id_in, wait_for_approval
 from test_admin import change, login, setup, state, web_gateway
 from test_discovery import execute, search
 from test_web_connector import payload, response, start_site
@@ -127,11 +128,13 @@ async def test_agents_publish_with_version_and_idempotency_without_granting_acce
             assert (await execute(client, GET_DESCRIPTION, "shop", {"revision": 1})).structured_content["document"] == document
 
 
-async def test_post_read_proposal_requires_passkey_and_matches_exact_endpoint(tmp_path, monkeypatch):
+async def test_operation_rule_proposal_requires_passkey_and_matches_exact_endpoint(tmp_path, monkeypatch):
     calls = []
 
     def fetch(host, target, method, headers, body, receive):
         calls.append((host, target, method))
+        if target == "/entry":
+            return response(receive, status=307, location="/%63heckout?confirm=yes")
         return response(receive, b'{}', content_type="application/json")
 
     monkeypatch.setattr(web, "_fetch", fetch)
@@ -143,58 +146,75 @@ async def test_post_read_proposal_requires_passkey_and_matches_exact_endpoint(tm
         assert (await change(http, "permissions/connection", connection="shop", client="agent-a2",
                              access="read_write_approval")).status_code == 200
 
-        rule = {"origin": API, "path": "/orders"}
-        proposal_body = {"endpoints": [rule], "reason": "Lists orders; the body only filters the result."}
-        call = {"method": "POST", **rule}
+        rule = {"origin": API, "method": "POST", "path": "/orders", "access": "read"}
+        write_rule = {"origin": API, "method": "GET", "path": "/checkout", "access": "write"}
+        proposal_body = {"rules": [rule, write_rule], "reason": "Lists orders by POST and starts checkout by GET."}
+        call = {k: v for k, v in rule.items() if k != "access"}
+        action = {k: v for k, v in write_rule.items() if k != "access"}
+        action["path"] += "?confirm=yes"
+        legacy = gw.app.state.admin.runtime.gateway.cfg.connection("shop").model_dump(exclude={"web_operation_rules"})
+        migrated = ConnectionCfg.model_validate({**legacy, "web_post_reads": [{"origin": API, "path": rule["path"]}]})
+        assert [r.model_dump() for r in migrated.web_operation_rules] == [rule]
         async with (agent(origin + "/mcp", TOKEN_A) as maintainer, agent(origin + "/mcp", TOKEN_A2) as other,
                     agent(origin + "/mcp", TOKEN_B) as outsider):
-            found = await search(maintainer, "tools", query=PROPOSE_POST_READS, connection="shop")
-            assert [t["name"] for t in found["tools"]] == [PROPOSE_POST_READS]
+            found = await search(maintainer, "tools", query=PROPOSE_OPERATION_RULES, connection="shop")
+            assert [t["name"] for t in found["tools"]] == [PROPOSE_OPERATION_RULES]
             for client in (other, outsider):
-                assert (await search(client, "tools", query=PROPOSE_POST_READS))["total"] == 0
+                assert (await search(client, "tools", query=PROPOSE_OPERATION_RULES))["total"] == 0
                 with pytest.raises(MCPError, match="Unknown tool"):
-                    await execute(client, PROPOSE_POST_READS, "shop", proposal_body)
+                    await execute(client, PROPOSE_OPERATION_RULES, "shop", proposal_body)
             for invalid in ({**rule, "origin": "https://other.example.test"},
                             *({**rule, "path": path} for path in ("/orders?x=1", "/%6frders", "/a/../orders", "//orders", "/orders/{id}"))):
-                refused = await execute(maintainer, PROPOSE_POST_READS, "shop", {**proposal_body, "endpoints": [invalid]})
-                assert refused.is_error and refused.structured_content["error"] == "web_post_read_invalid"
+                refused = await execute(maintainer, PROPOSE_OPERATION_RULES, "shop", {**proposal_body, "rules": [invalid]})
+                assert refused.is_error and refused.structured_content["error"] == "web_operation_rule_invalid"
 
             def submit(body=proposal_body):
-                return execute(maintainer, PROPOSE_POST_READS, "shop", body)
+                return execute(maintainer, PROPOSE_OPERATION_RULES, "shop", body)
 
             revision = (await state(http))["revision"]
             first = (await submit()).structured_content
             assert first["status"] == "pending_admin_review"
-            assert first["review_url"].endswith("review_post_reads=shop&proposal=" + first["proposal_id"])
+            assert first["review_url"].endswith("review_operation_rules=shop&proposal=" + first["proposal_id"])
             assert (await submit()).structured_content["proposal_id"] == first["proposal_id"]
-            conflicting = await submit({**proposal_body, "endpoints": [{**rule, "path": "/status"}]})
-            assert conflicting.structured_content["error"] == "web_post_read_pending"
+            conflicting = await submit({**proposal_body, "rules": [{**rule, "path": "/status"}]})
+            assert conflicting.structured_content["error"] == "web_operation_rule_pending"
             assert (await execute(maintainer, "web_http_request", "shop", call)).is_error
             assert (await state(http))["revision"] == revision and not calls
-            reject = await change(http, "web-post-reads/decide", id="shop", proposal=first["proposal_id"], decision="reject")
+            assert payload(await execute(maintainer, "web_http_request", "shop", action))["status"] == 200
+            assert calls.pop() == ("api.example.test", action["path"], "GET")
+            reject = await change(http, "web-operation-rules/decide", id="shop", proposal=first["proposal_id"], decision="reject")
             assert reject.json()["status"] == "rejected"
             assert (await execute(maintainer, "web_http_request", "shop", call)).is_error
 
             second = (await submit()).structured_content
             assert second["proposal_id"] != first["proposal_id"]
-            view = (await http.post("/admin/api/web-post-reads/view",
+            view = (await http.post("/admin/api/web-operation-rules/view",
                                     json={"id": "shop", "proposal": second["proposal_id"]})).json()
-            assert view["active"] == [] and view["proposal"]["endpoints"] == [rule]
+            assert view["active"] == [] and view["proposal"]["rules"] == [write_rule, rule]
             decision = {"id": "shop", "proposal": second["proposal_id"], "decision": "approve"}
-            unconfirmed = await http.post("/admin/api/web-post-reads/decide", json={**decision, "revision": revision})
+            unconfirmed = await http.post("/admin/api/web-operation-rules/decide", json={**decision, "revision": revision})
             assert unconfirmed.status_code == 403 and unconfirmed.json()["error"] == "admin_confirmation_required"
             assert (await execute(maintainer, "web_http_request", "shop", call)).is_error and not calls
-            approved = await change(http, "web-post-reads/decide", **decision)
+            approved = await change(http, "web-operation-rules/decide", **decision)
             assert approved.status_code == 200, approved.text
 
             assert payload(await execute(maintainer, "web_http_request", "shop", call))["status"] == 200
             assert calls == [("api.example.test", "/orders", "POST")]
-            assert (await search(maintainer, "connections", query="shop"))["connections"][0]["post_read_endpoints"] == [rule]
+            assert (await search(maintainer, "connections", query="shop"))["connections"][0]["operation_rules"] == [write_rule, rule]
+            for method in ("GET", "HEAD"):
+                for target in (action["path"], "/checkout/", "/%63heckout", "/other/../Checkout", "/checkout;foo=1"):
+                    denied = await execute(maintainer, "web_http_request", "shop", {**action, "method": method, "path": target})
+                    assert denied.is_error
+            redirect = await execute(maintainer, "web_http_request", "shop",
+                                     {**action, "path": "/entry", "follow_redirects": True})
+            blocked = payload(redirect)
+            assert blocked["status"] == 307 and blocked["redirect_reason"] == "destination_is_write"
+            assert calls.pop() == ("api.example.test", "/entry", "GET")
             for changed_call in ({**call, "path": other_path} for other_path in ("/orders/", "/orders?x=1", "/orders/submit", "/%6frders")):
                 assert (await execute(maintainer, "web_http_request", "shop", changed_call)).is_error
             assert (await execute(maintainer, "web_http_request", "shop", {**call, "origin": MAIN})).is_error
             assert (await execute(maintainer, "web_graphql_request", "shop",
-                                  {**rule, "query": "mutation { checkout }"})).is_error
+                                  {"origin": API, "path": rule["path"], "query": "mutation { checkout }"})).is_error
             for args in (call, {**call, "path": "/checkout"}):
                 pending = await execute(other, "web_http_request", "shop", args)
                 assert pending.structured_content["status"] == "pending"
@@ -204,7 +224,16 @@ async def test_post_read_proposal_requires_passkey_and_matches_exact_endpoint(tm
             for args in ({**call, "path": "/checkout"}, {**call, "path": "/payment"}, {**call, "path": "/cancel"}):
                 pending = await execute(maintainer, "web_http_request", "shop", args)
                 assert pending.structured_content["status"] == "pending"
-            assert len(calls) == 2
+            pending = await execute(maintainer, "web_http_request", "shop", action, idempotency_key="get-write")
+            assert pending.structured_content["status"] == "pending" and len(calls) == 2
+            assert (await Page(origin, origin).decide("approve", request_id_in(text_of(pending)), key, origin=origin))[0] == 200
+            finished = await wait_for_approval(maintainer, "get-write")
+            assert finished.structured_content["status"] == "succeeded"
+            assert calls[-1] == ("api.example.test", action["path"], "GET") and len(calls) == 3
+            removal = {k: v for k, v in write_rule.items() if k != "access"}
+            unconfirmed = await http.post("/admin/api/web-operation-rules/remove",
+                                          json={"id": "shop", **removal, "revision": (await state(http))["revision"]})
+            assert unconfirmed.json()["error"] == "admin_confirmation_required"
             assert (await change(http, "permissions/connection", connection="shop", client="agent-a",
                                  access="read")).status_code == 200
 
@@ -277,15 +306,16 @@ async def test_mobile_admin_reviews_catalog_versions_and_approves_origin(tmp_pat
         async with agent(origin + "/mcp", TOKEN_A) as writer:
             entries = await search(writer, "connections", query="shop")
             assert entries["connections"][0]["api_origins"] == [API]
-            result = await execute(writer, PROPOSE_POST_READS, "shop", {
-                "endpoints": [{"origin": API, "path": "/orders"}], "reason": "Lists orders."
+            result = await execute(writer, PROPOSE_OPERATION_RULES, "shop", {
+                "rules": [{"origin": API, "method": "POST", "path": "/orders", "access": "read"}], "reason": "Lists orders."
             })
             await page.goto(result.structured_content["review_url"])
-            rules = page.get_by_role("dialog", name="POST 读取规则 · shop", exact=True)
+            rules = page.get_by_role("dialog", name="HTTP 操作规则 · shop", exact=True)
             await playwright.expect(rules.get_by_text("POST " + API + "/orders", exact=True)).to_be_visible()
-            await rules.get_by_role("button", name="批准为读取", exact=True).tap()
+            await rules.get_by_role("button", name="批准规则", exact=True).tap()
             await playwright.expect(rules.get_by_text("已批准", exact=True)).to_be_visible()
             await rules.get_by_role("button", name="移除规则", exact=True).tap()
+            await page.get_by_role("dialog", name="移除此规则？").get_by_role("button", name="确认", exact=True).tap()
             await playwright.expect(rules.get_by_text("无", exact=True)).to_be_visible()
 
 

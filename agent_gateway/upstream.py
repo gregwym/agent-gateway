@@ -70,7 +70,7 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         web = (web_sessions.get(conn, secrets) if web_sessions else
                SiteSession(WebProfile.saved(conn.env[PROFILE_ENV]), secrets[conn.secret_env[SESSION_ENV]],
                            extra_origins=api_origins(conn.env.get(ORIGINS_ENV, "[]"))))
-        async with _client(conn, build_server(conn.service, web.tools())) as client:
+        async with _client(conn, build_server(conn.service, web.tools(conn.web_operation_rules))) as client:
             yield client
     elif conn.transport == "stdio":
         # The SDK starts the child with a minimal environment (HOME, PATH, ...) plus
