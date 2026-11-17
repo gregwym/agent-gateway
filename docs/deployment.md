@@ -530,8 +530,14 @@ Compose 的 `browser` 服务提供管理员专用的临时登录窗口，可加�
 它不挂载网关数据，也不能访问内网。保存时只保留连接站点和已批准 API 来源范围内的 Cookie，
 关闭窗口后清除临时浏览器数据。依赖手机本机通行密钥的站点登录方式无法在此窗口使用。
 
-「高级：导入会话文件」支持 Cookie JSON 数组或 Playwright `storageState`。也可用
-`python -m examples.export_web_session amazon-us ./browser-session.json`（Weee 用 `weee-orders`）。
+服务器上的登录窗口是无头 Chromium，带自动化标记，输入以整段文本送入。Amazon 等使用风控脚本的站点
+可能因此拒绝登录或反复回到登录页；这类站点改用下面的会话文件。
+
+「高级：导入会话文件」支持 Cookie JSON 数组或 Playwright `storageState`。在自己的电脑上运行
+`python -m examples.export_web_session amazon-us ./browser-session.json`（Weee 用 `weee-orders`）：
+它用本机 Chrome 和一个新的临时 profile 打开站点，不带任何自动化或调试参数；登录时勾选「保持登录」，
+然后退出这个 Chrome 窗口。脚本再以无头方式打开同一 profile，只读取该站点的 Cookie，随后删除 profile。
+不会读取日常使用的 Chrome profile。只在浏览器关闭前有效的会话无法导出。
 导入后删除文件。备份包括 `admin.enc` 和存在时的 `admin.enc.web-sessions`。
 
 所有网站连接共用 `web_http_request` 和 `web_graphql_request`。Agent 指定连接与相对路径，读取
