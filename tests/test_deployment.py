@@ -246,7 +246,7 @@ async def test_isolated_browser_container_starts_and_renders_without_network():
         assert metadata["HostConfig"]["NetworkMode"] == "none"
         assert [mount["Destination"] for mount in metadata["Mounts"]] == ["/browser"]
         probe = """
-import base64, socket, time
+import base64, time
 import httpx2
 http = httpx2.Client(transport=httpx2.HTTPTransport(uds='/browser/control.sock'), timeout=25)
 for _ in range(75):
@@ -261,8 +261,11 @@ ident='0123456789abcdef01234567'
 def call(op, **kw):
     r=http.post('http://browser/'+op,json=dict(id=ident,**kw))
     return r.raise_for_status().json()
-assert call('start', url='data:text/html,<h1>Simulated login</h1>',
-            navigation=['www.amazon.com'], expires=time.time()+50)['width'] == 420
+# Match the display settings that the Gateway sends to the worker. This
+# in-memory page needs no network connection or login account.
+viewport = {'width': 420, 'height': 620}
+assert call('start', url='data:text/html,<h1>Simulated login</h1>', viewport=viewport,
+            touch=False, user_agent=None, expires=time.time()+50) == viewport
 assert base64.b64decode(call('frame')['image']).startswith(b'\\xff\\xd8')
 assert call('close') == {}
 """
