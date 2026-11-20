@@ -104,6 +104,8 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 assert sent['structuredContent']['status'] == 'succeeded'
                 outcome = json.loads(sent['content'][1]['text'])
                 assert outcome['results'] == [{'recipient': 'ok@example.test', 'status': 'accepted'}]
+                # pymap marks no folder \Sent: the copy fails on its own and the send still succeeds, once.
+                assert outcome['sent_copy']['status'] == 'failed' and outcome['sent_copy']['code'] == 'imap_sent_folder_missing'
                 assert len(messages) == 1
                 repeat = await send(args)
                 assert repeat['structuredContent']['idempotency_key'] == request_id and len(messages) == 1

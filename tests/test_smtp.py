@@ -8,10 +8,12 @@ import threading
 from contextlib import contextmanager
 
 import pytest
+from imapclient import IMAPClient
 
 from agent_gateway.connectors._base import ConnectorError
 from agent_gateway.connectors._smtp import Submission, address_literal
-from service_helpers import localhost_certificate
+from agent_gateway.connectors.imap_mail import Mailbox
+from service_helpers import localhost_certificate, mail_account
 
 
 @contextmanager
@@ -141,6 +143,66 @@ def test_smtp_credential_gate_and_certificate_validation(tmp_path, monkeypatch):
                 sender.check({})
             assert failure.value.code == "smtp_credentials_rejected"
         assert events.count("AUTH") == 1 and not messages
+
+
+def test_sent_copy_is_the_submitted_message_saved_once_to_the_sent_folder(tmp_path, monkeypatch):
+    with mail_account(tmp_path / "imap", "account@example.test", "fake-app-password") as account:
+        with smtp_server(tmp_path / "smtp", cert_pair=(account.cert, account.cert.parent / "key.pem")) as (port, cert, events, messages, _):
+            monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+            # pymap does not announce RFC 6154 special-use flags; mark its Sent folder as real servers do.
+            listed = IMAPClient.list_folders
+            monkeypatch.setattr(IMAPClient, "list_folders", lambda self, *a, **k: [
+                ((*flags, b"\\Sent") if name == "Sent" else flags, delimiter, name) for flags, delimiter, name in listed(self, *a, **k)])
+            with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as inspect:
+                inspect.login(account.user, account.password)
+                inspect.select_folder("Sent", readonly=True)
+                before = set(inspect.search(["ALL"]))
+            mailbox = Mailbox("localhost", account.front.port, account.user, account.password)
+            sender = Submission("localhost", port, "starttls", "account@example.test", "fake-app-password", "account@example.test",
+                                sent_copy=mailbox.save_sent)
+            result = sender.send({"to": ["ok@example.test", "bad@example.test"], "bcc": ["private@example.test"],
+                                  "subject": "中文 copy", "text": "hello\n.\nworld", "html": "<p>hello</p>"})
+            assert [r["status"] for r in result["results"]] == ["accepted", "rejected", "accepted"]
+            assert result["sent_copy"] == {"status": "saved", "mailbox": "Sent"}
+            assert events.count("DATA") == len(messages) == 1
+            with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as inspect:
+                inspect.login(account.user, account.password)
+                inspect.select_folder("Sent", readonly=True)
+                new = sorted(set(inspect.search(["ALL"])) - before)
+                assert len(new) == 1
+                saved = inspect.fetch(new, ["FLAGS", "BODY.PEEK[]"])[new[0]]
+            assert b"\\Seen" in saved[b"FLAGS"]
+            assert saved[b"BODY[]"] == messages[0][1]  # byte-for-byte what SMTP received, same Message-ID, no Bcc
+            assert email.message_from_bytes(saved[b"BODY[]"])["Message-ID"] == result["message_id"]
+
+
+@pytest.mark.parametrize("to, disconnect", [(["bad@example.test"], False), (["ok@example.test"], True)])
+def test_no_sent_copy_without_an_accepted_recipient_or_a_known_outcome(tmp_path, monkeypatch, to, disconnect):
+    with smtp_server(tmp_path, disconnect_data=disconnect) as (port, cert, events, messages, _):
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        copies = []
+        sender = Submission("localhost", port, "starttls", "account@example.test", "fake-app-password", "account@example.test",
+                            sent_copy=copies.append)
+        result = sender.send({"to": to, "subject": "no copy", "text": "body"})
+        assert result["results"][0]["status"] == ("unknown" if disconnect else "rejected")
+        assert result["sent_copy"]["status"] == "skipped" and not copies
+
+
+def test_a_failed_sent_copy_never_fails_or_repeats_the_submission(tmp_path, monkeypatch):
+    with smtp_server(tmp_path) as (port, cert, events, messages, _):
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        copies = []
+
+        def broken(raw):
+            copies.append(raw)
+            raise RuntimeError("mailbox exploded")
+
+        sender = Submission("localhost", port, "starttls", "account@example.test", "fake-app-password", "account@example.test",
+                            sent_copy=broken)
+        result = sender.send({"to": ["ok@example.test"], "subject": "copy fails", "text": "body"})
+        assert result["results"] == [{"recipient": "ok@example.test", "status": "accepted"}]
+        assert result["sent_copy"] == {"status": "failed", "code": "sent_copy_failed", "error": "The Sent copy could not be saved."}
+        assert len(copies) == 1 and events.count("DATA") == len(messages) == 1
 
 
 @pytest.mark.parametrize("recipient", ["somebody\r\nBcc: secret@example.test", "Name <x@example.test>", "a@b@example.test"])

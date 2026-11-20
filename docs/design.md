@@ -307,7 +307,7 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 | 项 | 值 |
 |---|---|
-| 待审批请求的有效期 | `request_ttl_seconds`，默认 10 分钟 |
+| 待审批请求的有效期 | `request_ttl_seconds`，默认 1 小时；按创建时的设置记录到期时间，修改后只影响新请求 |
 | 批准后开始执行的期限 | `grant_ttl_seconds`，默认 10 分钟；领取一次即失效 |
 | 被拒绝后 | 拒绝后的 `request_ttl_seconds` 内，同一次调用直接回答「已被拒绝」，不产生新的请求 |
 | 撤回 | 已批准未使用的请求可以在页面上用 Passkey 撤回，或由管理员 `agw approval cancel` |

@@ -84,7 +84,7 @@ class ApprovalsCfg(_Model):
     # bound to this hostname by the browser, so changing it later means enrolling again.
     origin: str
     store: Path
-    request_ttl_seconds: int = Field(600, ge=60, le=86_400)  # how long a request waits for a decision
+    request_ttl_seconds: int = Field(3_600, ge=60, le=86_400)  # how long a request waits for a decision
     grant_ttl_seconds: int = Field(600, ge=30, le=3_600)  # how long an approved call may be used, once
 
     @model_validator(mode="after")

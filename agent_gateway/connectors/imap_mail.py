@@ -88,6 +88,38 @@ class Mailbox:
                 raise ConnectorError("The mail server refused the request (for example: no such mailbox).") from None
         raise ConnectorError(_UNREACHABLE)
 
+    def save_sent(self, raw: bytes) -> dict[str, Any]:
+        """Append an already submitted message to the \\Sent folder, marked read. Reports instead of raising."""
+        from ._imap_ops import refusal, special_folders
+
+        def find(client: IMAPClient) -> str:
+            matches = special_folders(client.list_folders(), "\\Sent")
+            if len(matches) != 1:
+                raise ConnectorError("The mail server did not identify exactly one Sent folder (special-use \\Sent).", "imap_sent_folder_missing")
+            return matches[0]
+
+        def append(client: IMAPClient) -> None:
+            try:
+                client.append(folder, raw, flags=(b"\\Seen",))
+            except imaplib.IMAP4.abort:
+                raise
+            except imaplib.IMAP4.error as exc:
+                code, message = refusal(exc)
+                raise ConnectorError(message, code) from None
+
+        try:
+            folder = self.run(find)
+        except ConnectorError as exc:
+            return {"status": "failed", "code": exc.code or "imap_operation_refused", "error": str(exc)}
+        try:
+            self.run(append, retry=False)  # an APPEND is never replayed automatically
+        except ConnectorError as exc:
+            if exc.code == "imap_server_unreachable":
+                return {"status": "unknown", "mailbox": folder, "code": exc.code,
+                        "error": "The connection was lost during the copy; it may have been saved. Check the Sent folder."}
+            return {"status": "failed", "mailbox": folder, "code": exc.code or "imap_operation_refused", "error": str(exc)}
+        return {"status": "saved", "mailbox": folder}
+
     def _drop(self) -> None:
         if self._client is not None:
             _close(self._client)
@@ -244,15 +276,16 @@ def main() -> None:
     password = setting("IMAP_PASSWORD")
     icloud = host.lower() == "imap.mail.me.com"
     sender = os.environ.get("SMTP_SENDER") or (username + "@icloud.com" if icloud and "@" not in username else username)
-    submission = Submission(os.environ.get("SMTP_HOST", "smtp.mail.me.com" if icloud else ""),
-                            int(setting("SMTP_PORT", "587")), setting("SMTP_SECURITY", "starttls"),
-                            os.environ.get("SMTP_USERNAME") or (sender if icloud else username), password, sender)
     mail = Mailbox(
         host=host,
         port=int(setting("IMAP_PORT", "993")),
         username=username,
         password=password,
     )
+    submission = Submission(os.environ.get("SMTP_HOST", "smtp.mail.me.com" if icloud else ""),
+                            int(setting("SMTP_PORT", "587")), setting("SMTP_SECURITY", "starttls"),
+                            os.environ.get("SMTP_USERNAME") or (sender if icloud else username), password, sender,
+                            sent_copy=mail.save_sent)
     serve(
         "imap-mail",
         build_tools(
