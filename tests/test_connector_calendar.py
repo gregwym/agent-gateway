@@ -116,7 +116,9 @@ async def ask(client, tool: str, **arguments):
 async def test_calendars_events_and_conflicts(server, tmp_path):
     async with running_gateway(await prepare(tmp_path, config(server.url), secrets=SECRETS)) as gw:
         async with agent(gw.url, TOKEN_A) as a:
-            assert await ask(a, "a_cal_list_calendars") == [{"calendar": "home", "name": "Home"}, {"calendar": "family", "name": "Family"}]
+            # The server lists calendars in its own (here: directory) order; no order is promised.
+            listed = await ask(a, "a_cal_list_calendars")
+            assert sorted(listed, key=lambda c: c["calendar"]) == [{"calendar": "family", "name": "Family"}, {"calendar": "home", "name": "Home"}]
 
             week = await ask(a, "a_cal_list_events", start="2026-11-15", end="2026-11-22")
             assert (week["start"], week["end"]) == ("2026-11-15T00:00:00-08:00", "2026-11-22T00:00:00-08:00")
