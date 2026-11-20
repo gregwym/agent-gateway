@@ -1,7 +1,6 @@
 """SMTP submission for the same mailbox connection and app-specific password."""
 from __future__ import annotations
 
-import re
 import smtplib
 import socket
 import ssl
@@ -34,7 +33,7 @@ class Submission:
     def __init__(self, host, port, security, username, password, sender, sent=None):
         self.host, self.port, self.security = host, port, security
         self.username, self.password, self.sender = username, password, sender
-        self.sent = sent  # a _sent.SentCopies that keeps the copy in Sent
+        self.sent = sent  # a _sent.SentCopies that files the copy in Sent
         self.gate = CredentialGate("SMTP rejected the account credentials. Check the SMTP username and app-specific password in this mail connection.", code="smtp_credentials_rejected")
 
     def open(self):
@@ -87,8 +86,8 @@ class Submission:
     def send(self, args):
         groups = {key: [address(v) for v in args.get(key, [])] for key in ("to", "cc", "bcc")}
         recipients = list(dict.fromkeys(v for values in groups.values() for v in values))
-        if not 1 <= len(recipients) <= MAX_RECIPIENTS:
-            raise ConnectorError(f"Use between 1 and {MAX_RECIPIENTS} recipients in total.", "smtp_recipient_limit")
+        if not 1 <= len(recipients) <= 50:
+            raise ConnectorError("Use between 1 and 50 recipients in total.", "smtp_recipient_limit")
         sender = address(self.sender)
         msg = EmailMessage()
         msg["From"], msg["To"] = sender, ", ".join(groups["to"])
@@ -101,128 +100,72 @@ class Submission:
         msg.set_content(args["text"])
         if args.get("html"):
             msg.add_alternative(args["html"], subtype="html")
-        # Flatten once: these exact bytes are submitted and, if needed, appended to Sent.
+        # Flatten once: these bytes are submitted, and kept in Sent with the Bcc line a mail client would keep.
         raw = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
-        # Where the server does not file sent mail itself, the sender's own copy (envelope only) goes to Sent.
-        self_bcc = bool(self.sent) and self.sent.self_bcc(recipients)
-        outcome, refused, recorded = self._submit(sender, recipients + [sender] * self_bcc, raw, message_id, self_bcc)
-        if isinstance(outcome, tuple):
-            code, error = outcome
-            return {"message_id": message_id, "results": [{"recipient": r, "status": "rejected", "smtp_code": code, "error": error} for r in recipients],
+        copy = (b"Bcc: " + ", ".join(groups["bcc"]).encode() + b"\r\n" if groups["bcc"] else b"") + raw
+
+        def everyone(status, **extra):
+            return {"message_id": message_id, "results": [{"recipient": r, "status": status, **extra} for r in recipients],
                     "sent_copy": {"status": "skipped", "reason": "The message was not sent."}}
-        if outcome == "refused":
-            return {"message_id": message_id, "results": [
-                {"recipient": r, "status": "rejected", "smtp_code": refused[r][0],
-                 "error": "SMTP refused this recipient. Check the address and recipient mailbox policy; retry only rejected recipients."} for r in recipients],
-                "sent_copy": {"status": "skipped", "reason": "SMTP accepted no recipient."}}
-        if outcome == "failed":
-            return {"message_id": message_id, "results": [
-                {"recipient": r, "status": "failed", "error": "SMTP disconnected before the message was complete, so it was not sent. It is safe to retry."} for r in recipients],
-                "sent_copy": {"status": "skipped", "reason": "The message was not sent."}}
-        results = [{"recipient": r, "status": "rejected", "smtp_code": refused[r][0],
-                    "error": "SMTP refused this recipient. Check the address and recipient mailbox policy; retry only rejected recipients."}
-                   if r in refused else {"recipient": r, "status": outcome} for r in recipients]
-        if outcome == "unknown":
-            for row in results:
-                if row["status"] == "unknown":
-                    row["error"] = "SMTP disconnected after the whole message was sent. Delivery may have been accepted; do not resend automatically."
-        copy = {"status": "skipped", "reason": "This connector runs without a gateway state directory, so it keeps no Sent copy."}
-        if recorded:
-            done = self.sent.wait(message_id)
-            copy = done["sent_copy"] if done else {"status": "pending", "reason": "The copy is being saved to Sent in the background and will be retried until it is there."}
-            if done and outcome == "unknown" and done["delivered"] is not None:
-                results = [row if row["status"] != "unknown" else
-                           {"recipient": row["recipient"], "status": "accepted"} if done["delivered"] else
-                           {"recipient": row["recipient"], "status": "failed", "error": "No copy of the message appeared, so it was not sent."}
-                           for row in results]
-        return {"message_id": message_id, "results": results, "sent_copy": copy,
-                "note": "Accepted means the SMTP server accepted submission, not confirmed delivery. sent_copy reports the copy "
-                        "in the Sent folder separately; whatever it says, never resend a message that was accepted."}
 
-    def _submit(self, sender, envelope, raw, message_id, self_bcc):
-        """Run SMTP step by step so a lost connection is known to be before or after the end of the message.
-
-        Returns (outcome, refused, recorded): outcome is "accepted", "unknown", "failed" (certainly
-        not sent) or a (code, error) rejection of the whole message.
-        """
         smtp = self.open()
         recorded = False
         try:
+            # Step by step, so a lost connection before DATA is known not to have sent anything.
             try:
+                smtp.ehlo_or_helo_if_needed()
                 code, _ = smtp.mail(sender)
                 if code != 250:
-                    return (code, "SMTP rejected the sender. Check sender permissions and server policy."), {}, False
+                    return everyone("rejected", smtp_code=code, error="SMTP rejected the sender. Check sender permissions and server policy.")
                 refused = {}
-                for recipient in envelope:
+                for recipient in recipients:
                     code, reply = smtp.rcpt(recipient)
                     if code not in (250, 251):
-                        refused[recipient] = (code, reply)
-                if all(r in refused for r in envelope if r != sender or not self_bcc):
-                    try:
-                        smtp.rset()
-                    except (OSError, smtplib.SMTPException):
-                        pass
-                    return "refused", refused, False  # every real recipient was refused: nothing was sent
-                if self_bcc and sender in refused:
-                    self_bcc = False  # the server will not deliver the sender's copy
-                if self.sent:
-                    self.sent.begin(raw, message_id, self_bcc)
-                    recorded = True
-                code, _ = smtp.docmd("DATA")
-                if code != 354:
-                    raise _Rejected(code)
-                smtp.send(_dot_stuffed(raw))
+                        refused[recipient] = code
             except (OSError, smtplib.SMTPException):
-                if recorded:
-                    _quietly(self.sent.discard, message_id)
-                return "failed", {}, False
+                return everyone("failed", error="SMTP disconnected before the message was sent, so it was not sent. It is safe to retry.")
+            if len(refused) == len(recipients):
+                return {"message_id": message_id, "results": [
+                    {"recipient": r, "status": "rejected", "smtp_code": refused[r], "error": _REFUSED} for r in recipients],
+                    "sent_copy": {"status": "skipped", "reason": "SMTP accepted no recipient."}}
+            if self.sent:
+                try:
+                    self.sent.add(message_id, copy)
+                except OSError:
+                    raise ConnectorError("The gateway could not store the Sent copy (for example: its disk is full), so the message was not sent.", "sent_copy_unavailable") from None
+                recorded = True
             try:
-                code, _ = smtp.getreply()
+                code, _ = smtp.data(raw)
+                outcome = "accepted" if code == 250 else code
+            except smtplib.SMTPDataError as exc:
+                outcome = exc.smtp_code
             except (OSError, smtplib.SMTPException):
+                outcome = "unknown"  # the server may have the whole message: treat it as sent
+            if outcome not in ("accepted", "unknown"):
                 if recorded:
-                    _quietly(self.sent.settle, message_id, False)  # the mailbox will show what happened
-                return "unknown", refused, recorded
-            if code != 250:
-                raise _Rejected(code)
-            if recorded:
-                # Once the server has the message, nothing here may turn the send into an error.
-                _quietly(self.sent.settle, message_id, True)
-            return "accepted", refused, recorded
-        except _Rejected as exc:
-            if recorded:
-                _quietly(self.sent.discard, message_id)
-            return (exc.code, "SMTP rejected the message data. Check message limits and server policy."), {}, False
+                    self.sent.discard(message_id)
+                return everyone("rejected", smtp_code=outcome, error="SMTP rejected the message data. Check message limits and server policy.")
         finally:
             # A failed QUIT must not turn acknowledged submission into a failure.
             smtp.close()
+        results = [{"recipient": r, "status": "rejected", "smtp_code": refused[r], "error": _REFUSED} if r in refused else
+                   {"recipient": r, "status": outcome} if outcome == "accepted" else
+                   {"recipient": r, "status": "unknown", "error": "SMTP disconnected during submission. Delivery may have been accepted; do not resend automatically. Check the mailbox or recipient first."}
+                   for r in recipients]
+        return {"message_id": message_id, "results": results,
+                "sent_copy": {"status": "pending", "reason": "It is filed in the Sent folder within a few minutes, and retried until it is there."} if recorded else
+                             {"status": "skipped", "reason": "This connector runs without a gateway state directory, so it keeps no Sent copy."},
+                "note": "Accepted means the SMTP server accepted submission, not confirmed delivery. Never resend because of sent_copy."}
 
 
-MAX_RECIPIENTS = 49  # one envelope slot is kept for the sender's own copy
-
-
-def _quietly(action, *args):
-    try:
-        action(*args)
-    except Exception:
-        pass
-
-
-class _Rejected(Exception):
-    def __init__(self, code):
-        self.code = code
-
-
-def _dot_stuffed(raw):
-    # RFC 5321 section 4.5.2, as smtplib.SMTP.data does, followed by the end-of-data line.
-    data = re.sub(rb"(?m)^\.", b"..", raw)
-    return data + (b"" if data.endswith(b"\r\n") else b"\r\n") + b".\r\n"
+_REFUSED = "SMTP refused this recipient. Check the address and recipient mailbox policy; retry only rejected recipients."
 
 
 def tools(submission):
-    addresses = {"type": "array", "items": string("Bare recipient email address.", 254), "maxItems": MAX_RECIPIENTS, "uniqueItems": True}
+    addresses = {"type": "array", "items": string("Bare recipient email address.", 254), "maxItems": 50, "uniqueItems": True}
     return [
         Tool("check_smtp", "Check TLS and authentication for this mail account's SMTP server without sending a message.", submission.check),
-        Tool("send_message", "Send an email from this connection's configured sender using its SMTP server and shared account credential. Supports text and optional HTML, To/Cc/Bcc, up to 49 recipients in total. Returns accepted/rejected/unknown/failed per recipient; failed means certainly not sent and may be retried, unknown must not be retried automatically. Every sent message is kept once in the Sent folder; sent_copy reports that separately (saved, or pending while it is completed in the background) and never means the message should be resent. No attachments.", submission.send,
+        Tool("send_message", "Send an email from this connection's configured sender using its SMTP server and shared account credential. Supports text and optional HTML, To/Cc/Bcc, up to 50 recipients in total. Returns accepted/rejected/unknown/failed per recipient; failed means certainly not sent and may be retried, unknown must not be retried automatically. The message is kept in the Sent folder within a few minutes (sent_copy); that never means it should be resent. No attachments.", submission.send,
              {"to": {**addresses, "minItems": 1}, "cc": addresses, "bcc": addresses,
               "subject": string("Email subject.", 998), "text": {"type": "string", "maxLength": 200000, "description": "Plain-text message body."},
               "html": {"type": "string", "maxLength": 200000, "description": "Optional HTML alternative."}},

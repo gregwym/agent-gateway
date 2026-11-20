@@ -5,6 +5,7 @@ import html
 import json
 import re
 import secrets
+import shutil
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
@@ -805,7 +806,12 @@ class AdminController:
             referenced = {n for c in raw["connections"] for n in [*c.get("secret_env", {}).values(),
                           *c.get("secret_headers", {}).values(), c.get("bearer_secret")] if n}
             state["secrets"] = {k: v for k, v in state["secrets"].items() if k in referenced}
-            return await self._commit(state, operation)
+            result = await self._commit(state, operation)
+            # Messages still waiting for the Sent folder belong to the removed mailbox; a later
+            # connection reusing this name must never file them.
+            from .server import connector_state_dir
+            shutil.rmtree(connector_state_dir(self.runtime.gateway.cfg, name), ignore_errors=True)
+            return result
         if operation == "permissions/connection":
             client_id, name, mode = body.get("client"), body.get("connection"), body.get("access")
             cfg, _, _ = self.store.effective(state)

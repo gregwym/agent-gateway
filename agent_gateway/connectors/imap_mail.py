@@ -254,9 +254,8 @@ def main() -> None:
         # Its own IMAP session, so background work never interleaves with a tool call.
         background = Mailbox(host=host, port=port, username=username, password=password)
         # AGW_STATE_DIR is this connection's private directory, given by the gateway.
-        own = [a for a in os.environ.get("AGW_MAILBOX_ADDRESSES", "").split(",") if a]
-        sent = SentCopies(os.environ["AGW_STATE_DIR"], background._connect, smtp_host, sender, own)
-        sent.start()  # also resumes copies left pending before a restart
+        sent = SentCopies(os.environ["AGW_STATE_DIR"], f"{username}@{host}:{port}", background._connect)
+        sent.start()  # also files copies left pending before a restart
     submission = Submission(smtp_host, int(setting("SMTP_PORT", "587")), setting("SMTP_SECURITY", "starttls"),
                             os.environ.get("SMTP_USERNAME") or (sender if icloud else username), password, sender, sent=sent)
     serve(

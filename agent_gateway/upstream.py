@@ -80,9 +80,7 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         env = dict(conn.env)
         env.update({var: secrets[name] for var, name in conn.secret_env.items()})
         if state_dir is not None:
-            env["AGW_STATE_DIR"] = str(state_dir)
-            # Addresses that deliver into this mailbox, so mail to them is never mistaken for the sender's copy.
-            env["AGW_MAILBOX_ADDRESSES"] = ",".join(a for a in [conn.mailbox_email, *conn.mailbox_aliases] if a)
+            env["AGW_STATE_DIR"] = str(state_dir)  # this connection's private directory (sent-mail copies)
         params = StdioServerParameters(command=conn.command[0], args=conn.command[1:], env=env)
         # The child's stderr is discarded: connectors log mail subjects and the like.
         with open(os.devnull, "w") as devnull:
