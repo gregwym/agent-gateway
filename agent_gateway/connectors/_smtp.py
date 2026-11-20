@@ -174,22 +174,23 @@ class Submission:
                 smtp.send(_dot_stuffed(raw))
             except (OSError, smtplib.SMTPException):
                 if recorded:
-                    self.sent.discard(message_id)
+                    _quietly(self.sent.discard, message_id)
                 return "failed", {}, False
             try:
                 code, _ = smtp.getreply()
             except (OSError, smtplib.SMTPException):
                 if recorded:
-                    self.sent.settle(message_id, accepted=False)  # the mailbox will show what happened
+                    _quietly(self.sent.settle, message_id, False)  # the mailbox will show what happened
                 return "unknown", refused, recorded
             if code != 250:
                 raise _Rejected(code)
             if recorded:
-                self.sent.settle(message_id, accepted=True)
+                # Once the server has the message, nothing here may turn the send into an error.
+                _quietly(self.sent.settle, message_id, True)
             return "accepted", refused, recorded
         except _Rejected as exc:
             if recorded:
-                self.sent.discard(message_id)
+                _quietly(self.sent.discard, message_id)
             return (exc.code, "SMTP rejected the message data. Check message limits and server policy."), {}, False
         finally:
             # A failed QUIT must not turn acknowledged submission into a failure.
@@ -197,6 +198,13 @@ class Submission:
 
 
 MAX_RECIPIENTS = 49  # one envelope slot is kept for the sender's own copy
+
+
+def _quietly(action, *args):
+    try:
+        action(*args)
+    except Exception:
+        pass
 
 
 class _Rejected(Exception):

@@ -197,6 +197,17 @@ def test_a_disconnect_before_the_end_of_data_is_a_certain_failure(tmp_path, monk
         assert result["sent_copy"]["status"] == "skipped" and not m.pending() and not m.messages
 
 
+def test_a_record_that_cannot_be_updated_never_turns_an_accepted_send_into_an_error(tmp_path, monkeypatch):
+    with mail(tmp_path, monkeypatch) as m:
+        def full(self, *args):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(SentCopies, "settle", full)
+        result = m.send()
+        assert result["results"] == [{"recipient": "ok@example.test", "status": "accepted"}]
+        assert result["sent_copy"]["status"] == "pending" and len(m.messages) == 1
+
+
 def test_an_unreachable_mailbox_never_delays_the_send_result(tmp_path, monkeypatch):
     with mail(tmp_path, monkeypatch) as m:
         def unreachable():
