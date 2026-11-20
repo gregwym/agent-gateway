@@ -104,8 +104,13 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 assert sent['structuredContent']['status'] == 'succeeded'
                 outcome = json.loads(sent['content'][1]['text'])
                 assert outcome['results'] == [{'recipient': 'ok@example.test', 'status': 'accepted'}]
-                # pymap marks no folder \Sent: the copy fails on its own and the send still succeeds, once.
-                assert outcome['sent_copy']['status'] == 'failed' and outcome['sent_copy']['code'] == 'imap_sent_folder_missing'
+                # The sender's own copy goes in the envelope only; nobody delivers it here, so the copy stays
+                # pending in this connection's private state directory instead of delaying the result.
+                assert messages[0][0] == ['TO:<ok@example.test>', 'TO:<account@example.test>']
+                assert outcome['sent_copy']['status'] == 'pending'
+                state_dir = gw.app.state.admin.runtime.gateway.cfg.audit.path.parent / 'connectors' / conn['id']
+                (record,) = (state_dir / 'pending').glob('*.json')
+                assert state_dir.stat().st_mode & 0o777 == 0o700 and record.stat().st_mode & 0o777 == 0o600
                 assert len(messages) == 1
                 repeat = await send(args)
                 assert repeat['structuredContent']['idempotency_key'] == request_id and len(messages) == 1

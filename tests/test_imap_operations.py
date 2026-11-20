@@ -196,35 +196,6 @@ class FakeIMAP:
         pass
 
 
-class SentFake(FakeIMAP):
-    def __init__(self, failure=None, special=True):
-        super().__init__()
-        self.appended, self.failure, self.sent_special = [], failure, special
-
-    def list_folders(self):
-        return super().list_folders() + [((b"\\Sent",) if self.sent_special else (), b"/", "已发送")]
-
-    def append(self, folder, msg, flags=(), msg_time=None):
-        self.appended.append((folder, msg, tuple(flags)))
-        if self.failure:
-            raise self.failure
-
-
-@pytest.mark.parametrize("failure, special, expected, appends", [
-    (None, True, {"status": "saved", "mailbox": "已发送"}, 1),
-    (None, False, {"status": "failed", "code": "imap_sent_folder_missing"}, 0),
-    (imaplib.IMAP4.error("NO [OVERQUOTA] full"), True, {"status": "failed", "code": "imap_quota_exceeded"}, 1),
-    (imaplib.IMAP4.abort("connection lost after APPEND"), True, {"status": "unknown", "code": "imap_server_unreachable"}, 1),
-])
-def test_sent_copy_outcomes_are_reported_and_never_replayed(failure, special, expected, appends):
-    fake = SentFake(failure, special)
-    mail = Mailbox("unused", 993, "unused", "unused")
-    mail._client = fake
-    outcome = mail.save_sent(b"Message-ID: <x@example.test>\r\n\r\nbody\r\n")
-    assert expected.items() <= outcome.items()
-    assert fake.appended == [("已发送", b"Message-ID: <x@example.test>\r\n\r\nbody\r\n", (b"\\Seen",))] * appends
-
-
 def tools_for(client, limit=40000000):
     mail = Mailbox("unused", 993, "unused", "unused")
     mail._client = client

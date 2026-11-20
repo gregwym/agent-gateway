@@ -14,6 +14,7 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -58,7 +59,8 @@ def http_client(**kwargs):
 
 
 @asynccontextmanager
-async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None, web_sessions=None) -> AsyncIterator[Client]:
+async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None, web_sessions=None,
+                      state_dir: Path | None = None) -> AsyncIterator[Client]:
     """Connect to one upstream, handing it its own credentials and nothing else."""
     if conn.oauth_ref and oauth is None and auth is None:
         from .passkey import Refused
@@ -77,6 +79,10 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         # what is passed here; the gateway's own environment is not inherited.
         env = dict(conn.env)
         env.update({var: secrets[name] for var, name in conn.secret_env.items()})
+        if state_dir is not None:
+            env["AGW_STATE_DIR"] = str(state_dir)
+            # Addresses that deliver into this mailbox, so mail to them is never mistaken for the sender's copy.
+            env["AGW_MAILBOX_ADDRESSES"] = ",".join(a for a in [conn.mailbox_email, *conn.mailbox_aliases] if a)
         params = StdioServerParameters(command=conn.command[0], args=conn.command[1:], env=env)
         # The child's stderr is discarded: connectors log mail subjects and the like.
         with open(os.devnull, "w") as devnull:
@@ -133,8 +139,10 @@ async def list_all_tools(client: Client) -> list[types.Tool]:
 
 
 class Upstream:
-    def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit, oauth=None, web_sessions=None) -> None:
+    def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit, oauth=None, web_sessions=None,
+                 state_dir: Path | None = None) -> None:
         self.oauth = oauth
+        self.state_dir = state_dir
         self.web_sessions = web_sessions
         self.conn = conn
         self._secrets = secrets
@@ -154,7 +162,7 @@ class Upstream:
         while True:
             self._connecting = True
             try:
-                async with open_client(self.conn, self._secrets, self.oauth, web_sessions=self.web_sessions) as client:
+                async with open_client(self.conn, self._secrets, self.oauth, web_sessions=self.web_sessions, state_dir=self.state_dir) as client:
                     with anyio.fail_after(_CONNECT_TIMEOUT):
                         await self._verify(client)
                     self._client = client
