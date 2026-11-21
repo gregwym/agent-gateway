@@ -5,7 +5,8 @@ background thread files it later: once a record is DELAY old, it looks for the
 Message-ID in Sent and appends the message only if it is not there yet. A
 server that files sent mail itself (Gmail, Outlook and others) has put it there
 by then, so it gets no second copy. A record is deleted once Sent holds the
-message; until then every round simply tries again, also after a restart.
+message; until then every round simply tries again, also after a restart. A
+record that fails does not hold up the others.
 """
 
 from __future__ import annotations
@@ -87,19 +88,31 @@ class SentCopies:
             try:
                 folder = self._sent_folder(client)
                 for path in due:
-                    if not path.exists():
-                        continue
-                    raw = path.read_bytes()
-                    message_id = (BytesHeaderParser().parsebytes(raw)["Message-ID"] or "").strip()
-                    client.select_folder(folder, readonly=True)
-                    if not message_id or not client.search(["HEADER", "Message-ID", message_id]):
-                        client.append(folder, raw, flags=(b"\\Seen",))
-                    path.unlink()
+                    try:
+                        self._file(client, folder, path)
+                    except Exception:
+                        # This record stays for the next round. The others go on unless the
+                        # connection itself is gone.
+                        try:
+                            client.noop()
+                        except Exception:
+                            return
             finally:
                 try:
                     client.logout()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _file(client, folder: str, path: Path) -> None:
+        if not path.exists():
+            return
+        raw = path.read_bytes()
+        message_id = (BytesHeaderParser().parsebytes(raw)["Message-ID"] or "").strip()
+        client.select_folder(folder, readonly=True)
+        if not message_id or not client.search(["HEADER", "Message-ID", message_id]):
+            client.append(folder, raw, flags=(b"\\Seen",))
+        path.unlink()
 
     @staticmethod
     def _sent_folder(client) -> str:

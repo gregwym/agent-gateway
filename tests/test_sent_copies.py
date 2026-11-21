@@ -101,8 +101,7 @@ def test_a_copy_whose_record_survived_a_lost_connection_is_not_appended_again(tm
             raise OSError("connection lost after APPEND")
 
         monkeypatch.setattr(IMAPClient, "append", lost)
-        with pytest.raises(OSError):
-            m.later()
+        m.later()
         assert m.copies.pending()
         monkeypatch.setattr(IMAPClient, "append", append)
         # A new process for the same connection files what was left on disk.
@@ -110,6 +109,26 @@ def test_a_copy_whose_record_survived_a_lost_connection_is_not_appended_again(tm
                                clock=lambda: time.time() + DELAY)
         restarted.run_once()
         assert len(copies_of(m.account, result["message_id"])["Sent"]) == 1 and not restarted.pending()
+
+
+def test_a_record_the_server_refuses_does_not_hold_up_the_others(tmp_path, monkeypatch):
+    with mail(tmp_path, monkeypatch) as m:
+        sent = [m.send(subject=f"copy {n}")["message_id"] for n in range(3)]
+        first = email.message_from_bytes(m.copies.pending()[0].read_bytes())["Message-ID"]
+        append = IMAPClient.append
+
+        def refuse_first(self, folder, raw, *args, **kwargs):
+            if first.encode() in raw:
+                raise IMAPClient.Error("APPEND refused")
+            return append(self, folder, raw, *args, **kwargs)
+
+        monkeypatch.setattr(IMAPClient, "append", refuse_first)
+        m.later()
+        assert [p.name for p in m.copies.pending()] == [m.copies._path(first).name]
+        assert all(copies_of(m.account, message_id) for message_id in sent if message_id != first)
+        monkeypatch.setattr(IMAPClient, "append", append)
+        m.later(0)
+        assert not m.copies.pending() and copies_of(m.account, first)
 
 
 def test_an_unreachable_mailbox_keeps_the_record_for_the_next_round(tmp_path, monkeypatch):
