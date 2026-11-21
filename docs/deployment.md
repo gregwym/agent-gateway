@@ -41,8 +41,17 @@ mkdir -p data/config data/secrets data/key data/state
 cp gateway.example.yaml data/config/gateway.yaml              # demo；真实账号用 gateway.household.example.yaml，见第 5 节
 sudo chown -R 10001:10001 data && sudo chmod -R go-rwx data   # Linux 主机；macOS 上的 Colima / Docker Desktop 不需要 chown
 
-docker compose build
+# 使用 CI 发布的镜像（见下文），不在本机构建
+echo "AGW_IMAGE=ghcr.io/gregwym/agent-gateway:<版本>-<commit>" >> .env
+echo "AGW_BROWSER_IMAGE=ghcr.io/gregwym/agent-gateway-browser:<版本>-<commit>" >> .env
+docker compose pull
 ```
+
+**镜像由 CI 构建。** `master` 上每个通过验收的 commit 都会发布一对镜像（amd64 与 arm64），tag 为
+`<pyproject 版本>-<commit 前 12 位>`，例如 `0.19.5-e12687a40e83`；对应 Actions 运行的摘要里也列出了完整镜像名。
+tag 和 commit 一一对应，不会被覆盖，也没有浮动的 `latest`。`deploy/` 用和镜像同一个 commit 的版本，
+之后的命令都加 `--no-build`，确保主机只拉取、不构建。不设这两个变量时 Compose 退回本机构建
+（`docker compose build`），只用于开发。
 
 然后按顺序：
 
@@ -54,7 +63,7 @@ docker compose build
 5. **审阅工具定义**：`docker compose run --rm admin lock`。它会打印配置里引用的每个上游工具的完整定义。
    工具描述是会被 Agent 当作指令读的文本，要像审代码一样读一遍。确认后 `lock --write`。
 6. **检查**：`docker compose run --rm admin check`，输出每个 principal 能调用什么。逐行核对。
-7. **启动**：`AGW_BIND=<本机 Tailscale IP> docker compose up -d`（可以把 `AGW_BIND` 写进 `deploy/.env`）。
+7. **启动**：`AGW_BIND=<本机 Tailscale IP> docker compose up -d --no-build`（可以把 `AGW_BIND` 写进 `deploy/.env`）。
 
 不用 Docker 时，在仓库目录里 `pip install '.[connectors]'` 后直接用 `agw` 命令，步骤相同；用一个专用的系统用户运行，
 数据目录权限 `0700`。这个项目没有发布到 PyPI，不要按名字从 PyPI 安装。
@@ -685,12 +694,17 @@ jq -r 'select(.event == "tool_call") | [.principal, .tool] | @tsv' data/state/au
 
 ## 12. 升级
 
+先确认目标 commit 的 CI 已通过并发布了镜像，然后：
+
 ```sh
-git pull
-docker compose build
+git fetch && git checkout --detach <commit>   # deploy/ 与镜像同一版本
+# 把 deploy/.env 里的 AGW_IMAGE / AGW_BROWSER_IMAGE 改成 <版本>-<commit 前 12 位>
+docker compose pull
 docker compose run --rm admin check
 docker compose run --rm admin lock      # Connector 版本变了就会有 diff
-docker compose up -d
+docker compose up -d --no-build
 ```
+
+回滚：把两个变量改回上一版的 tag，再 `docker compose up -d --no-build`。旧 tag 一直保留在 ghcr.io 上。
 
 依赖版本锁在 `requirements.txt`（带哈希）。升级依赖 = 重新生成该文件并跑完整测试，不要在镜像里放开版本。

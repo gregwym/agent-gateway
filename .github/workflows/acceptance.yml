@@ -51,3 +51,82 @@ jobs:
         with:
           name: acceptance-${{ matrix.os }}-py${{ matrix.python }}
           path: run/acceptance/
+
+  # Every commit on master that passed acceptance is published, so a Gateway host
+  # pulls the tested image instead of building one itself.
+  publish:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: names
+        run: scripts/image-names.sh >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: gateway
+          push: true
+          provenance: false
+          tags: ${{ steps.names.outputs.gateway }}-${{ matrix.arch }}
+          labels: ${{ steps.names.outputs.labels }}
+          cache-from: type=gha,scope=gateway-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=gateway-${{ matrix.arch }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: login-browser
+          push: true
+          provenance: false
+          tags: ${{ steps.names.outputs.browser }}-${{ matrix.arch }}
+          labels: ${{ steps.names.outputs.labels }}
+          cache-from: type=gha,scope=browser-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=browser-${{ matrix.arch }}
+
+  # One tag per image that serves both architectures.
+  publish-manifest:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: names
+        run: scripts/image-names.sh >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - env:
+          GATEWAY: ${{ steps.names.outputs.gateway }}
+          BROWSER: ${{ steps.names.outputs.browser }}
+        run: |
+          for image in "$GATEWAY" "$BROWSER"; do
+            docker buildx imagetools create -t "$image" "$image-amd64" "$image-arm64"
+          done
+          {
+            echo "### Published"
+            echo
+            echo "AGW_IMAGE=$GATEWAY"
+            echo "AGW_BROWSER_IMAGE=$BROWSER"
+          } >> "$GITHUB_STEP_SUMMARY"
