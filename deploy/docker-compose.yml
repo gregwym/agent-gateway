@@ -1,4 +1,7 @@
-# Run from this directory:  docker compose up -d --build
+# Run from this directory. With the images CI published for a commit on master
+# (AGW_IMAGE and AGW_BROWSER_IMAGE, usually set in .env next to this file):
+#   docker compose pull && docker compose up -d --no-build
+# To build on this host instead, leave both unset:  docker compose up -d --build
 #
 # Host layout (AGW_HOME, default ./data), all owned by uid 10001:
 #   config/gateway.yaml, config/tools.lock.json   read-only for the running gateway
@@ -16,7 +19,7 @@ name: agent-gateway
 
 x-gateway: &gateway
   build: ..
-  image: agent-gateway:local
+  image: ${AGW_IMAGE:-agent-gateway:local}
   user: "10001:10001"
   init: true            # reaps whatever connector processes leave behind
   read_only: true
@@ -51,7 +54,7 @@ services:
     build:
       context: ..
       target: login-browser
-    image: agent-gateway-browser:local
+    image: ${AGW_BROWSER_IMAGE:-agent-gateway-browser:local}
     user: "10001:10001"
     restart: unless-stopped
     network_mode: none
