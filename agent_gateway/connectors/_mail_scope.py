@@ -2,14 +2,16 @@
 from ._base import ConnectorError
 
 ARGUMENT = "_gateway_mail_scope"
+# The gateway's own tool for its approval page. No catalog entry names it, so no Agent tool maps to it.
+PREVIEW = "preview_messages"
 TOOLS = {
     "imap": frozenset({
         "list_mailboxes", "search_messages", "list_messages", "get_message", "get_messages", "get_attachment",
-        "set_message_state", "move_messages", "archive_messages", "trash_messages",
+        "set_message_state", "move_messages", "archive_messages", "trash_messages", PREVIEW,
     }),
     "gmail": frozenset({
         "list_labels", "search_messages", "get_message", "get_attachment", "set_message_state", "set_message_labels",
-        "move_messages", "archive_messages", "trash_messages", "restore_messages",
+        "move_messages", "archive_messages", "trash_messages", "restore_messages", PREVIEW,
     }),
 }
 

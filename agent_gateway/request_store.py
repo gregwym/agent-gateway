@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS requests (
     id TEXT PRIMARY KEY, binding TEXT NOT NULL, status TEXT NOT NULL,
     client TEXT NOT NULL, principal TEXT NOT NULL, tool TEXT NOT NULL, connection TEXT NOT NULL,
     service TEXT NOT NULL, account TEXT NOT NULL, owner TEXT NOT NULL, upstream_tool TEXT NOT NULL,
-    approvers TEXT NOT NULL, arguments TEXT,
+    approvers TEXT NOT NULL, arguments TEXT, preview TEXT,
     created INTEGER NOT NULL, expires INTEGER NOT NULL,
     decided INTEGER, decided_by TEXT, credential TEXT, used INTEGER, outcome TEXT);
 CREATE INDEX IF NOT EXISTS requests_binding ON requests (binding, created);
@@ -68,6 +68,8 @@ class RequestStore:
         setup = sqlite3.connect(path, timeout=10)
         try:
             setup.executescript(_SCHEMA + extra_schema)
+            if "preview" not in {row[1] for row in setup.execute("PRAGMA table_info(requests)")}:
+                setup.execute("ALTER TABLE requests ADD COLUMN preview TEXT")  # stores created before previews
         finally:
             setup.close()
 
@@ -116,7 +118,7 @@ class RequestStore:
 
     def _sweep(self, db: sqlite3.Connection, now: int) -> None:
         db.execute(
-            "UPDATE requests SET status='expired', arguments=NULL WHERE status IN ('pending','approved','queued') AND expires<=?",
+            "UPDATE requests SET status='expired', arguments=NULL, preview=NULL WHERE status IN ('pending','approved','queued') AND expires<=?",
             (now,),
         )
         db.execute("DELETE FROM requests WHERE status NOT IN ('pending','approved','queued') AND created<?", (now - self._retention,))
@@ -141,10 +143,11 @@ class RequestStore:
     def _insert_request(db, request_id, request, now, expires, *, status="pending", key=None):
         db.execute(
             "INSERT INTO requests (id, binding, status, client, principal, tool, connection, service, account, owner,"
-            " upstream_tool, approvers, arguments, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " upstream_tool, approvers, arguments, preview, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, request.binding, status, request.client_id, request.principal, request.tool,
              request.connection, request.service, request.account, request.owner, request.upstream_tool,
-             json.dumps(sorted(request.approvers)), canonical(request.arguments).decode("utf-8"), now, expires),
+             json.dumps(sorted(request.approvers)), canonical(request.arguments).decode("utf-8"),
+             None if request.preview is None else json.dumps(request.preview, ensure_ascii=False), now, expires),
         )
         db.execute("INSERT INTO dispatch VALUES (?,?,?)",
                    (request_id, request.configuration_revision, request.client_token_sha256))
@@ -175,9 +178,9 @@ class RequestStore:
             if not row or row["status"] not in ("approved", "queued") or row["expires"] <= now:
                 return None
             if row["status"] == "approved" and not self._approved_key_is_active(db, row):
-                db.execute("UPDATE requests SET status='cancelled', outcome='approver_key_revoked', arguments=NULL WHERE id=?", (request_id,))
+                db.execute("UPDATE requests SET status='cancelled', outcome='approver_key_revoked', arguments=NULL, preview=NULL WHERE id=?", (request_id,))
                 return None
-            db.execute("UPDATE requests SET status='used', used=?, arguments=NULL WHERE id=?", (now, request_id))
+            db.execute("UPDATE requests SET status='used', used=?, arguments=NULL, preview=NULL WHERE id=?", (now, request_id))
             return dict(row)
 
     @staticmethod
@@ -217,7 +220,7 @@ class RequestStore:
                 return
             if row["status"] not in ("pending", "approved", "queued"):
                 return
-            db.execute("UPDATE requests SET status='cancelled', decided=?, arguments=NULL WHERE id=?",
+            db.execute("UPDATE requests SET status='cancelled', decided=?, arguments=NULL, preview=NULL WHERE id=?",
                        (now, request_id))
         self.audit.write("approval_cancelled", approval=request_id, client=row["client"], reason="client_cancelled")
 

@@ -238,7 +238,8 @@ async def test_the_connector_checks_its_own_input_and_settings(google):
     google.requests.clear()
     async with Client(stdio_client(params), cache=None) as client:
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-        assert set(tools) == set(TOOLS) | {"list_labels"}
+        # preview_messages is served for the gateway's approval page; no catalog entry offers it to an Agent.
+        assert set(tools) == set(TOOLS) | {"list_labels", "preview_messages"}
         for tool in tools.values():
             assert tool.annotations.read_only_hint and tool.input_schema["additionalProperties"] is False
             assert not {"account", "user", "userId", "token", "url"} & set(tool.input_schema["properties"])
@@ -250,6 +251,8 @@ async def test_the_connector_checks_its_own_input_and_settings(google):
             ("search_messages", {"query": "a\r\nHost: evil.example"}),
             ("search_messages", {"limit": 500}),
             ("search_messages", {"userId": "someone-else"}),
+            ("preview_messages", {"ids": ["18c0a1/../../18c0b1"]}),
+            ("preview_messages", {"ids": []}),
         ):
             assert (await client.call_tool(tool, arguments)).is_error, arguments
     assert all(path == "/token" or path.startswith("/gmail/v1/users/me/messages") for _, path in google.requests)
@@ -390,5 +393,29 @@ async def test_gmail_organize_preserves_unrelated_labels_and_reports_each_messag
             assert google.requests.count(("POST", "/gmail/v1/users/me/messages/a1/trash")) == 2
             assert "TRASH" not in account["messages"]["a2"]["labels"]
             assert not any(method == "DELETE" for method, _ in google.requests)
+    finally:
+        google.close()
+
+
+async def test_preview_shows_sender_subject_and_date_only_within_the_label_scope():
+    google = FakeGoogle()
+    google.add_account(REFRESH_A, CLIENT_ID, CLIENT_SECRET, scope=FakeGoogle.MODIFY)
+    google.add_message(REFRESH_A, "a1", message("Invoice 42", "Billing <billing@example.test>", "b@example.test", "Secret body.").as_bytes(), ("INBOX",))
+    google.add_message(REFRESH_A, "a2", message("Elsewhere", "c@example.test", "b@example.test", "Other body.").as_bytes(), ("Label_2",))
+    env = {"GMAIL_CLIENT_ID": CLIENT_ID, "GMAIL_CLIENT_SECRET": CLIENT_SECRET, "GMAIL_REFRESH_TOKEN": REFRESH_A,
+           "GMAIL_API_BASE": google.base, "GMAIL_TOKEN_URL": f"{google.base}/token", "GMAIL_ACCESS": "read_organize"}
+    params = StdioServerParameters(command=sys.executable, args=["-m", "agent_gateway.connectors.gmail"], env=env)
+    try:
+        async with Client(stdio_client(params), cache=None) as client:
+            shown = json.loads(text_of(await client.call_tool("preview_messages", {"ids": ["a1", "a2", "dead"]})))["messages"]
+            assert shown == [
+                {"id": "a1", "from": "Billing <billing@example.test>", "subject": "Invoice 42", "date": "2026-11-03T09:30:00+00:00"},
+                {"id": "a2", "from": "c@example.test", "subject": "Elsewhere", "date": "2026-11-03T09:30:00+00:00"},
+                {"id": "dead", "status": "missing"},
+            ]
+            assert "Secret body" not in json.dumps(shown)
+            scoped = await client.call_tool("preview_messages", {"ids": ["a1", "a2", "dead"], "_gateway_mail_scope": ["INBOX"]})
+            # Outside the allowed labels looks the same as missing, as it does for get_message.
+            assert json.loads(text_of(scoped))["messages"][1:] == [{"id": "a2", "status": "hidden"}, {"id": "dead", "status": "hidden"}]
     finally:
         google.close()

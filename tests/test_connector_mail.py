@@ -326,7 +326,8 @@ async def test_the_connector_refuses_what_could_break_out_of_a_command(accounts)
     async with Client(stdio_client(params), cache=None) as client:
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
         writes = {"set_message_state", "move_messages", "archive_messages", "trash_messages", "send_message"}
-        assert set(tools) == set(TOOLS) | {"list_messages", "get_messages", "check_smtp"} | writes
+        # preview_messages is listed for the gateway's approval page; no catalog entry offers it to an Agent.
+        assert set(tools) == set(TOOLS) | {"list_messages", "get_messages", "check_smtp", "preview_messages"} | writes
         for tool in tools.values():
             assert tool.annotations.read_only_hint == (tool.name not in writes)
             assert tool.input_schema["additionalProperties"] is False

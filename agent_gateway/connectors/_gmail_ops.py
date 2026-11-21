@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from ._base import ConnectorError, Tool, integer, string
-from ._mail_scope import ARGUMENT, denied, exposed_labels
+from ._mail_scope import ARGUMENT, PREVIEW, denied, exposed_labels
 
 
 class ChangeError(ConnectorError):
@@ -142,3 +142,39 @@ def tools(gmail, message_id, *, organize):
              {"ids": ids, **fields}, ("ids", *required), read_only=False)
         for name, op, description, fields, required in specs
     ]
+
+
+def preview_tool(gmail, message_id):
+    """Sender, subject and date of the messages a pending change names, for the gateway's approval page."""
+    from . import _mail
+
+    wanted = [("format", "metadata")] + [("metadataHeaders", name) for name in _mail.PREVIEW_HEADERS]
+
+    def preview(args):
+        scope = args.get(ARGUMENT)
+        deadline = time.monotonic() + 6
+        messages, stopped = [], False
+        for item in args["ids"]:
+            if stopped or time.monotonic() >= deadline:
+                messages.append({"id": item, "status": "skipped"})
+                continue
+            try:
+                message = gmail.get(f"messages/{item}", wanted, timeout=4)
+            except ConnectorError as exc:
+                if exc.code == "gmail_message_missing":
+                    # Under a label restriction, "missing" and "outside the labels" look the same, as for get_message.
+                    messages.append({"id": item, "status": "hidden" if scope is not None else "missing"})
+                else:
+                    stopped = True
+                    messages.append({"id": item, "status": "skipped"})
+                continue
+            if message.get("id") != item or (scope is not None and not labels_of(message) & scope):
+                messages.append({"id": item, "status": "hidden" if scope is not None else "missing"})
+                continue
+            pairs = [(str(h.get("name", "")), str(h.get("value", ""))) for h in message.get("payload", {}).get("headers", [])]
+            messages.append({"id": item, **_mail.preview(_mail.headers_from_pairs(pairs))})
+        return {"messages": messages}
+
+    ids = {"type": "array", "items": message_id, "minItems": 1, "maxItems": 50, "uniqueItems": True}
+    return Tool(PREVIEW, "For the gateway's approval page only: sender, subject and date of the named messages. Not offered to Agents.",
+                preview, {"ids": ids}, ("ids",))

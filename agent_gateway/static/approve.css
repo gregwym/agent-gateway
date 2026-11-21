@@ -12,6 +12,10 @@ p { margin: 0.4rem 0; }
 dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 0.9rem; }
 dt { color: var(--muted); font-size: 0.9rem; }
 dd { margin: 0; overflow-wrap: anywhere; }
+.messages { list-style: none; margin: 0 0 0.5rem; padding: 0; }
+.messages li { padding: 0.45rem 0; overflow-wrap: anywhere; }
+.messages li + li { border-top: 1px solid var(--line); }
+.messages .subject { font-weight: 600; }
 pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 0.85rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .actions { display: flex; gap: 0.75rem; margin-top: 1rem; }
 button { flex: 1; font: inherit; font-weight: 600; padding: 0.8rem 1rem; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }

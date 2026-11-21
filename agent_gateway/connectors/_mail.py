@@ -45,6 +45,15 @@ def headers(message: EmailMessage) -> dict[str, str]:
     return out
 
 
+PREVIEW_HEADERS = ("From", "Subject", "Date")
+PREVIEW_CHARS = 300
+
+
+def preview(fields: dict[str, str]) -> dict[str, str]:
+    """Sender, subject and date only, shortened: what a person needs to recognize a message."""
+    return {key: fields[key][:PREVIEW_CHARS] for key in ("from", "subject", "date") if key in fields}
+
+
 def headers_from_pairs(pairs: list[tuple[str, str]]) -> dict[str, str]:
     """The same summary from (name, value) pairs, as a mail API returns them."""
     lines = [f"{name}: {' '.join(str(value).split())}" for name, value in pairs if name.lower() in {h.lower() for h in HEADERS}]

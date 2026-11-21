@@ -36,6 +36,17 @@ const TEXT = {
   outcome: ['Result', '执行结果'],
   arguments: ['Exact content', '具体内容'],
   no_arguments: ['(no longer stored)', '（已不再保存）'],
+  messages: ['Messages affected', '涉及的邮件'],
+  messages_hint: ['Looked up by the gateway when the request arrived. Sender and subject are written by whoever sent the mail.',
+    '网关在收到请求时查询，仅供识别。发件人和主题由寄件方填写，不一定真实。'],
+  no_subject: ['(no subject)', '（无主题）'],
+  message_missing: ['Message not found', '找不到这封邮件'],
+  message_hidden: ['Not shown: missing, or outside the Agent’s allowed labels', '不显示：邮件不存在，或不在 Agent 允许的标签内'],
+  message_skipped: ['Not looked up in time', '未能及时查到'],
+  preview_no_read_access: ['Not shown. The Agent may not read these messages without approval, and it can open this page too. Check the IDs below in your mail client.',
+    '不显示：Agent 无权直接读取这些邮件，而它也能打开本页面。请按下方 ID 在邮件客户端中核对。'],
+  preview_fetch_failed: ['The gateway could not look up these messages. Check the IDs below in your mail client.',
+    '网关没能查到这些邮件，请按下方 ID 在邮件客户端中核对。'],
   approve: ['Approve with passkey', '用通行密钥批准'],
   deny: ['Decline', '拒绝'],
   cancel: ['Withdraw approval', '撤回批准'],
@@ -206,6 +217,8 @@ function showRequest(request) {
   };
   row(facts, t('outcome'), outcomes[request.outcome]?.[ZH ? 1 : 0] || request.outcome);
 
+  if (request.preview) showPreview(request.preview);
+
   const content = el(app, 'div', undefined, 'card');
   el(content, 'p', t('arguments'), 'muted');
   el(content, 'pre', request.arguments === null ? t('no_arguments') : JSON.stringify(request.arguments, null, 2));
@@ -219,6 +232,32 @@ function showRequest(request) {
     act(actions, t('cancel'), 'stop', decide('cancel'));
   }
   el(app, 'p', '', 'muted').id = 'status';
+}
+
+// Subject, sender and date of the messages a mail change names; see mail_preview.py.
+function showPreview(preview) {
+  const card = el(app, 'div', undefined, 'card');
+  el(card, 'p', t('messages'), 'muted');
+  if (!Array.isArray(preview.messages)) {
+    el(card, 'p', t(preview.unavailable === 'no_read_access' ? 'preview_no_read_access' : 'preview_fetch_failed'));
+    return;
+  }
+  const when = (value) => {
+    const date = new Date(value);
+    return isNaN(date) ? value : date.toLocaleString(ZH ? 'zh-CN' : 'en');
+  };
+  const list = el(card, 'ul', undefined, 'messages');
+  for (const message of preview.messages) {
+    const item = el(list, 'li');
+    const id = 'ID ' + String(message.uid ?? message.id);
+    if (message.status) {
+      el(item, 'div', (TEXT['message_' + message.status] ? t('message_' + message.status) : message.status) + ' · ' + id, 'muted');
+      continue;
+    }
+    el(item, 'div', message.subject || t('no_subject'), 'subject');
+    el(item, 'div', [message.from, message.date && when(message.date), id].filter(Boolean).join(' · '), 'muted');
+  }
+  el(card, 'p', t('messages_hint'), 'muted');
 }
 
 function showEnrollment(code) {

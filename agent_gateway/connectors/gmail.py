@@ -358,7 +358,7 @@ def main() -> None:
             max_message_bytes=int(setting("GMAIL_MAX_MESSAGE_BYTES", "40000000")),
             max_attachment_bytes=int(setting("GMAIL_MAX_ATTACHMENT_BYTES", "5000000")),
             access=access,
-        ),
+        ) + [_gmail_ops.preview_tool(gmail, string("Message id.", 32, _ID))],  # served, never part of the Agent catalog
         mail_kind="gmail",
     )
 

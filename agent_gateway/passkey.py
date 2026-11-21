@@ -28,6 +28,7 @@ still be decided or used, and are erased afterwards.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -138,7 +139,19 @@ class PasskeyApprover(RequestStore):
 
     # -- the Approver interface ---------------------------------------------------
 
-    async def authorize(self, request: ApprovalRequest, key=None) -> ApprovalDecision:
+    async def authorize(self, request: ApprovalRequest, key=None, *, preview=None) -> ApprovalDecision:
+        """Reuse the matching request, or create one. `preview`, an async function, is awaited only
+        when a new request is about to be created, never while the database is locked."""
+        if preview is not None:
+            decision = self._authorize(request, key, create=False)
+            if decision is not None:
+                return decision
+            request = dataclasses.replace(request, preview=await preview())
+        decision = self._authorize(request, key, create=True)
+        assert decision is not None
+        return decision
+
+    def _authorize(self, request: ApprovalRequest, key, *, create: bool) -> ApprovalDecision | None:
         now = _now()
         with self._db() as db:
             self._sweep(db, now)
@@ -151,7 +164,7 @@ class PasskeyApprover(RequestStore):
             # Host-file edits do not have a web revision. Re-check the current
             # approval authority before reusing either a pending request or grant.
             if row is not None and set(json.loads(row["approvers"])) != set(request.approvers):
-                db.execute("UPDATE requests SET status='cancelled', arguments=NULL WHERE id=? AND status IN ('pending','approved')", (row["id"],))
+                db.execute("UPDATE requests SET status='cancelled', arguments=NULL, preview=NULL WHERE id=? AND status IN ('pending','approved')", (row["id"],))
                 row = None
             if row is not None:
                 status = row["status"]
@@ -173,6 +186,8 @@ class PasskeyApprover(RequestStore):
                 return ApprovalDecision(
                     False, "too_many_pending", "Too many actions from this client are already waiting for approval. Try again later."
                 )
+            if not create:
+                return None
             request_id = secrets.token_urlsafe(24)
             approvers = json.dumps(sorted(request.approvers))
             expires = now + self.cfg.request_ttl_seconds
@@ -225,14 +240,14 @@ class PasskeyApprover(RequestStore):
         with self._db() as db:
             self._sweep(db, _now())
             rows = db.execute("SELECT * FROM requests ORDER BY created DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
-        return [{key: row[key] for key in row.keys() if key not in ("arguments", "binding")} for row in rows]
+        return [{key: row[key] for key in row.keys() if key not in ("arguments", "preview", "binding")} for row in rows]
 
     def cancel(self, request_id: str) -> None:
         """Withdraw a request that is waiting, or an approval that has not been used yet."""
         with self._db() as db:
             self._sweep(db, _now())
             done = db.execute(
-                "UPDATE requests SET status='cancelled', arguments=NULL WHERE id=? AND status IN ('pending','approved')",
+                "UPDATE requests SET status='cancelled', arguments=NULL, preview=NULL WHERE id=? AND status IN ('pending','approved')",
                 (request_id,),
             ).rowcount
         if not done:
@@ -248,10 +263,12 @@ class PasskeyApprover(RequestStore):
         if row is None or row["approvers"] == "[]":
             # Background calls without an approval are private to the Agent.
             raise Refused("not_found", 404)
-        private = {"binding", "credential", "arguments", "approvers", "revision", "client_token_sha256"}
+        private = {"binding", "credential", "arguments", "preview", "approvers", "revision", "client_token_sha256"}
         shown = {key: row[key] for key in row.keys() if key not in private}
         shown["approvers"] = json.loads(row["approvers"])
-        shown["arguments"] = json.loads(row["arguments"]) if shown["status"] in _OPEN and row["arguments"] is not None else None
+        is_open = shown["status"] in _OPEN
+        shown["arguments"] = json.loads(row["arguments"]) if is_open and row["arguments"] is not None else None
+        shown["preview"] = json.loads(row["preview"]) if is_open and row["preview"] is not None else None
         people = {row["principal"], row["owner"], *shown["approvers"]}
         if row["decided_by"]:
             people.add(row["decided_by"])
@@ -396,7 +413,7 @@ class PasskeyApprover(RequestStore):
                 else:
                     status = "denied" if action == "deny" else "cancelled"
                     db.execute(
-                        "UPDATE requests SET status=?, decided=?, decided_by=?, credential=?, arguments=NULL WHERE id=?",
+                        "UPDATE requests SET status=?, decided=?, decided_by=?, credential=?, arguments=NULL, preview=NULL WHERE id=?",
                         (status, now, decided_by, credential_hex, target),
                     )
                 request_row = row

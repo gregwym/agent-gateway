@@ -17,7 +17,7 @@ from typing import Any
 
 from . import _mail
 from ._base import DATE, ConnectorError, Tool, integer, plain, string
-from ._mail_scope import ARGUMENT, check_source, denied, in_folder
+from ._mail_scope import ARGUMENT, PREVIEW, check_source, denied, in_folder
 
 SNAPSHOT_SECONDS = 3600
 MAX_SNAPSHOTS = 16
@@ -348,3 +348,34 @@ def additional_tools(mail, max_message_bytes, summary, header_fetch):
         Tool("trash_messages", "Move messages to the server's Trash folder or explicit destination. Does not empty Trash. Returns one outcome per UID. Inspect both folders after an unknown outcome before retrying.", lambda a: mutate(a, "trash"),
              {**batch, "destination": destination}, required, read_only=False),
     ]
+
+
+def preview_tool(mail):
+    """Sender, subject and date of the messages a pending change names, for the gateway's approval page."""
+    fetch = "BODY.PEEK[HEADER.FIELDS (" + " ".join(name.upper() for name in _mail.PREVIEW_HEADERS) + ")]"
+
+    def preview(args):
+        check_source(args, args.get(ARGUMENT))
+        mailbox, validity, uids = plain(args.get("mailbox", "INBOX")), args["uidvalidity"], args["uids"]
+
+        def read(client):
+            select(client, mailbox, validity)
+            return client.fetch(uids, [fetch])
+
+        fetched = mail.run(read)
+        messages = []
+        for uid in uids:
+            raw = next((value for key, value in fetched.get(uid, {}).items() if key.startswith(b"BODY[HEADER.FIELDS")), None)
+            if not isinstance(raw, bytes):
+                messages.append({"uid": uid, "status": "missing"})
+                continue
+            try:
+                messages.append({"uid": uid, **_mail.preview(_mail.headers(_mail.parse(raw)))})
+            except Exception:
+                messages.append({"uid": uid})
+        return {"messages": messages}
+
+    uids = {"type": "array", "items": integer("Message UID.", 1, 4_294_967_295), "minItems": 1, "maxItems": 50, "uniqueItems": True}
+    return Tool(PREVIEW, "For the gateway's approval page only: sender, subject and date of the named messages. Not offered to Agents.",
+                preview, {"mailbox": string("Mailbox name. Default: INBOX."), "uidvalidity": integer("Mailbox UIDVALIDITY.", 1, 4_294_967_295),
+                          "uids": uids}, ("uidvalidity", "uids"))

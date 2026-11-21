@@ -58,6 +58,9 @@ class ApprovalRequest:
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     created_at: float = field(default_factory=time.time)
     ttl_seconds: int = 300
+    # What the gateway could look up about the call's targets, such as the subject and sender
+    # of the messages a mail change names. Shown to the person deciding; not part of the binding.
+    preview: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
     @property
     def expires_at(self) -> float:

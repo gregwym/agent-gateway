@@ -177,7 +177,7 @@ class AdminController:
             # Revision-bound approvals are unusable immediately after publication,
             # including a crash between the atomic state write and this cleanup.
             with self.auth.approver._db() as db:
-                db.execute("UPDATE requests SET status='cancelled', outcome='configuration_changed', arguments=NULL WHERE status IN ('pending','approved','queued')")
+                db.execute("UPDATE requests SET status='cancelled', outcome='configuration_changed', arguments=NULL, preview=NULL WHERE status IN ('pending','approved','queued')")
 
         try:
             await self.runtime.replace(gateway, persist)

@@ -327,3 +327,22 @@ def test_write_time_budget_returns_unattempted_rows(monkeypatch):
     value = tools_for(fake)["set_message_state"]({"uidvalidity": 17, "uids": [1, 2, 3], "read": True})
     assert [r["status"] for r in value["results"]] == ["success", "not_attempted", "not_attempted"]
     assert b"\\Seen" in fake.data[1]["flags"] and all(b"\\Seen" not in fake.data[i]["flags"] for i in [2, 3])
+
+
+def test_preview_reads_only_sender_subject_and_date_within_the_folder_scope():
+    from agent_gateway.connectors._mail_scope import ARGUMENT
+    fake = FakeIMAP()
+    mail = Mailbox("unused", 993, "unused", "unused")
+    mail._client = fake
+    preview = _imap_ops.preview_tool(mail).handler
+    assert preview({"uidvalidity": 17, "uids": [2, 99]}) == {"messages": [
+        {"uid": 2, "from": "a@test", "subject": "2", "date": "2026-11-03T09:30:00+00:00"},
+        {"uid": 99, "status": "missing"},
+    ]}
+    assert ("select", True) in fake.events
+    assert [e[2] for e in fake.events if e[0] == "fetch"] == [["BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]"]]
+    assert all(b"\\Seen" not in d["flags"] for d in fake.data.values())
+    with pytest.raises(ConnectorError, match="UIDVALIDITY changed"):
+        preview({"uidvalidity": 18, "uids": [2]})
+    with pytest.raises(ConnectorError, match="outside the Agent's allowed"):
+        preview({"uidvalidity": 17, "uids": [2], ARGUMENT: frozenset({"存档"})})

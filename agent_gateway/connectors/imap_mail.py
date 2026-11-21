@@ -238,6 +238,7 @@ def build_tools(mail: Mailbox, max_message_bytes: int, max_attachment_bytes: int
 
 
 def main() -> None:
+    from ._imap_ops import preview_tool
     from ._smtp import Submission
 
     host, username = setting("IMAP_HOST", "imap.mail.me.com"), setting("IMAP_USERNAME")
@@ -265,7 +266,7 @@ def main() -> None:
             max_message_bytes=int(setting("IMAP_MAX_MESSAGE_BYTES", "40000000")),
             max_attachment_bytes=int(setting("IMAP_MAX_ATTACHMENT_BYTES", "5000000")),
             submission=submission,
-        ),
+        ) + [preview_tool(mail)],  # served, but outside build_tools: never part of the Agent catalog
         mail_kind="imap",
     )
 

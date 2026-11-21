@@ -458,6 +458,53 @@ class Gateway:
                 return _error(str(exc))
         return self.policy.effect(principal, route.tool.name, client_id, operation=operation)
 
+    async def _mail_preview(self, who, route, final_arguments, upstream_arguments):
+        """Subject, sender and date of the messages a mail change names, for the approval page.
+
+        The page is not access-controlled, and its address is in the Agent's conversation, so headers
+        are looked up only if the Agent could read them itself, without approval (see mail_preview).
+        """
+        from . import mail_preview
+        from .catalog_sync import bundled_kind
+        from .connectors._mail_scope import PREVIEW
+
+        kind = bundled_kind(route.conn)
+        started = time.monotonic()
+        preview, reason = None, "no_read_access"
+        if self._can_read(who, route.conn, mail_preview.reads(kind, final_arguments)):
+            reason = "fetch_failed"
+            with anyio.move_on_after(mail_preview.SECONDS):
+                try:
+                    result = await self.upstreams[route.conn.id].call(PREVIEW, mail_preview.arguments(kind, upstream_arguments))
+                    preview = mail_preview.parse(kind, result)
+                except UpstreamError:
+                    pass
+        self.audit.write("approval_preview", client=who.client_id, principal=who.principal, tool=route.tool.name,
+                         connection=route.conn.id, upstream_tool=PREVIEW, reason="shown" if preview else reason,
+                         duration_ms=int((time.monotonic() - started) * 1000))
+        return preview or {"unavailable": reason}
+
+    def _can_read(self, who, conn, ways):
+        """Whether one of `ways` (read tool, calls) is open to this Agent on `conn` without approval."""
+        from .mail_preview import same_reach
+
+        def ignore(*_args, **_fields):
+            pass
+
+        for upstream, calls in ways:
+            for route in self.routes.values():
+                if (route.conn.id != conn.id or route.tool.upstream != upstream
+                        or self.policy.effect(who.principal, route.tool.name, who.client_id) != "allow"):
+                    continue
+                for wanted in calls:
+                    # Pinned arguments cannot be supplied; the pin must then agree with what is wanted.
+                    prepared = self._prepare_call(who.client_id, route, {k: v for k, v in wanted.items() if k not in route.tool.pin}, ignore)
+                    if isinstance(prepared, types.CallToolResult) or not same_reach(wanted, prepared[0]):
+                        break
+                else:
+                    return True
+        return False
+
     def _approval_request(self, client, route, final_arguments, *, requires_approval=True):
         return ApprovalRequest(
             principal=client.subject, client_id=client.id, tool=route.tool.name, connection=route.conn.id,
@@ -486,6 +533,8 @@ class Gateway:
         if effect != "approval_required" and key is None:
             return await self._run(route, upstream_arguments, done, "ok")
 
+        from . import mail_preview
+        from .catalog_sync import bundled_kind
         from .passkey import PasskeyApprover
         from .request_store import QueueFull
 
@@ -503,7 +552,9 @@ class Gateway:
 
         request = self._approval_request(client, route, final_arguments)
         if isinstance(self.approver, PasskeyApprover):
-            decision = await self.approver.authorize(request, key=key)
+            previewed = route.tool.upstream in mail_preview.TOOLS.get(bundled_kind(route.conn) or "", ())
+            preview = (lambda: self._mail_preview(who, route, final_arguments, upstream_arguments)) if previewed else None
+            decision = await self.approver.authorize(request, key=key, preview=preview)
         elif key is not None:
             done("deny", "approval:unavailable")
             return _error(NOT_EXECUTED)

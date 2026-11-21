@@ -135,6 +135,50 @@ async def test_browser_does_not_claim_execution_when_upstream_failed(tmp_path):
 
 
 @pytest.mark.parametrize("locale", ["en-US", "zh-CN"])
+async def test_browser_lists_sender_and_subject_of_the_messages_a_mail_change_touches(tmp_path, locale):
+    from helpers import SECRETS
+    from passkey_helpers import Authenticator, Page
+    from service_helpers import mail_account
+    from test_approval_mail_preview import READS, inbox, mail_config
+    from test_connector_mail import fill, message
+
+    subject = "<img src=x onerror=alert(1)> 季度发票 Quarterly invoice"
+    with mail_account(tmp_path / "server", "preview@example.test", "fake-mail-password") as account:
+        fill(account, message(subject, "Billing <billing@example.test>", account.user, "confidential body"))
+        port = free_port()
+        origin = f"http://localhost:{port}"
+        raw, _ = mail_config(account, READS)
+        raw["approvals"]["origin"] = origin
+        gateway_path = await prepare(tmp_path / "gateway", raw, secrets={**SECRETS, "mail_password": account.password})
+        async with running_gateway(gateway_path, port=port) as gateway:
+            code = gateway.gateway.approver.new_enrollment("person_a").split("#", 1)[1]
+            assert (await Page(gateway.base, origin).decide("enroll", code, Authenticator(), origin=origin))[0] == 200
+            async with agent(gateway.url, TOKEN_A) as client:
+                requested = await client.call_tool("mail_archive_messages", inbox(account, "Quarterly invoice"))
+            request_id = request_id_in(text_of(requested))
+            async with playwright.async_playwright() as driver:
+                browser = await driver.chromium.launch()
+                try:
+                    context = await browser.new_context(locale=locale, viewport={"width": 390, "height": 844})
+                    page = await context.new_page()
+                    errors = []
+                    page.on("pageerror", lambda error: errors.append(str(error)))
+                    await page.goto(f"{origin}/approvals/r/{request_id}")
+                    await playwright.expect(page.locator(".messages .subject")).to_have_text(subject)
+                    await playwright.expect(page.locator(".messages li .muted")).to_contain_text("billing@example.test")
+                    assert await page.locator("#app img").count() == 0
+                    assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                    assert "confidential body" not in await page.locator("#app").inner_text()
+                    if directory := os.environ.get("AGW_TEST_ARTIFACTS"):
+                        artifacts = Path(directory)
+                        artifacts.mkdir(parents=True, exist_ok=True)
+                        await page.screenshot(path=str(artifacts / f"approval-mail-{locale}.png"), full_page=True)
+                    assert not errors
+                finally:
+                    await browser.close()
+
+
+@pytest.mark.parametrize("locale", ["en-US", "zh-CN"])
 async def test_admin_copies_new_member_registration_link(tmp_path, locale):
     from test_admin_feedback_browser import admin_page
 
