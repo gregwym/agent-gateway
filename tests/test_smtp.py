@@ -15,7 +15,7 @@ from service_helpers import localhost_certificate
 
 
 @contextmanager
-def smtp_server(path, *, implicit=False, reject_auth=False, disconnect_data=False, cert_pair=None):
+def smtp_server(path, *, implicit=False, reject_auth=False, disconnect_data=False, cert_pair=None, deliver=None):
     cert, key = cert_pair or localhost_certificate(path)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
@@ -64,6 +64,8 @@ def smtp_server(path, *, implicit=False, reject_auth=False, disconnect_data=Fals
                                 return
                             chunks.append(part[1:] if part.startswith(b"..") else part)
                         messages.append((recipients[:], b"".join(chunks)))
+                        if deliver:
+                            deliver([r.split("<", 1)[1].rstrip(">") for r in recipients], b"".join(chunks))
                         if disconnect_data:
                             return
                         conn.sendall(b"250 Queued\r\n")

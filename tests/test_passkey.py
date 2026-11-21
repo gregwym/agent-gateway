@@ -231,6 +231,27 @@ async def test_requests_and_approvals_expire(tmp_path, monkeypatch):
             assert "buy milk" not in await notes(a)
 
 
+async def test_requests_wait_an_hour_by_default_and_keep_the_window_they_were_created_with(tmp_path, monkeypatch):
+    defer_dispatch(monkeypatch)
+    clock = [1_800_000_000]
+    monkeypatch.setattr(passkey, "_now", lambda: clock[0])
+    async with running_gateway(await prepare(tmp_path, approval_config(request_ttl_seconds=600))) as gw:
+        key_a = await Page(gw.base).enroll(gw.gateway, "person_a")
+        async with agent(gw.url, TOKEN_A) as a:
+            old = request_id_in(text_of(await a.call_tool("a_add_note", NOTE)))
+    # Restarted without an explicit window: new requests get the default hour, the old one keeps its ten minutes.
+    async with running_gateway(await prepare(tmp_path, approval_config())) as gw:
+        page = Page(gw.base)
+        async with agent(gw.url, TOKEN_A) as a:
+            waiting = text_of(await a.call_tool("a_add_note", {**NOTE, "text": "buy bread"}))
+            assert "60 minutes" in waiting
+            new = request_id_in(waiting)
+            clock[0] += 601
+            assert (await page.decide("approve", old, key_a)) == (403, {"error": "stale_request"})
+            clock[0] += 3_600 - 601 - 1
+            assert (await page.decide("approve", new, key_a))[0] == 200
+
+
 async def test_a_passkey_answer_cannot_be_replayed_or_moved_to_another_request(tmp_path):
     async with running_gateway(await prepare(tmp_path, approval_config())) as gw:
         page = Page(gw.base)

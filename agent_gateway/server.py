@@ -25,6 +25,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -166,6 +167,11 @@ def make_approver(cfg: Config, audit: Audit) -> Approver:
     return approver
 
 
+def connector_state_dir(cfg: Config, connection_id: str) -> Path:
+    """A connection's private directory; removed together with the connection."""
+    return cfg.audit.path.parent / "connectors" / connection_id
+
+
 class Gateway:
     def __init__(
         self,
@@ -189,9 +195,13 @@ class Gateway:
         self.scrubber = Scrubber(list(secrets.values()), (lambda: oauth.sensitive) if oauth else None)
         self.upstreams: dict[str, Upstream] = {}
         self.routes: dict[str, ToolRoute] = {}
+        from .catalog_sync import bundled_kind
+
         for conn in cfg.connections:
             own = {name: secrets[name] for name in conn.secret_names()}
-            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions)
+            # The bundled mail connector keeps sent-mail copies here until they are filed in Sent.
+            state_dir = connector_state_dir(cfg, conn.id) if bundled_kind(conn) == "imap" else None
+            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir)
             for tool in conn.tools:
                 self.routes[tool.name] = build_route(conn, tool, lock.get(conn.id, tool.upstream))
 

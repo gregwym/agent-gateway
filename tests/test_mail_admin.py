@@ -104,6 +104,13 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                 assert sent['structuredContent']['status'] == 'succeeded'
                 outcome = json.loads(sent['content'][1]['text'])
                 assert outcome['results'] == [{'recipient': 'ok@example.test', 'status': 'accepted'}]
+                # The Sent copy waits in this connection's private state directory; it never delays the result.
+                assert messages[0][0] == ['TO:<ok@example.test>']
+                assert outcome['sent_copy']['status'] == 'pending'
+                state_dir = gw.app.state.admin.runtime.gateway.cfg.audit.path.parent / 'connectors' / conn['id']
+                (record,) = state_dir.glob('sent-*/*.eml')
+                assert record.read_bytes() == messages[0][1]
+                assert state_dir.stat().st_mode & 0o777 == 0o700 and record.stat().st_mode & 0o777 == 0o600
                 assert len(messages) == 1
                 repeat = await send(args)
                 assert repeat['structuredContent']['idempotency_key'] == request_id and len(messages) == 1
@@ -123,3 +130,7 @@ async def test_one_connection_checks_both_protocols_and_requires_exact_send_appr
                              access='read_write_direct', mail_send='deny')
                 denied = (await rpc(origin, TOKEN_A, 'tools/call', {'name': 'mail_send_message', 'arguments': args})).json()
                 assert denied['error']['code'] == -32602 and len(messages) == 2
+                # Removing the connection removes the messages still waiting for its Sent folder.
+                assert state_dir.exists()
+                assert (await change(http, 'connections/remove', id=conn['id'])).status_code == 200
+                assert not state_dir.exists()

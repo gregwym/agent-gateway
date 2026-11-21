@@ -30,9 +30,10 @@ def address(value):
 
 
 class Submission:
-    def __init__(self, host, port, security, username, password, sender):
+    def __init__(self, host, port, security, username, password, sender, sent=None):
         self.host, self.port, self.security = host, port, security
         self.username, self.password, self.sender = username, password, sender
+        self.sent = sent  # a _sent.SentCopies that files the copy in Sent
         self.gate = CredentialGate("SMTP rejected the account credentials. Check the SMTP username and app-specific password in this mail connection.", code="smtp_credentials_rejected")
 
     def open(self):
@@ -94,37 +95,77 @@ class Submission:
             msg["Cc"] = ", ".join(groups["cc"])
         # Bcc appears only in the envelope, never in the transmitted headers.
         msg["Subject"] = plain(args["subject"])
-        msg["Date"], msg["Message-ID"] = formatdate(localtime=False), make_msgid(domain=Address(addr_spec=sender).domain)
+        message_id = make_msgid(domain=Address(addr_spec=sender).domain)
+        msg["Date"], msg["Message-ID"] = formatdate(localtime=False), message_id
         msg.set_content(args["text"])
         if args.get("html"):
             msg.add_alternative(args["html"], subtype="html")
+        # Flatten once: these bytes are submitted, and kept in Sent with the Bcc line a mail client would keep.
+        raw = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
+        copy = (b"Bcc: " + ", ".join(groups["bcc"]).encode() + b"\r\n" if groups["bcc"] else b"") + raw
+
+        def everyone(status, **extra):
+            return {"message_id": message_id, "results": [{"recipient": r, "status": status, **extra} for r in recipients],
+                    "sent_copy": {"status": "skipped", "reason": "The message was not sent."}}
+
         smtp = self.open()
+        recorded = False
         try:
-            refused = smtp.send_message(msg, from_addr=sender, to_addrs=recipients)
-        except smtplib.SMTPRecipientsRefused as exc:
-            refused = exc.recipients
-        except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as exc:
-            return {"message_id": str(msg["Message-ID"]), "results": [
-                {"recipient": r, "status": "rejected", "smtp_code": exc.smtp_code,
-                 "error": "SMTP rejected the sender or message data. Check sender permissions, message limits and server policy."} for r in recipients]}
-        except (OSError, smtplib.SMTPException):
-            return {"message_id": str(msg["Message-ID"]), "results": [
-                {"recipient": r, "status": "unknown", "error": "SMTP disconnected during submission. Delivery may have been accepted; do not resend automatically. Check the mailbox or recipient first."} for r in recipients]}
+            # Step by step, so a lost connection before DATA is known not to have sent anything.
+            try:
+                smtp.ehlo_or_helo_if_needed()
+                code, _ = smtp.mail(sender)
+                if code != 250:
+                    return everyone("rejected", smtp_code=code, error="SMTP rejected the sender. Check sender permissions and server policy.")
+                refused = {}
+                for recipient in recipients:
+                    code, reply = smtp.rcpt(recipient)
+                    if code not in (250, 251):
+                        refused[recipient] = code
+            except (OSError, smtplib.SMTPException):
+                return everyone("failed", error="SMTP disconnected before the message was sent, so it was not sent. It is safe to retry.")
+            if len(refused) == len(recipients):
+                return {"message_id": message_id, "results": [
+                    {"recipient": r, "status": "rejected", "smtp_code": refused[r], "error": _REFUSED} for r in recipients],
+                    "sent_copy": {"status": "skipped", "reason": "SMTP accepted no recipient."}}
+            if self.sent:
+                try:
+                    self.sent.add(message_id, copy)
+                except OSError:
+                    raise ConnectorError("The gateway could not store the Sent copy (for example: its disk is full), so the message was not sent.", "sent_copy_unavailable") from None
+                recorded = True
+            try:
+                code, _ = smtp.data(raw)
+                outcome = "accepted" if code == 250 else code
+            except smtplib.SMTPDataError as exc:
+                outcome = exc.smtp_code
+            except (OSError, smtplib.SMTPException):
+                outcome = "unknown"  # the server may have the whole message: treat it as sent
+            if outcome not in ("accepted", "unknown"):
+                if recorded:
+                    self.sent.discard(message_id)
+                return everyone("rejected", smtp_code=outcome, error="SMTP rejected the message data. Check message limits and server policy.")
         finally:
             # A failed QUIT must not turn acknowledged submission into a failure.
             smtp.close()
-        return {"message_id": str(msg["Message-ID"]), "results": [
-            {"recipient": r, "status": "rejected", "smtp_code": refused[r][0],
-             "error": "SMTP refused this recipient. Check the address and recipient mailbox policy; retry only rejected recipients."}
-            if r in refused else {"recipient": r, "status": "accepted"} for r in recipients],
-            "note": "Accepted means the SMTP server accepted submission, not confirmed delivery. This tool does not append a second copy to Sent."}
+        results = [{"recipient": r, "status": "rejected", "smtp_code": refused[r], "error": _REFUSED} if r in refused else
+                   {"recipient": r, "status": outcome} if outcome == "accepted" else
+                   {"recipient": r, "status": "unknown", "error": "SMTP disconnected during submission. Delivery may have been accepted; do not resend automatically. Check the mailbox or recipient first."}
+                   for r in recipients]
+        return {"message_id": message_id, "results": results,
+                "sent_copy": {"status": "pending", "reason": "It is filed in the Sent folder within a few minutes, and retried until it is there."} if recorded else
+                             {"status": "skipped", "reason": "This connector runs without a gateway state directory, so it keeps no Sent copy."},
+                "note": "Accepted means the SMTP server accepted submission, not confirmed delivery. Never resend because of sent_copy."}
+
+
+_REFUSED = "SMTP refused this recipient. Check the address and recipient mailbox policy; retry only rejected recipients."
 
 
 def tools(submission):
     addresses = {"type": "array", "items": string("Bare recipient email address.", 254), "maxItems": 50, "uniqueItems": True}
     return [
         Tool("check_smtp", "Check TLS and authentication for this mail account's SMTP server without sending a message.", submission.check),
-        Tool("send_message", "Send an email from this connection's configured sender using its SMTP server and shared account credential. Supports text and optional HTML, To/Cc/Bcc. Returns accepted/rejected/unknown per recipient. Unknown submission outcomes must not be retried automatically. No attachments or separate Sent-folder copy.", submission.send,
+        Tool("send_message", "Send an email from this connection's configured sender using its SMTP server and shared account credential. Supports text and optional HTML, To/Cc/Bcc, up to 50 recipients in total. Returns accepted/rejected/unknown/failed per recipient; failed means certainly not sent and may be retried, unknown must not be retried automatically. The message is kept in the Sent folder within a few minutes (sent_copy); that never means it should be resent. No attachments.", submission.send,
              {"to": {**addresses, "minItems": 1}, "cc": addresses, "bcc": addresses,
               "subject": string("Email subject.", 998), "text": {"type": "string", "maxLength": 200000, "description": "Plain-text message body."},
               "html": {"type": "string", "maxLength": 200000, "description": "Optional HTML alternative."}},

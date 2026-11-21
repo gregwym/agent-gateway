@@ -62,6 +62,12 @@ def refusal(exc):
     return "imap_operation_refused", "The server refused this operation. Check mailbox write permissions and destination quota; inspect current state before retrying."
 
 
+def special_folders(folders, flag):
+    """Names of LIST entries that carry a special-use flag such as \\Sent (RFC 6154)."""
+    return [name for flags, _, name in folders
+            if flag.lower() in [(f.decode() if isinstance(f, bytes) else f).lower() for f in flags]]
+
+
 def select(client, mailbox, validity=None, *, readonly=True):
     info = client.select_folder(mailbox, readonly=readonly)
     actual = info.get(b"UIDVALIDITY")
@@ -228,9 +234,7 @@ def additional_tools(mail, max_message_bytes, summary, header_fetch):
                 folders = client.list_folders()
                 destination = args.get("destination")
                 if not destination:
-                    flag = {"archive": "\\archive", "trash": "\\trash"}[operation]
-                    matches = [name for flags, _, name in folders
-                               if flag in [(f.decode() if isinstance(f, bytes) else f).lower() for f in flags]]
+                    matches = special_folders(folders, {"archive": "\\Archive", "trash": "\\Trash"}[operation])
                     if len(matches) != 1:
                         raise ConnectorError(f"The server did not identify exactly one {operation} folder. Specify destination from list_mailboxes.", "imap_special_folder_missing")
                     destination = matches[0]
