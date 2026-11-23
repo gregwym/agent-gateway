@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -201,36 +201,6 @@ class GmailSource:
             token = page.get("nextPageToken")
             if not token:
                 return _gmail_ids(reversed(ids))  # the list is newest first
-
-
-class ImapSource:
-    """New INBOX mail of an IMAP mailbox, by UID. INBOX is opened read-only (EXAMINE)."""
-
-    key = "uids"
-
-    def __init__(self, mailbox) -> None:
-        self.mailbox = mailbox  # its own session, so a check never interleaves with a tool call
-
-    def check(self, cursor: dict[str, Any] | None, since: float | None) -> tuple[list[int], dict[str, Any], dict[str, Any]]:
-        def run(client) -> tuple[list[int], dict[str, Any], dict[str, Any]]:
-            info = client.select_folder("INBOX", readonly=True)
-            validity = int(info[b"UIDVALIDITY"])
-            top = int(info[b"UIDNEXT"]) - 1 if info.get(b"UIDNEXT") else max(client.search(["ALL"]), default=0)
-            if cursor is None:  # the first check starts from now: older mail is not new
-                return [], {"uidvalidity": validity}, {"uidvalidity": validity, "last_uid": top}
-            if cursor["uidvalidity"] == validity:
-                last = cursor["last_uid"]
-                uids = sorted(uid for uid in client.search(["UID", f"{last + 1}:*"]) if uid > last)  # n:* also matches the top UID
-            else:
-                # The mailbox was renumbered: report what arrived since the last good check.
-                after = (since or 0) - MARGIN
-                found = client.search(["SINCE", date.fromtimestamp(after - 86_400)])  # whole days on the server; exact below
-                arrived = client.fetch(found, ["INTERNALDATE"]) if found else {}
-                uids = sorted(uid for uid, data in arrived.items() if data[b"INTERNALDATE"].timestamp() >= after)
-                last = 0
-            return uids, {"uidvalidity": validity}, {"uidvalidity": validity, "last_uid": max([last, top, *uids])}
-
-        return self.mailbox.run(run)
 
 
 def _gmail_ids(values) -> list[str]:

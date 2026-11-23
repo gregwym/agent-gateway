@@ -148,7 +148,7 @@ class AdminCfg(_Model):
 
 
 class MailEventsCfg(_Model):
-    """Tell a webhook about new mail in one bundled Gmail or IMAP connection's INBOX.
+    """Tell a webhook about new mail in one bundled Gmail connection's INBOX.
 
     A host setting, so a connection edited in the web administration keeps it. The
     request carries the connection id and message identifiers only (docs/design.md 7.8).

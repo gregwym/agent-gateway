@@ -259,12 +259,6 @@ def main() -> None:
         sent.start()  # also files copies left pending before a restart
     submission = Submission(smtp_host, int(setting("SMTP_PORT", "587")), setting("SMTP_SECURITY", "starttls"),
                             os.environ.get("SMTP_USERNAME") or (sender if icloud else username), password, sender, sent=sent)
-    from ._mail_events import ImapSource, from_environment
-
-    # Only when the gateway configured mail_events; its own session, like the Sent copies.
-    events = from_environment(lambda: ImapSource(Mailbox(host=host, port=port, username=username, password=password)))
-    if events:
-        events.start()
     serve(
         "imap-mail",
         build_tools(

@@ -280,23 +280,22 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 ### 7.8 新邮件通知
 
-Gateway 本身不轮询。主机配置里的 `mail_events` 为某条自带 Gmail 或 IMAP 连接打开后，这条连接的 Connector 进程里
+Gateway 本身不轮询。主机配置里的 `mail_events` 为某条自带 Gmail 连接打开后，这条连接的 Connector 进程里
 多一个后台线程，每 30 秒问一次服务器「上次之后有什么新的」，有就向配置的 webhook 发一个签名请求。
 Agent 收到后再用这条连接的读取工具读信，所以凭据仍然只在 Gateway 里。
 
-- **只发标识。** 请求体为 `{"type": <配置的类型>, "occurredAt": ..., "data": {"mailbox": <连接 ID>, "message_ids": [...]}}`；
-  IMAP 为 `"uidvalidity": N, "uids": [...]`。不含发件人、主题、正文或附件，也不读取它们：Gmail 只调
-  `users.getProfile`、`users.history.list`，补报时另调 `users.messages.list`（`gmail.readonly` 即可）；IMAP 用 `EXAMINE`
-  打开 INBOX 后只做 `UID SEARCH`，补报时另取 `INTERNALDATE`，不改动已读状态。
+- **只发标识。** 请求体为 `{"type": <配置的类型>, "occurredAt": ..., "data": {"mailbox": <连接 ID>, "message_ids": [...]}}`。
+  不含发件人、主题、正文或附件，也不读取它们：只调 `users.getProfile`、`users.history.list`，补报时另调
+  `users.messages.list`（`gmail.readonly` 即可）。
 - **什么算新。** 第一次检查只记下当前位置，之前的邮件不算。之后：Gmail 历史里新增到 INBOX 的邮件（`messageAdded`），
-  以及后来被加上 INBOX 标签的（移回收件箱、稍后提醒到期）；IMAP 是 INBOX 里 UID 大于上次最大值的邮件，移进 INBOX 的邮件也会得到新 UID。
+  以及后来被加上 INBOX 标签的（移回收件箱、稍后提醒到期）。
 - **先落盘再发送。** 新标识、推进后的游标和待发事件一起原子写入 `<连接状态目录>/mail-events.json`，然后才发送。
   每个事件生成时就有固定的 delivery ID，接收方按它去重，所以重试（包括进程重启后）不会变成第二个事件。
   2xx 算送达；400、413 说明请求体本身被拒，丢弃该事件，避免挡住后面的；其余（401、404、429、5xx、网络错误）保留重试。
 - **退避。** 一轮里检查或发送失败，下一轮间隔依次为 30 秒、1、2、4 分钟，之后每 5 分钟（与 Gmail 凭据被拒后的暂停相同），
   一轮全部成功即恢复 30 秒。接收方离线时每一轮仍先检查，新邮件照样记进待发队列。
 - **游标失效时补报。** Gmail 历史通常保留约一周，有时只有几小时；过期时（404）改为列出「上次成功检查前 60 秒之后」到达 INBOX 的邮件。
-  IMAP 的 UIDVALIDITY 变了时同理，按 INTERNALDATE 筛选。可能重复报告少量邮件，不会漏。
+  可能重复报告少量邮件，不会漏。
 - **有界。** 每个事件最多 200 个标识；接收方长期不可用时待发队列最多保留 1000 个事件，最旧的先丢。
 - **一个连接一个监听。** 网页管理修改配置时，新 Connector 进程会在旧进程退出前启动；状态文件用文件锁保护，同一时刻只有一个进程在检查。
   `agw lock`、网页「预览工具」等只为读取工具定义而启动的 Connector 不拿状态目录，不会监听。
@@ -306,8 +305,8 @@ Agent 收到后再用这条连接的读取工具读信，所以凭据仍然只�
   `x-openbot-signature: sha256=<HMAC-SHA256("<timestamp>.<delivery id>.<请求体>")>`。
 
 没有用 Gmail 的 `users.watch` + Pub/Sub：它需要另建 Pub/Sub 主题、订阅和一份 Pub/Sub 凭据（Gmail Token 的 scope 必须恰好是
-所配置的那些，不能顺带加 Pub/Sub），而 Google 说明通知可能延迟或丢失，仍要靠 `history.list` 兜底。也没有用 IMAP IDLE：
-30 秒的间隔已满足及时性，IDLE 还要处理续期和断线。两者都可以以后在同一个游标和发送队列上加。
+所配置的那些，不能顺带加 Pub/Sub），而 Google 说明通知可能延迟或丢失，仍要靠 `history.list` 兜底。30 秒的间隔已满足及时性；
+以后需要更快时，可以在同一个游标和发送队列上加。
 
 ## 8. 审批
 
@@ -391,7 +390,7 @@ Passkey 邀请或撤销，以及会引入或改变连接凭据和工具的操作
 | 对真实 iCloud Mail / iCloud 日历 / Gmail 的完整验证 | 未完成；自动验收使用本地 IMAP、CalDAV 和模拟 Google；单次连接成功不替代完整验证 |
 | 审批浏览器验证 | Chromium + 虚拟认证器已覆盖；实体设备和浏览器兼容性需单独验证（8.5） |
 | 提醒事项 | **实验性，未在真实数据上运行**（7.6） |
-| 新邮件通知 | 只用模拟 Google、pymap 和本地签名接收方验证过（7.8）；真实 Gmail 历史、iCloud 和 OpenBot 接收需部署后核对 |
+| 新邮件通知 | 只有 Gmail；只用模拟 Google 和本地签名接收方验证过（7.8）；真实 Gmail 历史和 OpenBot 接收需部署后核对 |
 | 上游凭据层的只读 | 只有 Gmail 成立；iCloud 和提醒事项做不到（7.3） |
 | 审批不被主机上的人绕过 | **做不到**（8.5） |
 | 独立主机上的审批服务 | 没有；只有接口 |
