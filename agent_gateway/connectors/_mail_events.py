@@ -1,20 +1,7 @@
 """Tell a webhook about new mail in INBOX: the connection id and message identifiers, nothing else.
 
-The gateway turns this on per connection (`mail_events` in its configuration). Every
-INTERVAL seconds a background thread asks the mail server what is new since the saved
-cursor: Gmail's history (messages added to INBOX, or labelled INBOX later), or the IMAP
-UIDs above the last one seen. Only identifiers are read, and IMAP opens INBOX read-only,
-so nothing is marked as read.
-
-New identifiers and the advanced cursor are written to the state file together, before
-anything is sent. An event keeps its delivery id until the receiver accepts it, so a
-retry, also after a restart, is the same delivery to the receiver. When the cursor no
-longer works (Gmail keeps history for about a week, sometimes only hours; a new IMAP
-UIDVALIDITY renumbers the mailbox), what arrived since the last good check is reported
-again: a duplicate is possible, a gap is not.
-
-Requests use OpenBot's signed webhook format: `x-openbot-timestamp`, `x-openbot-delivery-id`
-and `x-openbot-signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<delivery id>.<body>">`.
+New identifiers and the advanced cursor are saved before anything is sent, and an event
+keeps its delivery id until the receiver accepts it. See docs/design.md 7.8.
 """
 
 from __future__ import annotations
@@ -67,8 +54,7 @@ class MailEvents:
         self._secret = secret.encode()
         # No proxy from the environment, no redirects: requests go to the configured address only.
         self._http = httpx2.Client(timeout=15, trust_env=False, follow_redirects=False)
-        self._check_at = self._send_at = 0.0
-        self._check_delay = self._send_delay = 0.0
+        self._next = self._delay = 0.0
 
     def start(self) -> None:
         threading.Thread(target=self._loop, name="mail-events", daemon=True).start()
@@ -82,6 +68,9 @@ class MailEvents:
             time.sleep(INTERVAL)
 
     def run_once(self) -> None:
+        now = self.clock()
+        if now < self._next:
+            return
         self.dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.dir, 0o700)
         with open(self.dir / "mail-events.lock", "a") as lock:
@@ -90,21 +79,16 @@ class MailEvents:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            state = self._load()
-            now = self.clock()
-            if now >= self._check_at:
-                try:
-                    self._check(state, now)
-                    self._check_delay = 0.0
-                except Exception:
-                    # Server down, credential refused: ask less often, the cursor keeps its place.
-                    self._check_delay = _longer(self._check_delay)
-                    state = self._load()  # send only what is on disk
-                self._check_at = now + self._check_delay
-            if state["outbox"] and now >= self._send_at:
-                # Receiver offline or refusing: the events wait in the outbox, ask less often.
-                self._send_delay = 0.0 if self._send(state) else _longer(self._send_delay)
-                self._send_at = now + self._send_delay
+            state, ok = self._load(), True
+            try:
+                self._check(state, now)
+            except Exception:  # server down, credential refused: the cursor keeps its place
+                state, ok = self._load(), False  # send only what is on disk
+            if state["outbox"] and not self._send(state):  # receiver offline or refusing: events wait
+                ok = False
+            # Any failure: ask less often (30 s doubling to 5 min); success: back to every round.
+            self._delay = 0.0 if ok else min(max(self._delay * 2, INTERVAL), MAX_DELAY)
+            self._next = now + self._delay
 
     def _check(self, state: dict[str, Any], now: float) -> None:
         ids, fields, cursor = self.source.check(state["cursor"], state["checked_at"])
@@ -252,10 +236,6 @@ class ImapSource:
 def _gmail_ids(values) -> list[str]:
     # Gmail message ids are hexadecimal; anything else is not passed on.
     return list(dict.fromkeys(v for v in values if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{1,32}", v)))
-
-
-def _longer(delay: float) -> float:
-    return min(max(delay * 2, INTERVAL), MAX_DELAY)
 
 
 def _iso(stamp: float) -> str:
