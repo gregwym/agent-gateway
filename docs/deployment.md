@@ -198,7 +198,7 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
 
 ### 5.4 新邮件通知（可选）
 
-让 Agent 在新邮件到达后不久收到通知，而不是自己定时轮询。设计见 [design.md](design.md) 7.8。目前只对自带的 Gmail 连接有效。
+让 Agent 在新邮件到达后不久收到通知，而不是自己定时轮询。设计见 [design.md](design.md) 7.8。只对自带的 Gmail 和 IMAP 连接有效。
 
 1. 在接收方（例如 OpenBot 的 webhook 任务）建好接收地址，得到 URL 和签名密钥。**先让接收方准备好再开监听**：
    OpenBot 会把停用的任务收到的事件记为已忽略，之后用同一个 delivery ID 重发也不会再触发。
@@ -216,10 +216,14 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
        url: https://<接收方给的 webhook URL>
        type: person_a.mail.new        # 接收方要求的事件类型
        secret: mail_events_signing    # 上一步的 secret 名
+     - connection: person_a_icloud_mail
+       url: https://<接收方给的 webhook URL>
+       type: person_a.mail.new
+       secret: mail_events_signing
    ```
 
 4. `docker compose run --rm admin check`：输出里每条应有 `new-mail events: <连接> -> <主机> (type ...)`；
-   ID 写错或不是自带 Gmail 连接时报 problem。然后 `docker compose up -d` 重启。
+   ID 写错或不是 Gmail / IMAP 连接时报 problem。然后 `docker compose up -d` 重启。
 5. 核对：几秒内 `state/audit/connectors/<连接>/mail-events.json` 出现，里面有 `cursor`。之后来一封新邮件，
    30 秒内接收方应收到请求，文件里的 `outbox` 回到空列表；`outbox` 一直不空说明接收方拒绝或不可达
    （密钥不对是 401，需要更正后重启）。
