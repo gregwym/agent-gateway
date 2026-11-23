@@ -253,6 +253,7 @@ class FakeGoogle:
                 Route("/token", self._token, methods=["POST"]),
                 Route("/auth", self._consent, methods=["GET"]),
                 Route("/gmail/v1/users/me/profile", self._profile, methods=["GET"]),
+                Route("/gmail/v1/users/me/history", self._history, methods=["GET"]),
                 Route("/gmail/v1/users/me/labels", self._labels, methods=["GET"]),
                 Route("/gmail/v1/users/me/messages/{message_id}/{operation}", self._change, methods=["POST"]),
                 Route("/gmail/v1/users/me/messages/send", self._send, methods=["POST"]),
@@ -269,12 +270,33 @@ class FakeGoogle:
 
     def add_account(self, refresh_token: str, client_id: str, client_secret: str, scope: str | None = None) -> dict:
         account = {"client_id": client_id, "client_secret": client_secret, "scope": scope or self.READONLY,
-                   "messages": {}, "revoked": False}  # fmt: skip
+                   "messages": {}, "revoked": False,
+                   "history": [], "history_id": 1000, "oldest_history": 1000}  # fmt: skip
         self.accounts[refresh_token] = account
         return account
 
-    def add_message(self, refresh_token: str, message_id: str, raw: bytes, labels: tuple[str, ...] = ("INBOX", "UNREAD")) -> None:
-        self.accounts[refresh_token]["messages"][message_id] = {"raw": raw, "labels": list(labels)}
+    def add_message(self, refresh_token: str, message_id: str, raw: bytes, labels: tuple[str, ...] = ("INBOX", "UNREAD"),
+                    *, at: float | None = None) -> None:
+        account = self.accounts[refresh_token]
+        account["messages"][message_id] = {"raw": raw, "labels": list(labels), "date": time.time() if at is None else at}
+        self._record(account, {"messagesAdded": [{"message": {"id": message_id, "threadId": message_id, "labelIds": list(labels)}}]})
+
+    def add_label(self, refresh_token: str, message_id: str, label: str) -> None:
+        account = self.accounts[refresh_token]
+        message = account["messages"][message_id]
+        message["labels"].append(label)
+        self._record(account, {"labelsAdded": [{"message": {"id": message_id, "threadId": message_id, "labelIds": list(message["labels"])},
+                                                "labelIds": [label]}]})
+
+    def forget_history(self, refresh_token: str) -> None:
+        """What Google does after about a week: older start points answer 404."""
+        account = self.accounts[refresh_token]
+        account["oldest_history"] = account["history_id"]
+
+    @staticmethod
+    def _record(account: dict, change: dict) -> None:
+        account["history_id"] += 1
+        account["history"].append({"id": str(account["history_id"]), **change})
 
     def expire_access_tokens(self) -> None:
         self.access.clear()
@@ -334,9 +356,42 @@ class FakeGoogle:
     async def _profile(self, request):
         from starlette.responses import JSONResponse
 
-        if self._account(request) is None:
+        account = self._account(request)
+        if account is None:
             return JSONResponse({}, 401)
-        return JSONResponse({"emailAddress": "mailbox@example.test"})
+        return JSONResponse({"emailAddress": "mailbox@example.test", "historyId": str(account["history_id"])})
+
+    async def _history(self, request):
+        """users.history.list: messageAdded / labelAdded records after startHistoryId, paged."""
+        from starlette.responses import JSONResponse
+
+        account = self._account(request)
+        if account is None:
+            return JSONResponse({}, 401)
+        query = request.query_params
+        start = int(query["startHistoryId"])
+        if start < account["oldest_history"]:
+            return JSONResponse({"error": {"code": 404, "message": "Requested entity was not found."}}, 404)
+        types = set(query.getlist("historyTypes")) or {"messageAdded", "labelAdded"}
+        label = query.get("labelId")
+        records = []
+        for record in account["history"]:
+            if int(record["id"]) <= start:
+                continue
+            kept = {"id": record["id"]}
+            for kind, field in (("messageAdded", "messagesAdded"), ("labelAdded", "labelsAdded")):
+                items = [item for item in record.get(field, []) if kind in types and (not label or label in item["message"]["labelIds"])]
+                if items:
+                    kept[field] = items
+            if len(kept) > 1:
+                records.append(kept)
+        size, offset = int(query.get("maxResults", "100")), int(query.get("pageToken", "0"))
+        out = {"historyId": str(account["history_id"])}
+        if records[offset:offset + size]:
+            out["history"] = records[offset:offset + size]
+        if offset + size < len(records):
+            out["nextPageToken"] = str(offset + size)
+        return JSONResponse(out)
 
     async def _send(self, request):
         import base64
@@ -392,9 +447,14 @@ class FakeGoogle:
         if account is None:
             return JSONResponse({"error": {"code": 401, "status": "UNAUTHENTICATED"}}, 401)
         words = request.query_params.get("q", "").lower().split()
+        # `after:<epoch seconds>` compares the time the message arrived; other words match its text.
+        after = max((int(word[6:]) for word in words if word.startswith("after:")), default=None)
+        words = [word for word in words if not word.startswith("after:")]
         hits = []
         for message_id, message in sorted(account["messages"].items(), reverse=True):
             text = message["raw"].decode("utf-8", "replace").lower()
+            if after is not None and message["date"] <= after:
+                continue
             if all(word.split(":", 1)[-1] in text for word in words):
                 hits.append({"id": message_id, "threadId": message_id})
         limit = int(request.query_params.get("maxResults", "100"))
@@ -429,3 +489,60 @@ class FakeGoogle:
 
         self.requests.append((request.method, request.url.path))
         return JSONResponse({"error": {"code": 404}}, 404)
+
+
+class WebhookReceiver:
+    """Stands in for an OpenBot webhook URL on localhost.
+
+    It checks what OpenBot checks (an HMAC-SHA256 signature over timestamp, delivery
+    id and body; a timestamp within 300 seconds) and treats a repeated delivery id as a
+    duplicate (200). `statuses` lists answers to give first, such as 503 for "offline".
+    """
+
+    PATH = "/v1/webhooks/route-1"
+
+    def __init__(self, secret: str) -> None:
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+
+        self.secret = secret.encode()
+        self.statuses: list[int] = []
+        self.attempts: list[tuple[str, int]] = []  # (delivery id, answer) for every request
+        self.events: list[dict] = []  # bodies of accepted deliveries
+        self.headers: list[dict[str, str]] = []
+        self._accepted: set[str] = set()
+        app = Starlette(routes=[Route(self.PATH, self._receive, methods=["POST"])])
+        self.port = free_port()
+        self._server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="error"))
+        threading.Thread(target=self._server.run, daemon=True).start()
+        wait_for_port(self.port)
+        self.url = f"http://127.0.0.1:{self.port}{self.PATH}"
+
+    def close(self) -> None:
+        self._server.should_exit = True
+
+    async def _receive(self, request):  # type: ignore[no-untyped-def]
+        import hashlib
+        import hmac
+        import json
+
+        from starlette.responses import Response
+
+        body = await request.body()
+        stamp = request.headers.get("x-openbot-timestamp", "")
+        delivery = request.headers.get("x-openbot-delivery-id", "")
+        expected = "sha256=" + hmac.new(self.secret, f"{stamp}.{delivery}.".encode() + body, hashlib.sha256).hexdigest()
+        if not stamp.isdecimal() or abs(time.time() - int(stamp)) > 300 or not hmac.compare_digest(
+                expected, request.headers.get("x-openbot-signature", "")):
+            status = 401
+        elif self.statuses:
+            status = self.statuses.pop(0)
+        else:
+            status = 200 if delivery in self._accepted else 202
+        self.attempts.append((delivery, status))
+        if status == 202:
+            self._accepted.add(delivery)
+            self.events.append(json.loads(body))
+            self.headers.append(dict(request.headers))
+        return Response(status_code=status)

@@ -1,0 +1,262 @@
+"""Tell a webhook about new mail in INBOX: the connection id and message identifiers, nothing else.
+
+The gateway turns this on per connection (`mail_events` in its configuration). Every
+INTERVAL seconds a background thread asks the mail server what is new since the saved
+cursor: Gmail's history (messages added to INBOX, or labelled INBOX later), or the IMAP
+UIDs above the last one seen. Only identifiers are read, and IMAP opens INBOX read-only,
+so nothing is marked as read.
+
+New identifiers and the advanced cursor are written to the state file together, before
+anything is sent. An event keeps its delivery id until the receiver accepts it, so a
+retry, also after a restart, is the same delivery to the receiver. When the cursor no
+longer works (Gmail keeps history for about a week, sometimes only hours; a new IMAP
+UIDVALIDITY renumbers the mailbox), what arrived since the last good check is reported
+again: a duplicate is possible, a gap is not.
+
+Requests use OpenBot's signed webhook format: `x-openbot-timestamp`, `x-openbot-delivery-id`
+and `x-openbot-signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<delivery id>.<body>">`.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx2
+
+from ._base import ConnectorError, setting
+
+INTERVAL = 30  # seconds between checks
+MAX_DELAY = 300  # the longest pause after repeated failures (Gmail's own credential pause)
+CHUNK = 200  # identifiers per event, far below webhook body limits (OpenBot: 64 KB)
+OUTBOX_LIMIT = 1000  # events kept for a receiver that stays unreachable; the oldest go first
+MARGIN = 60  # a resync also covers this much before the last good check (clock differences)
+STATE = "mail-events.json"
+
+
+def from_environment(source: Callable[[], Any]) -> MailEvents | None:
+    """The watcher the gateway asked for, or None.
+
+    Admin commands that start a connector only to list its tools get no state directory,
+    so they never watch.
+    """
+    url, directory = os.environ.get("AGW_MAIL_EVENTS_URL"), os.environ.get("AGW_STATE_DIR")
+    if not url or not directory:
+        return None
+    return MailEvents(directory, url, setting("AGW_MAIL_EVENTS_TYPE"), setting("AGW_MAIL_EVENTS_SECRET"),
+                      setting("AGW_MAIL_EVENTS_MAILBOX"), source())
+
+
+class MailEvents:
+    def __init__(self, directory, url: str, event_type: str, secret: str, mailbox: str, source, *,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.dir = Path(directory)
+        self.url, self.type, self.mailbox, self.source, self.clock = url, event_type, mailbox, source, clock
+        self._secret = secret.encode()
+        # No proxy from the environment, no redirects: requests go to the configured address only.
+        self._http = httpx2.Client(timeout=15, trust_env=False, follow_redirects=False)
+        self._check_at = self._send_at = 0.0
+        self._check_delay = self._send_delay = 0.0
+
+    def start(self) -> None:
+        threading.Thread(target=self._loop, name="mail-events", daemon=True).start()
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                self.run_once()
+            except Exception:
+                pass  # nothing was saved half-way; the next round starts from the state on disk
+            time.sleep(INTERVAL)
+
+    def run_once(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+        with open(self.dir / "mail-events.lock", "a") as lock:
+            try:
+                # A configuration change starts the new connector process before the old one stops.
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            state = self._load()
+            now = self.clock()
+            if now >= self._check_at:
+                try:
+                    self._check(state, now)
+                    self._check_delay = 0.0
+                except Exception:
+                    # Server down, credential refused: ask less often, the cursor keeps its place.
+                    self._check_delay = _longer(self._check_delay)
+                    state = self._load()  # send only what is on disk
+                self._check_at = now + self._check_delay
+            if state["outbox"] and now >= self._send_at:
+                # Receiver offline or refusing: the events wait in the outbox, ask less often.
+                self._send_delay = 0.0 if self._send(state) else _longer(self._send_delay)
+                self._send_at = now + self._send_delay
+
+    def _check(self, state: dict[str, Any], now: float) -> None:
+        ids, fields, cursor = self.source.check(state["cursor"], state["checked_at"])
+        for start in range(0, len(ids), CHUNK):
+            state["outbox"].append({"id": uuid.uuid4().hex, "at": _iso(now),
+                                    "data": {"mailbox": self.mailbox, **fields, self.source.key: ids[start:start + CHUNK]}})
+        del state["outbox"][:-OUTBOX_LIMIT]
+        state["cursor"], state["checked_at"] = cursor, now
+        self._save(state)
+
+    def _send(self, state: dict[str, Any]) -> bool:
+        """Deliver the outbox in order; False when the receiver has to be asked again later."""
+        done = 0
+        for entry in state["outbox"]:
+            status = self._post(entry)
+            # 2xx: accepted, or a repeat of an accepted delivery. 400 and 413 refuse the body
+            # itself, which a retry cannot change; keeping it would hold back every later event.
+            if status is None or not (200 <= status < 300 or status in (400, 413)):
+                break
+            done += 1
+        if done:
+            del state["outbox"][:done]
+            self._save(state)
+        return not state["outbox"]
+
+    def _post(self, entry: dict[str, Any]) -> int | None:
+        body = json.dumps({"type": self.type, "occurredAt": entry["at"], "data": entry["data"]},
+                          ensure_ascii=False, separators=(",", ":")).encode()
+        stamp = str(int(time.time()))  # signed afresh on every attempt: receivers check freshness
+        signature = hmac.new(self._secret, f"{stamp}.{entry['id']}.".encode() + body, hashlib.sha256).hexdigest()
+        try:
+            reply = self._http.post(self.url, content=body, headers={
+                "content-type": "application/json",
+                "x-openbot-timestamp": stamp,
+                "x-openbot-delivery-id": entry["id"],
+                "x-openbot-signature": "sha256=" + signature,
+            })
+        except httpx2.HTTPError:
+            return None
+        return reply.status_code
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            saved = json.loads((self.dir / STATE).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            saved = {}
+        return {"cursor": saved.get("cursor"), "checked_at": saved.get("checked_at"), "outbox": saved.get("outbox", [])}
+
+    def _save(self, state: dict[str, Any]) -> None:
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".tmp-mail-events-")  # created 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.dir / STATE)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+
+class GmailSource:
+    """New INBOX mail of a Gmail mailbox, from its history. Needs only gmail.readonly."""
+
+    key = "message_ids"
+
+    def __init__(self, gmail) -> None:
+        self.gmail = gmail
+
+    def check(self, cursor: dict[str, Any] | None, since: float | None) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+        if cursor is None:  # the first check starts from now: older mail is not new
+            return [], {}, {"history_id": self._latest()}
+        try:
+            ids, latest = self._history(cursor["history_id"])
+        except ConnectorError as exc:
+            if exc.code != "gmail_message_missing":  # how Gmail.get reports any 404
+                raise
+            # The cursor is older than the history Gmail keeps: list what arrived since the last good check.
+            latest = self._latest()
+            ids = self._arrived_after((since or 0) - MARGIN)
+        return ids, {}, {"history_id": latest}
+
+    def _latest(self) -> str:
+        return str(self.gmail.get("profile")["historyId"])
+
+    def _history(self, start: str) -> tuple[list[str], str]:
+        ids: list[str] = []
+        latest, token = start, None
+        while True:
+            params = [("startHistoryId", start), ("labelId", "INBOX"), ("historyTypes", "messageAdded"),
+                      ("historyTypes", "labelAdded"), ("maxResults", "500")] + ([("pageToken", token)] if token else [])
+            page = self.gmail.get("history", params)
+            latest = str(page.get("historyId", latest))
+            for record in page.get("history", []):
+                ids += [item.get("message", {}).get("id") for item in record.get("messagesAdded", [])
+                        if "INBOX" in item.get("message", {}).get("labelIds", [])]
+                ids += [item.get("message", {}).get("id") for item in record.get("labelsAdded", [])
+                        if "INBOX" in item.get("labelIds", [])]
+            token = page.get("nextPageToken")
+            if not token:
+                return _gmail_ids(ids), latest
+
+    def _arrived_after(self, after: float) -> list[str]:
+        ids: list[str] = []
+        token = None
+        while True:
+            params = [("labelIds", "INBOX"), ("q", f"after:{int(after)}"), ("maxResults", "500")]
+            page = self.gmail.get("messages", params + ([("pageToken", token)] if token else []))
+            ids += [item.get("id") for item in page.get("messages", [])]
+            token = page.get("nextPageToken")
+            if not token:
+                return _gmail_ids(reversed(ids))  # the list is newest first
+
+
+class ImapSource:
+    """New INBOX mail of an IMAP mailbox, by UID. INBOX is opened read-only (EXAMINE)."""
+
+    key = "uids"
+
+    def __init__(self, mailbox) -> None:
+        self.mailbox = mailbox  # its own session, so a check never interleaves with a tool call
+
+    def check(self, cursor: dict[str, Any] | None, since: float | None) -> tuple[list[int], dict[str, Any], dict[str, Any]]:
+        def run(client) -> tuple[list[int], dict[str, Any], dict[str, Any]]:
+            info = client.select_folder("INBOX", readonly=True)
+            validity = int(info[b"UIDVALIDITY"])
+            top = int(info[b"UIDNEXT"]) - 1 if info.get(b"UIDNEXT") else max(client.search(["ALL"]), default=0)
+            if cursor is None:  # the first check starts from now: older mail is not new
+                return [], {"uidvalidity": validity}, {"uidvalidity": validity, "last_uid": top}
+            if cursor["uidvalidity"] == validity:
+                last = cursor["last_uid"]
+                uids = sorted(uid for uid in client.search(["UID", f"{last + 1}:*"]) if uid > last)  # n:* also matches the top UID
+            else:
+                # The mailbox was renumbered: report what arrived since the last good check.
+                after = (since or 0) - MARGIN
+                found = client.search(["SINCE", date.fromtimestamp(after - 86_400)])  # whole days on the server; exact below
+                arrived = client.fetch(found, ["INTERNALDATE"]) if found else {}
+                uids = sorted(uid for uid, data in arrived.items() if data[b"INTERNALDATE"].timestamp() >= after)
+                last = 0
+            return uids, {"uidvalidity": validity}, {"uidvalidity": validity, "last_uid": max([last, top, *uids])}
+
+        return self.mailbox.run(run)
+
+
+def _gmail_ids(values) -> list[str]:
+    # Gmail message ids are hexadecimal; anything else is not passed on.
+    return list(dict.fromkeys(v for v in values if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{1,32}", v)))
+
+
+def _longer(delay: float) -> float:
+    return min(max(delay * 2, INTERVAL), MAX_DELAY)
+
+
+def _iso(stamp: float) -> str:
+    return datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")

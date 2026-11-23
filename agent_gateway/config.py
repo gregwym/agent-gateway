@@ -147,6 +147,28 @@ class AdminCfg(_Model):
     session_seconds: int = Field(1800, ge=60, le=3600)
 
 
+class MailEventsCfg(_Model):
+    """Tell a webhook about new mail in one bundled Gmail or IMAP connection's INBOX.
+
+    A host setting, so a connection edited in the web administration keeps it. The
+    request carries the connection id and message identifiers only (docs/design.md 7.8).
+    """
+
+    connection: str = Field(pattern=NAME)
+    url: str
+    type: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f\x7f]*$")  # the event type the receiver expects
+    secret: str = Field(min_length=1)  # name of the signing secret in the secret store
+
+    @model_validator(mode="after")
+    def _url(self) -> MailEventsCfg:
+        where = f"mail_events {self.connection}"
+        _check_url(where, self.url, allow_plain_http=True)
+        parts = urlsplit(self.url)
+        if parts.scheme != "https" and not _is_loopback(parts.hostname or ""):
+            raise ValueError(f"{where}: url must be https")  # plain http only to this host, for tests
+        return self
+
+
 class ToolCfg(_Model):
     """One upstream tool, exposed under one name, optionally narrowed.
 
@@ -352,6 +374,7 @@ class Config(_Model):
     clients: list[ClientCfg]
     connections: list[ConnectionCfg]
     policy: list[RuleCfg] = []
+    mail_events: list[MailEventsCfg] = []
 
     @model_validator(mode="before")
     @classmethod
@@ -390,6 +413,9 @@ class Config(_Model):
         for name in self.shared:
             if name not in known:
                 raise ValueError(f"shared: unknown principal {name!r}")
+        _unique("mail_events connection", [e.connection for e in self.mail_events])
+        if self.mail_events and self.secrets is None:
+            raise ValueError("mail_events needs a `secrets:` store for the signing secret")
 
         _unique("client id", [c.id for c in self.clients])
         _unique("client token", [c.token_sha256 for c in self.clients], show=False)
@@ -468,6 +494,10 @@ class Config(_Model):
                 return tuple(m.id for m in self.members if m.household == approver)
             return tuple(p for p in self.principals if p not in self.shared)
         return (approver,)
+
+    def secret_names(self) -> set[str]:
+        """Every secret this configuration needs: connection credentials and webhook signing keys."""
+        return {name for conn in self.connections for name in conn.secret_names()} | {e.secret for e in self.mail_events}
 
     def household_of(self, owner: str) -> str | None:
         if any(h.id == owner for h in self.households):

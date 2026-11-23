@@ -351,6 +351,11 @@ def main() -> None:
         token_url=_endpoint("GMAIL_TOKEN_URL", "https://oauth2.googleapis.com/token"),
         access=access,
     )
+    from ._mail_events import GmailSource, from_environment
+
+    events = from_environment(lambda: GmailSource(gmail))  # only when the gateway configured mail_events
+    if events:
+        events.start()
     serve(
         "gmail",
         build_tools(

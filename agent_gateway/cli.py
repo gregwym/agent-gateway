@@ -21,6 +21,7 @@ import os
 import sys
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 
@@ -41,8 +42,8 @@ def _store(cfg: Config) -> EncryptedFileStore:
 
 
 def resolve_secrets(cfg: Config) -> dict[str, str]:
-    """Every secret the configured connections reference, or an error naming the missing ones."""
-    wanted = sorted({name for conn in cfg.connections for name in conn.secret_names()})
+    """Every secret the configuration references, or an error naming the missing ones."""
+    wanted = sorted(cfg.secret_names())
     if not wanted:
         return {}
     store = _store(cfg)
@@ -85,7 +86,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     lock = Lock.load(cfg.lock_file)
     # Built without secrets: this only inspects routes, it never connects.
-    gateway = Gateway(cfg, lock, {name: "" for c in cfg.connections for name in c.secret_names()}, Audit(None))
+    gateway = Gateway(cfg, lock, {name: "" for name in cfg.secret_names()}, Audit(None))
     if cfg.admin:
         from .admin_config import ManagedStore
         gateway.secrets = resolve_secrets(cfg)
@@ -144,6 +145,11 @@ def cmd_check(args: argparse.Namespace) -> int:
         if route.problem:
             hint = " (run `agw lock`)" if route.problem == "not_locked" else ""
             problems.append(f"tool {name} will not be served: {route.problem}{hint}")
+    for event in cfg.mail_events:
+        if event.connection in gateway.unused_mail_events:
+            problems.append(f"mail_events {event.connection}: no bundled Gmail or IMAP connection has this id")
+        else:
+            print(f"new-mail events: {event.connection} -> {urlsplit(event.url).hostname} (type {event.type})")
     try:
         if not cfg.admin:
             resolve_secrets(cfg)
