@@ -279,14 +279,17 @@ class FakeGoogle:
                     *, at: float | None = None) -> None:
         account = self.accounts[refresh_token]
         account["messages"][message_id] = {"raw": raw, "labels": list(labels), "date": time.time() if at is None else at}
-        self._record(account, {"messagesAdded": [{"message": {"id": message_id, "threadId": message_id, "labelIds": list(labels)}}]})
+        self._record(account, {"messagesAdded": [{"message": {"id": message_id, "threadId": message_id}}]})
 
     def add_label(self, refresh_token: str, message_id: str, label: str) -> None:
         account = self.accounts[refresh_token]
-        message = account["messages"][message_id]
-        message["labels"].append(label)
-        self._record(account, {"labelsAdded": [{"message": {"id": message_id, "threadId": message_id, "labelIds": list(message["labels"])},
-                                                "labelIds": [label]}]})
+        account["messages"][message_id]["labels"].append(label)
+        self._record(account, {"labelsAdded": [{"message": {"id": message_id, "threadId": message_id}, "labelIds": [label]}]})
+
+    def remove_label(self, refresh_token: str, message_id: str, label: str) -> None:
+        account = self.accounts[refresh_token]
+        account["messages"][message_id]["labels"].remove(label)
+        self._record(account, {"labelsRemoved": [{"message": {"id": message_id, "threadId": message_id}, "labelIds": [label]}]})
 
     def forget_history(self, refresh_token: str) -> None:
         """What Google does after about a week: older start points answer 404."""
@@ -362,7 +365,11 @@ class FakeGoogle:
         return JSONResponse({"emailAddress": "mailbox@example.test", "historyId": str(account["history_id"])})
 
     async def _history(self, request):
-        """users.history.list: messageAdded / labelAdded records after startHistoryId, paged."""
+        """users.history.list: messageAdded / labelAdded records after startHistoryId, paged.
+
+        As in Google's responses, a record's message carries only `id` and `threadId`;
+        `labelId` filters on the message's labels here, on the server.
+        """
         from starlette.responses import JSONResponse
 
         account = self._account(request)
@@ -380,7 +387,8 @@ class FakeGoogle:
                 continue
             kept = {"id": record["id"]}
             for kind, field in (("messageAdded", "messagesAdded"), ("labelAdded", "labelsAdded")):
-                items = [item for item in record.get(field, []) if kind in types and (not label or label in item["message"]["labelIds"])]
+                items = [item for item in record.get(field, []) if kind in types
+                         and (not label or label in account["messages"][item["message"]["id"]]["labels"])]
                 if items:
                     kept[field] = items
             if len(kept) > 1:

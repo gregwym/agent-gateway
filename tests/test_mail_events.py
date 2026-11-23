@@ -109,7 +109,12 @@ def test_gmail_reports_mail_that_reaches_the_inbox_with_identifiers_only(tmp_pat
     # Only the history was asked for: no message was opened.
     assert {path for _, path in google.requests} <= {"/token", "/gmail/v1/users/me/history"}
     assert saved(tmp_path)["outbox"] == []
+    # As from Google, the history names messages by id and threadId only: no labels to filter on.
+    page = events.source.gmail.get("history", [("startHistoryId", "1000"), ("labelId", "INBOX")])
+    assert all(set(item["message"]) == {"id", "threadId"}
+               for record in page["history"] for field in ("messagesAdded", "labelsAdded") for item in record.get(field, []))
 
+    google.add_label(refresh, "18c0a1", "STARRED")  # a label added to inbox mail, but not INBOX
     clock.later()
     events.run_once()
     assert len(receiver.attempts) == 1  # nothing new, nothing sent

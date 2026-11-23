@@ -183,8 +183,9 @@ class GmailSource:
             page = self.gmail.get("history", params)
             latest = str(page.get("historyId", latest))
             for record in page.get("history", []):
-                ids += [item.get("message", {}).get("id") for item in record.get("messagesAdded", [])
-                        if "INBOX" in item.get("message", {}).get("labelIds", [])]
+                # A record's message has only id and threadId; labelId=INBOX already chose the messages.
+                ids += [item.get("message", {}).get("id") for item in record.get("messagesAdded", [])]
+                # labelsAdded[].labelIds are the labels added in this change: INBOX, not e.g. a star.
                 ids += [item.get("message", {}).get("id") for item in record.get("labelsAdded", [])
                         if "INBOX" in item.get("labelIds", [])]
             token = page.get("nextPageToken")
