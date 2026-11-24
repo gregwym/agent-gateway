@@ -198,7 +198,7 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
 
 ### 5.4 新邮件通知（可选）
 
-让 Agent 在新邮件到达后不久收到通知，而不是自己定时轮询。设计见 [design.md](design.md) 7.8。目前只对自带的 Gmail 连接有效。
+让 Agent 在新邮件到达后不久收到通知，而不是自己定时轮询。设计见 [design.md](design.md) 7.8。只对自带的 Gmail 和 IMAP 连接有效。
 
 1. 在接收方（例如 OpenBot 的 webhook 任务）建好接收地址，得到 URL 和签名密钥。**先让接收方准备好再开监听**：
    OpenBot 会把停用的任务收到的事件记为已忽略，之后用同一个 delivery ID 重发也不会再触发。
@@ -216,10 +216,14 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
        url: https://<接收方给的 webhook URL>
        type: person_a.mail.new        # 接收方要求的事件类型
        secret: mail_events_signing    # 上一步的 secret 名
+     - connection: person_a_icloud_mail
+       url: https://<接收方给的 webhook URL>
+       type: person_a.mail.new
+       secret: mail_events_signing
    ```
 
 4. `docker compose run --rm admin check`：输出里每条应有 `new-mail events: <连接> -> <主机> (type ...)`；
-   ID 写错或不是自带 Gmail 连接时报 problem。然后 `docker compose restart gateway`：配置只在进程启动时读取，
+   ID 写错或不是 Gmail / IMAP 连接时报 problem。然后 `docker compose restart gateway`：配置只在进程启动时读取，
    网关已在运行时 `docker compose up -d` 不会重启它（只有第一次启动用 `up -d`）。
 5. 核对：几秒内 `state/audit/connectors/<连接>/mail-events.json` 出现，里面有 `cursor`。之后来一封新邮件，
    30 秒内接收方应收到请求，文件里的 `outbox` 回到空列表；`outbox` 一直不空说明接收方拒绝或不可达
@@ -227,7 +231,7 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
 
 URL 只接受 https。请求从 Gateway 容器出站，主机需要能访问该地址。删掉 `mail_events` 里的条目并 `docker compose restart gateway`
 即停止；状态文件留着无害，在网页删除连接时随连接目录一起删除。停用一段时间后重新启用，会补报停用期间到达的邮件
-（停用超过约一周时，期间被移回收件箱的旧邮件不补报，见 design.md 7.8）；
+（Gmail 历史已过期、或 IMAP 邮箱被重新编号时，期间被移回收件箱的旧邮件不补报，见 design.md 7.8）；
 不需要补报时，重启前先删掉该连接的 `mail-events.json`，监听会从当前位置重新开始。
 
 **给开着通知的连接改名**：网页上直接改名会被拒绝（`mail_events` 还写着旧名称，网页改不了这个文件，改名后通知就会停）。
@@ -236,8 +240,9 @@ URL 只接受 https。请求从 Gateway 容器出站，主机需要能访问该�
 都不会再发（design.md 7.8）。在网页上把连接换成另一个邮箱账号时同样从当时开始，旧邮箱还没发出的通知作废。
 **已知限制：**改名后又改回原名，网关会接着用原名留下的检查进度和没发出的通知
 （`state/audit/connectors/<原名>/mail-events.json`），可能收到过期或重复的提醒。原名的检查进度已经失效时
-（离开原名超过约一周），期间被移回收件箱的旧邮件不会通知（design.md 7.8）。不想要这些提醒，就在改回原名之前删掉这个文件：
-没发出的通知随之丢弃，改回后从当时开始。只删这一个文件，不要删整个目录。
+（Gmail 历史已过期，或 iCloud 邮箱被重新编号），期间被移回收件箱的旧邮件不会通知（design.md 7.8）。不想要这些提醒，就在改回原名之前删掉这个文件：
+没发出的通知随之丢弃，改回后从当时开始。只删这一个文件，不要删整个目录：同一目录里还有 iCloud 连接等待放进「已发送」的邮件副本。
+Gmail 和 iCloud 相同。
 删除连接即停止它的通知，同时删掉 `mail_events` 里的条目。
 
 ### 5.5 收尾

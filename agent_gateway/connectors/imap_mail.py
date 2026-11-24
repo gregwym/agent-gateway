@@ -50,6 +50,11 @@ class Mailbox:
         self._client: IMAPClient | None = None
         self._gate = CredentialGate(_REJECTED, code="imap_credentials_rejected")
 
+    @property
+    def address(self) -> str:
+        """Names this mailbox in saved state; another port on the same host can be another mailbox."""
+        return f"{self._username}@{self._host}:{self._port}"
+
     def _connect(self) -> IMAPClient:
         self._gate.check()
         client = IMAPClient(self._host, port=self._port, ssl=True, ssl_context=ssl.create_default_context(), timeout=30)
@@ -259,6 +264,12 @@ def main() -> None:
         sent.start()  # also files copies left pending before a restart
     submission = Submission(smtp_host, int(setting("SMTP_PORT", "587")), setting("SMTP_SECURITY", "starttls"),
                             os.environ.get("SMTP_USERNAME") or (sender if icloud else username), password, sender, sent=sent)
+    from ._mail_events import ImapSource, from_environment
+
+    # Only when the gateway configured mail_events; its own session, like the Sent copies.
+    events = from_environment(lambda: ImapSource(Mailbox(host=host, port=port, username=username, password=password)))
+    if events:
+        events.start()
     serve(
         "imap-mail",
         build_tools(

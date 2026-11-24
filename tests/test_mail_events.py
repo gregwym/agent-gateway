@@ -1,8 +1,8 @@
 """New-mail events: what reaches the webhook, when, and what happens when something fails.
 
-Gmail is `FakeGoogle` (documented response shapes, not Google). The receiver checks
-signatures the way an OpenBot webhook URL does. These tests do not show how Google or
-OpenBot behave in production.
+Gmail is `FakeGoogle` (documented response shapes, not Google); IMAP is pymap, a real
+IMAP server. The receiver checks signatures the way an OpenBot webhook URL does. These
+tests do not show how Google, iCloud or OpenBot behave in production.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import json
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from types import SimpleNamespace
 
@@ -22,15 +22,17 @@ import pytest
 import yaml
 from helpers import SECRETS as BASE_SECRETS
 from helpers import base_config, prepare, running_gateway
+from imapclient import IMAPClient
 from passkey_helpers import approval_config
-from service_helpers import FakeGoogle, WebhookReceiver, free_port
+from service_helpers import FakeGoogle, WebhookReceiver, free_port, mail_account
 from test_admin import change, setup, web_gateway
 
 from agent_gateway import cli
 from agent_gateway.config import ConfigError, load_config
 from agent_gateway.connectors import _mail_events
-from agent_gateway.connectors._mail_events import INTERVAL, GmailSource, MailEvents
+from agent_gateway.connectors._mail_events import INTERVAL, GmailSource, ImapSource, MailEvents
 from agent_gateway.connectors.gmail import Gmail
+from agent_gateway.connectors.imap_mail import Mailbox
 from agent_gateway.upstream import Upstream
 
 pytestmark = pytest.mark.anyio
@@ -38,6 +40,7 @@ pytestmark = pytest.mark.anyio
 CLIENT_ID = "1234567890-testclient.apps.googleusercontent.com"
 CLIENT_SECRET = "GOCSPX-test-client-secret-000000"
 SIGNING_SECRET = "whsec-test-signing-secret-0000"
+USER, PASSWORD = "account@example.test", "fake-app-password"
 
 
 def raw(subject: str) -> bytes:
@@ -270,6 +273,92 @@ def test_a_second_process_of_the_same_connection_stays_out(tmp_path, google, rec
     assert (tmp_path / "state" / "mail-events.json").exists()
 
 
+def append(account, subject: str, when: datetime | None = None) -> int:
+    with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+        client.login(account.user, account.password)
+        out = EmailMessage()
+        out["Subject"], out["From"], out["To"] = subject, "sender@example.test", USER
+        out.set_content("Private body text.")
+        result = client.append("INBOX", out.as_bytes(), flags=(), msg_time=when or datetime.now(timezone.utc))
+        return int(result.split(b"]")[0].split()[-1])  # [APPENDUID <validity> <uid>]
+
+
+def flags(account, uid: int):
+    with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+        client.login(account.user, account.password)
+        client.select_folder("INBOX", readonly=True)
+        return client.fetch([uid], ["FLAGS"])[uid][b"FLAGS"]
+
+
+def imap_events(tmp_path, account, receiver, clock):
+    mailbox = Mailbox("localhost", account.front.port, USER, PASSWORD)
+    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", ImapSource(mailbox), clock=clock)
+
+
+def test_imap_reports_new_uids_without_marking_anything_read(tmp_path, monkeypatch, receiver):
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        monkeypatch.setenv("SSL_CERT_FILE", str(account.cert))
+        clock = Clock()
+        events = imap_events(tmp_path, account, receiver, clock)
+        events.run_once()
+        cursor = saved(tmp_path)["cursor"]
+        assert receiver.attempts == [] and cursor["last_uid"] == 104
+
+        first, second = append(account, "Invoice"), append(account, "Receipt")
+        clock.later()
+        events.run_once()
+        assert receiver.events[0]["data"] == {"mailbox": "icloud-a", "uidvalidity": cursor["uidvalidity"], "uids": [first, second]}
+        assert b"\\Seen" not in flags(account, first) and b"\\Seen" not in flags(account, second)
+        assert "Invoice" not in json.dumps(receiver.events)
+
+        clock.later()
+        events.run_once()
+        assert len(receiver.attempts) == 1
+
+
+def test_a_renumbered_imap_inbox_reports_what_arrived_since_the_last_good_check(tmp_path, monkeypatch, receiver):
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        monkeypatch.setenv("SSL_CERT_FILE", str(account.cert))
+        clock = Clock()
+        events = imap_events(tmp_path, account, receiver, clock)
+        events.run_once()
+        state = saved(tmp_path)
+        validity = state["cursor"]["uidvalidity"]
+        # As if the server had given INBOX a new UIDVALIDITY since the last check.
+        state["cursor"] = {"uidvalidity": validity + 1, "last_uid": 9}
+        (tmp_path / "state" / "mail-events.json").write_text(json.dumps(state))
+        fresh = append(account, "after the last check")
+        moved = move_to_inbox(account, "archived a month ago", datetime.now(timezone.utc) - timedelta(days=30))
+
+        clock.later()
+        events.run_once()
+        # By arrival time only (docs/design.md 7.8): the demo messages from decades ago and the old
+        # message moved back during the gap are not reported; the new one is.
+        assert [event["data"] for event in receiver.events] == [{"mailbox": "icloud-a", "uidvalidity": validity, "uids": [fresh]}]
+        assert saved(tmp_path)["cursor"] == {"uidvalidity": validity, "last_uid": moved}
+
+        again = move_to_inbox(account, "archived again", datetime.now(timezone.utc) - timedelta(days=30))
+        clock.later()
+        events.run_once()  # with a valid cursor, a message moved in gets a new UID and is reported
+        assert receiver.events[-1]["data"]["uids"] == [again]
+
+
+def move_to_inbox(account, subject: str, when: datetime) -> int:
+    """File an old message in another folder, then MOVE it to INBOX: it keeps its INTERNALDATE."""
+    with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+        client.login(account.user, account.password)
+        if not client.folder_exists("Archive"):
+            client.create_folder("Archive")
+        out = EmailMessage()
+        out["Subject"], out["From"], out["To"] = subject, "sender@example.test", USER
+        out.set_content("Private body text.")
+        client.append("Archive", out.as_bytes(), flags=(), msg_time=when)
+        client.select_folder("Archive")
+        client.move(client.search(["ALL"]), "INBOX")
+        client.select_folder("INBOX", readonly=True)
+        return max(client.search(["ALL"]))
+
+
 def events_config(google: FakeGoogle, url: str, **entry) -> dict:
     out = copy.deepcopy(base_config())
     out["connections"] = [{
@@ -326,7 +415,7 @@ async def test_check_lists_the_events_and_reports_an_entry_without_a_mail_connec
     raw_config["mail_events"].append({"connection": "notes-a", "url": receiver.url, "type": "x", "secret": "mail_events_signing"})
     path = await prepare(tmp_path / "other", raw_config, secrets=SECRETS)
     assert cli.main(["check", "-c", str(path)]) == 1
-    assert "mail_events notes-a: no bundled Gmail connection has this id" in capsys.readouterr().err
+    assert "mail_events notes-a: no bundled Gmail or IMAP connection has this id" in capsys.readouterr().err
 
     missing = await prepare(tmp_path / "missing", events_config(google, receiver.url), lock=False,
                             secrets={k: v for k, v in SECRETS.items() if k != "mail_events_signing"})
@@ -366,6 +455,35 @@ def test_mail_events_need_one_entry_per_connection_and_a_secret_store(tmp_path):
     with pytest.raises(ConfigError, match="mail_events needs a `secrets:` store"):
         load_config(tmp_path / "b.yaml")
 
+
+async def test_the_gateway_starts_the_watcher_for_an_imap_connection(tmp_path, receiver):
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        raw_config = copy.deepcopy(base_config())
+        raw_config["connections"] = [{
+            "id": "icloud-a", "service": "icloud-mail", "account": "person_a", "owner": "person_a", "transport": "stdio",
+            "command": [sys.executable, "-m", "agent_gateway.connectors.imap_mail"],
+            "env": {"IMAP_HOST": "localhost", "IMAP_PORT": str(account.front.port), "IMAP_USERNAME": USER,
+                    "SSL_CERT_FILE": str(account.cert), "SMTP_HOST": ""},
+            "secret_env": {"IMAP_PASSWORD": "mail_a"}, "timeout_seconds": 20,
+            "tools": [{"upstream": "list_mailboxes", "name": "a_mail_list_mailboxes"}],
+        }]
+        raw_config["policy"] = [{"principals": ["person_a"], "connection": "icloud-a", "tools": ["a_mail_list_mailboxes"], "effect": "allow"}]
+        raw_config["mail_events"] = [{"connection": "icloud-a", "url": receiver.url, "type": "person.mail.new", "secret": "signing"}]
+        path = await prepare(tmp_path / "gw", raw_config, secrets={"mail_a": PASSWORD, "signing": SIGNING_SECRET})
+        with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+            client.login(USER, PASSWORD)
+            validity = int(client.select_folder("INBOX", readonly=True)[b"UIDVALIDITY"])
+        state = load_config(path).audit.path.parent / "connectors" / "icloud-a"
+        state.mkdir(parents=True)
+        (state / "mail-events.json").write_text(json.dumps({"cursor": {"uidvalidity": validity, "last_uid": 104},
+                                                            "checked_at": time.time() - 60, "outbox": []}))
+        uid = append(account, "while the gateway was down")
+        async with running_gateway(path):
+            with anyio.fail_after(20):
+                while not receiver.events:
+                    await anyio.sleep(0.1)
+        assert receiver.events[0]["data"] == {"mailbox": "icloud-a", "uidvalidity": validity, "uids": [uid]}
+        assert b"\\Seen" not in flags(account, uid)
 
 
 async def test_a_connection_managed_in_the_web_administration_keeps_its_events(tmp_path, monkeypatch):
@@ -471,3 +589,67 @@ def test_another_mailbox_under_the_same_connection_starts_from_now(tmp_path, goo
     clock.later()
     switched.run_once()
     assert [event["data"] for event in receiver.events] == [{"mailbox": "gmail-a", "message_ids": ["18c0f4"]}]
+
+
+async def test_an_imap_connection_renamed_after_gateway_yaml_starts_from_the_rename(tmp_path, receiver):
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        port = free_port()
+        raw_config = approval_config(origin=f"http://localhost:{port}")
+        raw_config["admin"] = {"owner": "person_a", "state": "admin.enc"}
+        raw_config["connections"].append({
+            "id": "icloud-a", "service": "icloud-mail", "account": "person_a", "owner": "person_a", "transport": "stdio",
+            "command": [sys.executable, "-m", "agent_gateway.connectors.imap_mail"],
+            "env": {"IMAP_HOST": "localhost", "IMAP_PORT": str(account.front.port), "IMAP_USERNAME": USER,
+                    "SSL_CERT_FILE": str(account.cert), "SMTP_HOST": ""},
+            "secret_env": {"IMAP_PASSWORD": "mail_a"}, "timeout_seconds": 20,
+            "tools": [{"upstream": "list_mailboxes", "name": "a_mail_list_mailboxes"}],
+        })
+        # gateway.yaml already names the new id (the gateway was restarted): the old connection is not watching.
+        raw_config["mail_events"] = [{"connection": "icloud-b", "url": receiver.url, "type": "person.mail.new", "secret": "signing"}]
+        path = await prepare(tmp_path / "gw", raw_config, secrets={**BASE_SECRETS, "mail_a": PASSWORD, "signing": SIGNING_SECRET})
+        with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+            client.login(USER, PASSWORD)
+            validity = int(client.select_folder("INBOX", readonly=True)[b"UIDVALIDITY"])
+        connectors = load_config(path).audit.path.parent / "connectors"
+        (connectors / "icloud-a").mkdir(parents=True)
+        old = {"account": f"{USER}@localhost:{account.front.port}", "cursor": {"uidvalidity": validity, "last_uid": 104},
+               "checked_at": time.time() - 60, "outbox": []}
+        (connectors / "icloud-a" / "mail-events.json").write_text(json.dumps(old))
+        new = connectors / "icloud-b" / "mail-events.json"
+        async with web_gateway(tmp_path / "gw", path=path, port=port) as (gw, http, origin, path):
+            await setup(http, origin, path)
+            uid = append(account, "arrives between the restart and the rename")
+            renamed = await change(http, "connections/rename", id="icloud-a", name="icloud-b")
+            assert renamed.status_code == 200, renamed.text
+            with anyio.fail_after(20):
+                while not new.exists():
+                    await anyio.sleep(0.1)
+        # As for Gmail: the new id starts from the rename (docs/design.md 7.8).
+        assert json.loads(new.read_text())["cursor"] == {"uidvalidity": validity, "last_uid": uid}
+        assert json.loads(new.read_text())["outbox"] == [] and receiver.attempts == []
+        assert json.loads((connectors / "icloud-a" / "mail-events.json").read_text()) == old
+
+
+def test_another_imap_mailbox_under_the_same_connection_starts_from_now(tmp_path, monkeypatch, receiver):
+    # Same host, same user name, another port: a separate mailbox all the same.
+    with mail_account(tmp_path / "a", USER, PASSWORD) as a, mail_account(tmp_path / "b", USER, PASSWORD) as b:
+        monkeypatch.setenv("SSL_CERT_FILE", str(a.cert))
+        clock = Clock()
+        events = imap_events(tmp_path, a, receiver, clock)
+        events.run_once()
+        append(a, "for mailbox A")
+        receiver.statuses = [503]
+        clock.later()
+        events.run_once()
+        assert len(saved(tmp_path)["outbox"]) == 1
+
+        # The connection is saved with the other mailbox's port (web administration): a new connector process.
+        monkeypatch.setenv("SSL_CERT_FILE", str(b.cert))  # each fake server has its own self-signed certificate
+        switched = imap_events(tmp_path, b, receiver, clock)
+        switched.run_once()
+        assert len(receiver.attempts) == 1  # A's pending event is not sent for B
+        assert saved(tmp_path)["account"] == f"{USER}@localhost:{b.front.port}" and saved(tmp_path)["outbox"] == []
+        uid = append(b, "new in mailbox B")  # A's cursor is already past this UID number: it would skip it
+        clock.later()
+        switched.run_once()
+        assert [event["data"]["uids"] for event in receiver.events] == [[uid]]

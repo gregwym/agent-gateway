@@ -147,7 +147,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             problems.append(f"tool {name} will not be served: {route.problem}{hint}")
     for event in cfg.mail_events:
         if event.connection in gateway.unused_mail_events:
-            problems.append(f"mail_events {event.connection}: no bundled Gmail connection has this id")
+            problems.append(f"mail_events {event.connection}: no bundled Gmail or IMAP connection has this id")
         else:
             print(f"new-mail events: {event.connection} -> {urlsplit(event.url).hostname} (type {event.type})")
     try:

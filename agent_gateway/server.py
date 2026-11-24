@@ -167,7 +167,7 @@ def make_approver(cfg: Config, audit: Audit) -> Approver:
     return approver
 
 
-MAIL_EVENT_KINDS = ("gmail",)  # bundled connectors that can report new mail (docs/design.md 7.8)
+MAIL_EVENT_KINDS = ("gmail", "imap")  # bundled connectors that can report new mail (docs/design.md 7.8)
 
 
 def connector_state_dir(cfg: Config, connection_id: str) -> Path:
@@ -201,7 +201,7 @@ class Gateway:
         from .catalog_sync import bundled_kind
 
         events = {e.connection: e for e in cfg.mail_events}
-        # Entries without a bundled Gmail connection, reported by `agw check`. Not logged here: with
+        # Entries without a bundled Gmail or IMAP connection, reported by `agw check`. Not logged here: with
         # web administration the first Gateway is built from the host file, before the managed connections exist.
         self.unused_mail_events = sorted(set(events) - {c.id for c in cfg.connections if bundled_kind(c) in MAIL_EVENT_KINDS})
         for conn in cfg.connections:
