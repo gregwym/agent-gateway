@@ -60,8 +60,11 @@ def http_client(**kwargs):
 
 @asynccontextmanager
 async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None, web_sessions=None,
-                      state_dir: Path | None = None) -> AsyncIterator[Client]:
-    """Connect to one upstream, handing it its own credentials and nothing else."""
+                      state_dir: Path | None = None, extra_env: dict[str, str] | None = None) -> AsyncIterator[Client]:
+    """Connect to one upstream, handing it its own credentials and nothing else.
+
+    `extra_env` is what the gateway itself adds for a stdio connector (new-mail events).
+    """
     if conn.oauth_ref and oauth is None and auth is None:
         from .passkey import Refused
         raise Refused("oauth_reauthorization_required", 401)
@@ -80,7 +83,8 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         env = dict(conn.env)
         env.update({var: secrets[name] for var, name in conn.secret_env.items()})
         if state_dir is not None:
-            env["AGW_STATE_DIR"] = str(state_dir)  # this connection's private directory (sent-mail copies)
+            env["AGW_STATE_DIR"] = str(state_dir)  # this connection's private directory (sent-mail copies, mail cursor)
+        env.update(extra_env or {})
         params = StdioServerParameters(command=conn.command[0], args=conn.command[1:], env=env)
         # The child's stderr is discarded: connectors log mail subjects and the like.
         with open(os.devnull, "w") as devnull:
@@ -138,9 +142,10 @@ async def list_all_tools(client: Client) -> list[types.Tool]:
 
 class Upstream:
     def __init__(self, conn: ConnectionCfg, secrets: dict[str, str], lock: Lock, audit: Audit, oauth=None, web_sessions=None,
-                 state_dir: Path | None = None) -> None:
+                 state_dir: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
         self.oauth = oauth
         self.state_dir = state_dir
+        self.extra_env = extra_env
         self.web_sessions = web_sessions
         self.conn = conn
         self._secrets = secrets
@@ -160,7 +165,8 @@ class Upstream:
         while True:
             self._connecting = True
             try:
-                async with open_client(self.conn, self._secrets, self.oauth, web_sessions=self.web_sessions, state_dir=self.state_dir) as client:
+                async with open_client(self.conn, self._secrets, self.oauth, web_sessions=self.web_sessions, state_dir=self.state_dir,
+                                       extra_env=self.extra_env) as client:
                     with anyio.fail_after(_CONNECT_TIMEOUT):
                         await self._verify(client)
                     self._client = client

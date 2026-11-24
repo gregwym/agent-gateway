@@ -196,7 +196,51 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
 
 多个账号可以共用一个 OAuth 客户端，每个账号独立授权并保存 Token（`gmail_token_a`、`gmail_token_b`）。
 
-### 5.4 收尾
+### 5.4 新邮件通知（可选）
+
+让 Agent 在新邮件到达后不久收到通知，而不是自己定时轮询。设计见 [design.md](design.md) 7.8。目前只对自带的 Gmail 连接有效。
+
+1. 在接收方（例如 OpenBot 的 webhook 任务）建好接收地址，得到 URL 和签名密钥。**先让接收方准备好再开监听**：
+   OpenBot 会把停用的任务收到的事件记为已忽略，之后用同一个 delivery ID 重发也不会再触发。
+2. 把签名密钥存进 secret store，从提示符输入，不经过命令行参数：
+
+   ```sh
+   docker compose run --rm admin secret set mail_events_signing
+   ```
+
+3. 在 `data/config/gateway.yaml` 顶层加（`connection` 填连接 ID；网页管理的连接同样写在这里）：
+
+   ```yaml
+   mail_events:
+     - connection: person_a_gmail
+       url: https://<接收方给的 webhook URL>
+       type: person_a.mail.new        # 接收方要求的事件类型
+       secret: mail_events_signing    # 上一步的 secret 名
+   ```
+
+4. `docker compose run --rm admin check`：输出里每条应有 `new-mail events: <连接> -> <主机> (type ...)`；
+   ID 写错或不是自带 Gmail 连接时报 problem。然后 `docker compose restart gateway`：配置只在进程启动时读取，
+   网关已在运行时 `docker compose up -d` 不会重启它（只有第一次启动用 `up -d`）。
+5. 核对：几秒内 `state/audit/connectors/<连接>/mail-events.json` 出现，里面有 `cursor`。之后来一封新邮件，
+   30 秒内接收方应收到请求，文件里的 `outbox` 回到空列表；`outbox` 一直不空说明接收方拒绝或不可达
+   （密钥不对是 401，更正后 `docker compose restart gateway`）。
+
+URL 只接受 https。请求从 Gateway 容器出站，主机需要能访问该地址。删掉 `mail_events` 里的条目并 `docker compose restart gateway`
+即停止；状态文件留着无害，在网页删除连接时随连接目录一起删除。停用一段时间后重新启用，会补报停用期间到达的邮件
+（停用超过约一周时，期间被移回收件箱的旧邮件不补报，见 design.md 7.8）；
+不需要补报时，重启前先删掉该连接的 `mail-events.json`，监听会从当前位置重新开始。
+
+**给开着通知的连接改名**：网页上直接改名会被拒绝（`mail_events` 还写着旧名称，网页改不了这个文件，改名后通知就会停）。
+先把 `mail_events` 里的 `connection` 改成新名称，`admin check`（此时会报新名称还没有对应连接，属正常）后
+`docker compose restart gateway`，再到网页上改名。新名称从改名时开始通知：重启到改名之间到达的邮件、旧名称下还没发出的通知
+都不会再发（design.md 7.8）。在网页上把连接换成另一个邮箱账号时同样从当时开始，旧邮箱还没发出的通知作废。
+**已知限制：**改名后又改回原名，网关会接着用原名留下的检查进度和没发出的通知
+（`state/audit/connectors/<原名>/mail-events.json`），可能收到过期或重复的提醒。原名的检查进度已经失效时
+（离开原名超过约一周），期间被移回收件箱的旧邮件不会通知（design.md 7.8）。不想要这些提醒，就在改回原名之前删掉这个文件：
+没发出的通知随之丢弃，改回后从当时开始。只删这一个文件，不要删整个目录。
+删除连接即停止它的通知，同时删掉 `mail_events` 里的条目。
+
+### 5.5 收尾
 
 ```sh
 docker compose run --rm admin lock          # 读一遍 24 个工具的定义
@@ -656,7 +700,7 @@ GraphQL mutation 始终按写入处理；HTTP 读取规则不会改变 GraphQL �
 | `state/admin.enc` | 网页管理的配置、Token 哈希、工具定义和加密凭据（启用网页时） | 与配置一起备份，主密钥仍单独保存 |
 | `config/gateway.yaml`、`config/tools.lock.json` | 配置和已审阅的工具定义；只含 Token 的哈希 | 常规备份，或放私有仓库 |
 | `state/approvals.sqlite` | 已登记 Passkey 的公钥、近期审批请求 | 可以备份，也可以不备份：丢了的后果是每个人重新登记一次。它不含私钥，但含待处理请求的参数 |
-| `state/audit/` | 审计日志；`connectors/` 下是待存进「已发送」的邮件 | 按需；`connectors/` 含邮件原文，与邮箱同等保护 |
+| `state/audit/` | 审计日志；`connectors/` 下是待存进「已发送」的邮件，以及新邮件通知的游标和待发事件（`mail-events.json`，只有邮件标识） | 按需；`connectors/` 含邮件原文，与邮箱同等保护 |
 
 密钥和密文分开放，是这份加密唯一的意义：密文单独泄露不等于凭据泄露。把两者放进同一个备份就失去了这个意义。
 

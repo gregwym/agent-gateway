@@ -167,6 +167,9 @@ def make_approver(cfg: Config, audit: Audit) -> Approver:
     return approver
 
 
+MAIL_EVENT_KINDS = ("gmail",)  # bundled connectors that can report new mail (docs/design.md 7.8)
+
+
 def connector_state_dir(cfg: Config, connection_id: str) -> Path:
     """A connection's private directory; removed together with the connection."""
     return cfg.audit.path.parent / "connectors" / connection_id
@@ -197,11 +200,18 @@ class Gateway:
         self.routes: dict[str, ToolRoute] = {}
         from .catalog_sync import bundled_kind
 
+        events = {e.connection: e for e in cfg.mail_events}
+        # Entries without a bundled Gmail connection, reported by `agw check`. Not logged here: with
+        # web administration the first Gateway is built from the host file, before the managed connections exist.
+        self.unused_mail_events = sorted(set(events) - {c.id for c in cfg.connections if bundled_kind(c) in MAIL_EVENT_KINDS})
         for conn in cfg.connections:
             own = {name: secrets[name] for name in conn.secret_names()}
-            # The bundled mail connector keeps sent-mail copies here until they are filed in Sent.
-            state_dir = connector_state_dir(cfg, conn.id) if bundled_kind(conn) == "imap" else None
-            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir)
+            # Bundled mail connectors keep their state here: sent-mail copies, the new-mail cursor and outbox.
+            state_dir = connector_state_dir(cfg, conn.id) if bundled_kind(conn) in ("imap", "gmail") else None
+            event = events.get(conn.id) if bundled_kind(conn) in MAIL_EVENT_KINDS else None
+            extra = {"AGW_MAIL_EVENTS_URL": event.url, "AGW_MAIL_EVENTS_TYPE": event.type,
+                     "AGW_MAIL_EVENTS_SECRET": secrets[event.secret], "AGW_MAIL_EVENTS_MAILBOX": conn.id} if event else None
+            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir, extra)
             for tool in conn.tools:
                 self.routes[tool.name] = build_route(conn, tool, lock.get(conn.id, tool.upstream))
 

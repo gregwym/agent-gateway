@@ -725,6 +725,9 @@ class AdminController:
                 raise Refused("invalid_connector_name", 400)
             if any(c["id"] == renamed for c in raw["connections"]):
                 raise Refused("duplicate_connector", 409)
+            if any(event.connection == name for event in self.store.base.mail_events):
+                # gateway.yaml names it for new-mail events and the web cannot change that file (docs/deployment.md 5.4).
+                raise Refused("mail_events_rename_first", 409)
             _, lock, _ = self.store.effective(state)
             conn["id"] = renamed
             for rule in raw["policy"]:
