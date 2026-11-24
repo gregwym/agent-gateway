@@ -292,8 +292,7 @@ def flags(account, uid: int):
 
 def imap_events(tmp_path, account, receiver, clock):
     mailbox = Mailbox("localhost", account.front.port, USER, PASSWORD)
-    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", ImapSource(mailbox, f"{USER}@localhost"),
-                      clock=clock)
+    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", ImapSource(mailbox), clock=clock)
 
 
 def test_imap_reports_new_uids_without_marking_anything_read(tmp_path, monkeypatch, receiver):
@@ -613,7 +612,7 @@ async def test_an_imap_connection_renamed_after_gateway_yaml_starts_from_the_ren
             validity = int(client.select_folder("INBOX", readonly=True)[b"UIDVALIDITY"])
         connectors = load_config(path).audit.path.parent / "connectors"
         (connectors / "icloud-a").mkdir(parents=True)
-        old = {"account": f"{USER}@localhost", "cursor": {"uidvalidity": validity, "last_uid": 104},
+        old = {"account": f"{USER}@localhost:{account.front.port}", "cursor": {"uidvalidity": validity, "last_uid": 104},
                "checked_at": time.time() - 60, "outbox": []}
         (connectors / "icloud-a" / "mail-events.json").write_text(json.dumps(old))
         new = connectors / "icloud-b" / "mail-events.json"
@@ -632,8 +631,8 @@ async def test_an_imap_connection_renamed_after_gateway_yaml_starts_from_the_ren
 
 
 def test_another_imap_mailbox_under_the_same_connection_starts_from_now(tmp_path, monkeypatch, receiver):
-    other = "other@example.test"
-    with mail_account(tmp_path / "a", USER, PASSWORD) as a, mail_account(tmp_path / "b", other, PASSWORD) as b:
+    # Same host, same user name, another port: a separate mailbox all the same.
+    with mail_account(tmp_path / "a", USER, PASSWORD) as a, mail_account(tmp_path / "b", USER, PASSWORD) as b:
         monkeypatch.setenv("SSL_CERT_FILE", str(a.cert))
         clock = Clock()
         events = imap_events(tmp_path, a, receiver, clock)
@@ -644,13 +643,12 @@ def test_another_imap_mailbox_under_the_same_connection_starts_from_now(tmp_path
         events.run_once()
         assert len(saved(tmp_path)["outbox"]) == 1
 
-        # The connection is saved with another account (web administration): a new connector process.
+        # The connection is saved with the other mailbox's port (web administration): a new connector process.
         monkeypatch.setenv("SSL_CERT_FILE", str(b.cert))  # each fake server has its own self-signed certificate
-        source = ImapSource(Mailbox("localhost", b.front.port, other, PASSWORD), f"{other}@localhost")
-        switched = MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", source, clock=clock)
+        switched = imap_events(tmp_path, b, receiver, clock)
         switched.run_once()
         assert len(receiver.attempts) == 1  # A's pending event is not sent for B
-        assert saved(tmp_path)["account"] == f"{other}@localhost" and saved(tmp_path)["outbox"] == []
+        assert saved(tmp_path)["account"] == f"{USER}@localhost:{b.front.port}" and saved(tmp_path)["outbox"] == []
         uid = append(b, "new in mailbox B")  # A's cursor is already past this UID number: it would skip it
         clock.later()
         switched.run_once()

@@ -221,12 +221,11 @@ class ImapSource:
 
     key = "uids"
 
-    def __init__(self, mailbox, address: str) -> None:
+    def __init__(self, mailbox) -> None:
         self.mailbox = mailbox  # its own session, so a check never interleaves with a tool call
-        self.address = address  # username@host
 
     def account(self) -> str:
-        return self.address
+        return self.mailbox.address
 
     def check(self, cursor: dict[str, Any] | None, since: float | None) -> tuple[list[int], dict[str, Any], dict[str, Any]]:
         def run(client) -> tuple[list[int], dict[str, Any], dict[str, Any]]:
