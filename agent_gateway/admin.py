@@ -725,6 +725,9 @@ class AdminController:
                 raise Refused("invalid_connector_name", 400)
             if any(c["id"] == renamed for c in raw["connections"]):
                 raise Refused("duplicate_connector", 409)
+            if any(event.connection == name for event in self.store.base.mail_events):
+                # gateway.yaml names it for new-mail events and the web cannot change that file (docs/deployment.md 5.4).
+                raise Refused("mail_events_rename_first", 409)
             _, lock, _ = self.store.effective(state)
             conn["id"] = renamed
             for rule in raw["policy"]:
@@ -738,7 +741,20 @@ class AdminController:
             metadata = state.get("bundled_catalog", {})
             if name in metadata:
                 metadata[renamed] = metadata.pop(name)
-            result = await self._commit(state, operation)
+            # The new-mail cursor and pending events follow the name, before a connector for it starts:
+            # a mail_events entry already naming it resumes where the old name stopped.
+            from .server import connector_state_dir
+            old, new = (connector_state_dir(self.store.base, n) / "mail-events.json" for n in (name, renamed))
+            moved = old.exists()
+            if moved:
+                new.parent.mkdir(parents=True, exist_ok=True)
+                old.replace(new)
+            try:
+                result = await self._commit(state, operation)
+            except BaseException:
+                if moved:
+                    new.replace(old)
+                raise
             return {**result, "id": renamed}
         if operation in ("connections/save", "connections/preview", "connections/review-tools"):
             cfg, _, values = self.store.effective(state)

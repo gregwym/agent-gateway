@@ -94,7 +94,7 @@ class MailEvents:
         ids, fields, cursor = self.source.check(state["cursor"], state["checked_at"])
         for start in range(0, len(ids), CHUNK):
             state["outbox"].append({"id": uuid.uuid4().hex, "at": _iso(now),
-                                    "data": {"mailbox": self.mailbox, **fields, self.source.key: ids[start:start + CHUNK]}})
+                                    "data": {**fields, self.source.key: ids[start:start + CHUNK]}})
         del state["outbox"][:-OUTBOX_LIMIT]
         state["cursor"], state["checked_at"] = cursor, now
         self._save(state)
@@ -115,7 +115,8 @@ class MailEvents:
         return not state["outbox"]
 
     def _post(self, entry: dict[str, Any]) -> int | None:
-        body = json.dumps({"type": self.type, "occurredAt": entry["at"], "data": entry["data"]},
+        # The connection's current id, so events queued before a rename go out under the new name.
+        body = json.dumps({"type": self.type, "occurredAt": entry["at"], "data": {"mailbox": self.mailbox, **entry["data"]}},
                           ensure_ascii=False, separators=(",", ":")).encode()
         stamp = str(int(time.time()))  # signed afresh on every attempt: receivers check freshness
         signature = hmac.new(self._secret, f"{stamp}.{entry['id']}.".encode() + body, hashlib.sha256).hexdigest()

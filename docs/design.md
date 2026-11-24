@@ -305,6 +305,10 @@ Agent 收到后再用这条连接的读取工具读信，所以凭据仍然只�
   之后 YAML 里对连接的改动不再生效；网页表单只有固定字段，没有地方填 webhook 地址和签名密钥，新建连接的 `env` 只来自表单。
   所以通知不放在连接里，而是放在两种管理方式都读、网页改不到的 `mail_events`。签名密钥存在 secret store，
   以环境变量交给 Connector，不写进状态文件。
+- **改名。** `mail_events` 按连接 ID 绑定，而网页改名改不了它，所以网页拒绝给 `mail_events` 写着的连接改名：
+  先在 gateway.yaml 写上新名称并重启（这时旧名称的连接不再监听），再在网页改名。改名在新连接启动前把
+  `mail-events.json` 移到新名称下（提交失败则移回），监听从原来的游标继续，期间的邮件和待发通知都不丢。
+  通知里的 `mailbox` 在发送时填当前连接 ID，所以改名前排队的通知也用新名称。
 - **请求格式**是 OpenBot 的签名 webhook：`x-openbot-timestamp`、`x-openbot-delivery-id`、
   `x-openbot-signature: sha256=<HMAC-SHA256("<timestamp>.<delivery id>.<请求体>")>`。
 
