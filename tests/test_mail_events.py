@@ -20,9 +20,12 @@ from types import SimpleNamespace
 import anyio
 import pytest
 import yaml
+from helpers import SECRETS as BASE_SECRETS
 from helpers import base_config, prepare, running_gateway
 from imapclient import IMAPClient
-from service_helpers import FakeGoogle, WebhookReceiver, mail_account
+from passkey_helpers import approval_config
+from service_helpers import FakeGoogle, WebhookReceiver, free_port, mail_account
+from test_admin import change, setup, web_gateway
 
 from agent_gateway import cli
 from agent_gateway.config import ConfigError, load_config
@@ -30,6 +33,7 @@ from agent_gateway.connectors import _mail_events
 from agent_gateway.connectors._mail_events import INTERVAL, GmailSource, ImapSource, MailEvents
 from agent_gateway.connectors.gmail import Gmail
 from agent_gateway.connectors.imap_mail import Mailbox
+from agent_gateway.upstream import Upstream
 
 pytestmark = pytest.mark.anyio
 
@@ -480,3 +484,33 @@ async def test_the_gateway_starts_the_watcher_for_an_imap_connection(tmp_path, r
                     await anyio.sleep(0.1)
         assert receiver.events[0]["data"] == {"mailbox": "icloud-a", "uidvalidity": validity, "uids": [uid]}
         assert b"\\Seen" not in flags(account, uid)
+
+
+async def test_a_connection_managed_in_the_web_administration_keeps_its_events(tmp_path, monkeypatch):
+    async def idle(self):  # look at what each connector would be started with; start none (no network)
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(Upstream, "run", idle)
+    port = free_port()
+    raw_config = approval_config(origin=f"http://localhost:{port}")
+    raw_config["admin"] = {"owner": "person_a", "state": "admin.enc"}
+    mail = events_config(STUB, "https://hooks.example.test/v1/webhooks/x")
+    raw_config["connections"] += mail["connections"]
+    raw_config["policy"] += mail["policy"]
+    raw_config["mail_events"] = mail["mail_events"]
+    path = await prepare(tmp_path / "gateway", raw_config, secrets={**BASE_SECRETS, **SECRETS})
+    async with web_gateway(tmp_path / "gateway", path=path, port=port) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        before = gw.app.state.runtime.gateway
+        # An edit in the web form: the connection then lives in the web-managed state, whose form has
+        # no field for a webhook; the host-level mail_events still reaches the connector.
+        saved = await change(http, "connections/save", kind="gmail", id="gmail-a", owner="person_a",
+                             settings={"client_id": CLIENT_ID},
+                             credentials={"client_secret": CLIENT_SECRET, "refresh_token": "1//refresh-token-new"})
+        assert saved.status_code == 200 and saved.json()["saved"], saved.text
+        assert "gmail-a" in [c["id"] for c in gw.app.state.admin.store.state["config"]["connections"]]
+        upstream = gw.app.state.runtime.gateway.upstreams["gmail-a"]
+        assert gw.app.state.runtime.gateway is not before and upstream.state_dir is not None
+        assert upstream.extra_env == {"AGW_MAIL_EVENTS_URL": "https://hooks.example.test/v1/webhooks/x",
+                                      "AGW_MAIL_EVENTS_TYPE": "person.mail.new", "AGW_MAIL_EVENTS_SECRET": SIGNING_SECRET,
+                                      "AGW_MAIL_EVENTS_MAILBOX": "gmail-a"}

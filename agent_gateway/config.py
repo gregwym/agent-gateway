@@ -150,8 +150,8 @@ class AdminCfg(_Model):
 class MailEventsCfg(_Model):
     """Tell a webhook about new mail in one bundled Gmail or IMAP connection's INBOX.
 
-    A host setting, so a connection edited in the web administration keeps it. The
-    request carries the connection id and message identifiers only (docs/design.md 7.8).
+    A host setting: it also applies to connections managed in the web administration, whose
+    form has no field for it. The request carries the connection id and message ids only (docs/design.md 7.8).
     """
 
     connection: str = Field(pattern=NAME)
