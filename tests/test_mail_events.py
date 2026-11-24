@@ -186,18 +186,29 @@ def test_a_refused_signature_keeps_the_event_and_a_refused_body_does_not_block_l
 
 def test_an_expired_gmail_history_reports_what_arrived_since_the_last_good_check(tmp_path, google, receiver):
     refresh = "1//refresh-token-a"
+    google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
+    google.add_message(refresh, "18c0d2", raw("archived a month ago"), ("INBOX",), at=time.time() - 30 * 86_400)
+    google.remove_label(refresh, "18c0d2", "INBOX")
     clock = Clock()
     events = gmail_events(tmp_path, google, receiver, refresh, clock=clock)
     events.run_once()
     last_good = saved(tmp_path)["checked_at"]
     google.add_message(refresh, "18c0d0", raw("long before"), at=last_good - 3600)
     google.add_message(refresh, "18c0d1", raw("after the last check"), at=last_good + 5)
+    google.add_label(refresh, "18c0d2", "INBOX")  # moved back while the history expires
     google.forget_history(refresh)
 
     clock.later()
     events.run_once()
-    assert receiver.events[0]["data"]["message_ids"] == ["18c0d1"]
+    # By arrival time only: the message moved back during the gap is not reported (docs/design.md 7.8).
+    assert [event["data"]["message_ids"] for event in receiver.events] == [["18c0d1"]]
     assert saved(tmp_path)["cursor"]["history_id"] == str(google.accounts[refresh]["history_id"])
+
+    google.remove_label(refresh, "18c0d2", "INBOX")
+    google.add_label(refresh, "18c0d2", "INBOX")  # with a valid cursor, a move back is reported
+    clock.later()
+    events.run_once()
+    assert receiver.events[-1]["data"]["message_ids"] == ["18c0d2"]
 
 
 def test_large_batches_are_split_and_an_unreachable_receiver_keeps_a_bounded_outbox(tmp_path, google, receiver, monkeypatch):
