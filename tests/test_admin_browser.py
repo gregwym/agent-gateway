@@ -97,7 +97,8 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 details = page.get_by_role('dialog', name='browser-notes')
                 await details.get_by_role('button', name=t('Test connection','验证连接'), exact=True).click()
                 await details.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
-                await playwright.expect(connector).to_contain_text(t('Read check passed','读取验证通过'))
+                # The check waits for the new connector process to start; on CI's macOS runners that can take longer than 5 s.
+                await playwright.expect(connector).to_contain_text(t('Read check passed','读取验证通过'), timeout=20_000)
 
                 await page.get_by_role('link', name=t('Permissions','权限'), exact=True).click()
                 assert page.url == origin + '/admin/permissions'
