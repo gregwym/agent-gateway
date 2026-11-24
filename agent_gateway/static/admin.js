@@ -178,6 +178,7 @@ const messages = {
   invalid_configuration: ['Check the values and account-sharing permission.', '请检查输入值和跨账号授权选项。'],
   invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
   duplicate_connector: ['This connector name already exists. Choose another name.', '此连接器名称已存在，请使用其他名称。'],
+  mail_events_rename_first: ['This connector sends new-mail events. First put the new name under mail_events in gateway.yaml and restart the gateway, then rename it here.', '此连接器在发送新邮件通知。请先在 gateway.yaml 的 mail_events 里改成新名称并重启网关，再在这里改名。'],
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   website_origin_invalid: ['Enter up to eight distinct public HTTPS origins, with no paths or port numbers.', '请输入公网 HTTPS 网站地址，不含路径或端口，最多八个 API 地址。'],

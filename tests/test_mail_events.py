@@ -492,13 +492,8 @@ async def test_a_connection_managed_in_the_web_administration_keeps_its_events(t
 
     monkeypatch.setattr(Upstream, "run", idle)
     port = free_port()
-    raw_config = approval_config(origin=f"http://localhost:{port}")
-    raw_config["admin"] = {"owner": "person_a", "state": "admin.enc"}
-    mail = events_config(STUB, "https://hooks.example.test/v1/webhooks/x")
-    raw_config["connections"] += mail["connections"]
-    raw_config["policy"] += mail["policy"]
-    raw_config["mail_events"] = mail["mail_events"]
-    path = await prepare(tmp_path / "gateway", raw_config, secrets={**BASE_SECRETS, **SECRETS})
+    path = await prepare(tmp_path / "gateway", web_config(port, STUB, "https://hooks.example.test/v1/webhooks/x"),
+                         secrets={**BASE_SECRETS, **SECRETS})
     async with web_gateway(tmp_path / "gateway", path=path, port=port) as (gw, http, origin, path):
         await setup(http, origin, path)
         before = gw.app.state.runtime.gateway
@@ -514,3 +509,58 @@ async def test_a_connection_managed_in_the_web_administration_keeps_its_events(t
         assert upstream.extra_env == {"AGW_MAIL_EVENTS_URL": "https://hooks.example.test/v1/webhooks/x",
                                       "AGW_MAIL_EVENTS_TYPE": "person.mail.new", "AGW_MAIL_EVENTS_SECRET": SIGNING_SECRET,
                                       "AGW_MAIL_EVENTS_MAILBOX": "gmail-a"}
+
+
+def web_config(port: int, google, url: str, **entry) -> dict:
+    """The Gmail connection with mail_events, plus web administration."""
+    out = approval_config(origin=f"http://localhost:{port}")
+    out["admin"] = {"owner": "person_a", "state": "admin.enc"}
+    mail = events_config(google, url, **entry)
+    out["connections"] += mail["connections"]
+    out["policy"] += mail["policy"]
+    out["mail_events"] = mail["mail_events"]
+    return out
+
+
+async def test_a_connection_with_events_is_renamed_only_after_gateway_yaml(tmp_path, monkeypatch):
+    async def idle(self):  # no connector is started (no network)
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(Upstream, "run", idle)
+    port = free_port()
+    path = await prepare(tmp_path / "gateway", web_config(port, STUB, "https://hooks.example.test/v1/webhooks/x"),
+                         secrets={**BASE_SECRETS, **SECRETS})
+    async with web_gateway(tmp_path / "gateway", path=path, port=port) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        refused = await change(http, "connections/rename", id="gmail-a", name="gmail-b")
+        # Renaming here would leave gateway.yaml naming a connection that no longer exists: events would stop.
+        assert refused.status_code == 409 and refused.json()["error"] == "mail_events_rename_first"
+        assert gw.app.state.runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_MAILBOX"] == "gmail-a"
+
+
+async def test_renaming_after_gateway_yaml_resumes_without_losing_mail(tmp_path, google, receiver):
+    refresh = "1//refresh-token-a"
+    google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
+    port = free_port()
+    # gateway.yaml already names the new id (and the gateway was restarted), so the old connection is not watching.
+    raw_config = web_config(port, google, receiver.url, connection="gmail-b")
+    path = await prepare(tmp_path / "gateway", raw_config, secrets={**BASE_SECRETS, **SECRETS})
+    connectors = load_config(path).audit.path.parent / "connectors"
+    (connectors / "gmail-a").mkdir(parents=True)
+    pending = {"id": "pending0delivery", "at": "2026-11-23T20:00:00Z", "data": {"message_ids": ["18c0e9"]}}
+    (connectors / "gmail-a" / "mail-events.json").write_text(json.dumps(
+        {"cursor": {"history_id": str(google.accounts[refresh]["history_id"])}, "checked_at": time.time() - 60, "outbox": [pending]}))
+    async with web_gateway(tmp_path / "gateway", path=path, port=port) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        google.add_message(refresh, "18c0ea", raw("arrives between the restart and the rename"))
+        renamed = await change(http, "connections/rename", id="gmail-a", name="gmail-b")
+        assert renamed.status_code == 200, renamed.text
+        with anyio.fail_after(20):
+            while len(receiver.events) < 2:
+                await anyio.sleep(0.1)
+    # The event queued before the rename keeps its delivery id and goes out under the new name; nothing is skipped.
+    assert receiver.headers[0]["x-openbot-delivery-id"] == "pending0delivery"
+    assert [event["data"] for event in receiver.events] == [{"mailbox": "gmail-b", "message_ids": ["18c0e9"]},
+                                                            {"mailbox": "gmail-b", "message_ids": ["18c0ea"]}]
+    assert not (connectors / "gmail-a" / "mail-events.json").exists()
+    assert json.loads((connectors / "gmail-b" / "mail-events.json").read_text())["outbox"] == []
