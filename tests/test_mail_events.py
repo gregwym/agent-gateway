@@ -564,3 +564,38 @@ async def test_renaming_after_gateway_yaml_resumes_without_losing_mail(tmp_path,
                                                             {"mailbox": "gmail-b", "message_ids": ["18c0ea"]}]
     assert not (connectors / "gmail-a" / "mail-events.json").exists()
     assert json.loads((connectors / "gmail-b" / "mail-events.json").read_text())["outbox"] == []
+
+
+async def test_renaming_an_imap_connection_after_gateway_yaml_resumes_without_losing_mail(tmp_path, receiver):
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        port = free_port()
+        raw_config = approval_config(origin=f"http://localhost:{port}")
+        raw_config["admin"] = {"owner": "person_a", "state": "admin.enc"}
+        raw_config["connections"].append({
+            "id": "icloud-a", "service": "icloud-mail", "account": "person_a", "owner": "person_a", "transport": "stdio",
+            "command": [sys.executable, "-m", "agent_gateway.connectors.imap_mail"],
+            "env": {"IMAP_HOST": "localhost", "IMAP_PORT": str(account.front.port), "IMAP_USERNAME": USER,
+                    "SSL_CERT_FILE": str(account.cert), "SMTP_HOST": ""},
+            "secret_env": {"IMAP_PASSWORD": "mail_a"}, "timeout_seconds": 20,
+            "tools": [{"upstream": "list_mailboxes", "name": "a_mail_list_mailboxes"}],
+        })
+        # gateway.yaml already names the new id (the gateway was restarted): the old connection is not watching.
+        raw_config["mail_events"] = [{"connection": "icloud-b", "url": receiver.url, "type": "person.mail.new", "secret": "signing"}]
+        path = await prepare(tmp_path / "gw", raw_config, secrets={**BASE_SECRETS, "mail_a": PASSWORD, "signing": SIGNING_SECRET})
+        with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+            client.login(USER, PASSWORD)
+            validity = int(client.select_folder("INBOX", readonly=True)[b"UIDVALIDITY"])
+        connectors = load_config(path).audit.path.parent / "connectors"
+        (connectors / "icloud-a").mkdir(parents=True)
+        (connectors / "icloud-a" / "mail-events.json").write_text(json.dumps(
+            {"cursor": {"uidvalidity": validity, "last_uid": 104}, "checked_at": time.time() - 60, "outbox": []}))
+        async with web_gateway(tmp_path / "gw", path=path, port=port) as (gw, http, origin, path):
+            await setup(http, origin, path)
+            uid = append(account, "arrives between the restart and the rename")
+            renamed = await change(http, "connections/rename", id="icloud-a", name="icloud-b")
+            assert renamed.status_code == 200, renamed.text
+            with anyio.fail_after(20):
+                while not receiver.events:
+                    await anyio.sleep(0.1)
+        assert receiver.events == [{**receiver.events[0], "data": {"mailbox": "icloud-b", "uidvalidity": validity, "uids": [uid]}}]
+        assert not (connectors / "icloud-a" / "mail-events.json").exists()
