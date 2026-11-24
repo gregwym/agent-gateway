@@ -292,7 +292,8 @@ def flags(account, uid: int):
 
 def imap_events(tmp_path, account, receiver, clock):
     mailbox = Mailbox("localhost", account.front.port, USER, PASSWORD)
-    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", ImapSource(mailbox), clock=clock)
+    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", ImapSource(mailbox, f"{USER}@localhost"),
+                      clock=clock)
 
 
 def test_imap_reports_new_uids_without_marking_anything_read(tmp_path, monkeypatch, receiver):
@@ -538,7 +539,7 @@ async def test_a_connection_with_events_is_renamed_only_after_gateway_yaml(tmp_p
         assert gw.app.state.runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_MAILBOX"] == "gmail-a"
 
 
-async def test_renaming_after_gateway_yaml_resumes_without_losing_mail(tmp_path, google, receiver):
+async def test_a_connection_renamed_after_gateway_yaml_starts_from_the_rename(tmp_path, google, receiver):
     refresh = "1//refresh-token-a"
     google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
     port = free_port()
@@ -547,26 +548,51 @@ async def test_renaming_after_gateway_yaml_resumes_without_losing_mail(tmp_path,
     path = await prepare(tmp_path / "gateway", raw_config, secrets={**BASE_SECRETS, **SECRETS})
     connectors = load_config(path).audit.path.parent / "connectors"
     (connectors / "gmail-a").mkdir(parents=True)
-    pending = {"id": "pending0delivery", "at": "2026-11-23T20:00:00Z", "data": {"message_ids": ["18c0e9"]}}
-    (connectors / "gmail-a" / "mail-events.json").write_text(json.dumps(
-        {"cursor": {"history_id": str(google.accounts[refresh]["history_id"])}, "checked_at": time.time() - 60, "outbox": [pending]}))
+    pending = {"id": "pending0delivery", "at": "2026-11-23T20:00:00Z", "data": {"mailbox": "gmail-a", "message_ids": ["18c0e9"]}}
+    old = {"account": "mailbox@example.test", "cursor": {"history_id": "1000"}, "checked_at": time.time() - 60, "outbox": [pending]}
+    (connectors / "gmail-a" / "mail-events.json").write_text(json.dumps(old))
+    new = connectors / "gmail-b" / "mail-events.json"
     async with web_gateway(tmp_path / "gateway", path=path, port=port) as (gw, http, origin, path):
         await setup(http, origin, path)
         google.add_message(refresh, "18c0ea", raw("arrives between the restart and the rename"))
         renamed = await change(http, "connections/rename", id="gmail-a", name="gmail-b")
         assert renamed.status_code == 200, renamed.text
         with anyio.fail_after(20):
-            while len(receiver.events) < 2:
+            while not new.exists():
                 await anyio.sleep(0.1)
-    # The event queued before the rename keeps its delivery id and goes out under the new name; nothing is skipped.
-    assert receiver.headers[0]["x-openbot-delivery-id"] == "pending0delivery"
-    assert [event["data"] for event in receiver.events] == [{"mailbox": "gmail-b", "message_ids": ["18c0e9"]},
-                                                            {"mailbox": "gmail-b", "message_ids": ["18c0ea"]}]
-    assert not (connectors / "gmail-a" / "mail-events.json").exists()
-    assert json.loads((connectors / "gmail-b" / "mail-events.json").read_text())["outbox"] == []
+    # Nothing moves with the name: the new id starts from the rename, as newly enabled events do (docs/design.md 7.8).
+    assert json.loads(new.read_text())["cursor"] == {"history_id": "1001"}
+    assert json.loads(new.read_text())["outbox"] == [] and receiver.attempts == []
+    assert json.loads((connectors / "gmail-a" / "mail-events.json").read_text()) == old
 
 
-async def test_renaming_an_imap_connection_after_gateway_yaml_resumes_without_losing_mail(tmp_path, receiver):
+def test_another_mailbox_under_the_same_connection_starts_from_now(tmp_path, google, receiver):
+    clock = Clock()
+    events = gmail_events(tmp_path, google, receiver, "1//refresh-token-a", clock=clock)
+    events.run_once()
+    google.add_message("1//refresh-token-a", "18c0f1", raw("for mailbox A"))
+    receiver.statuses = [503]
+    clock.later()
+    events.run_once()
+    assert saved(tmp_path)["outbox"][0]["data"]["message_ids"] == ["18c0f1"]
+
+    # The connection is saved with another account's credential (web administration): a new connector process.
+    google.add_account("1//refresh-token-b", CLIENT_ID, CLIENT_SECRET)
+    google.add_message("1//refresh-token-b", "18c0f2", raw("already in mailbox B"))
+    google.add_message("1//refresh-token-b", "18c0f3", raw("also already in mailbox B"))
+    switched = gmail_events(tmp_path, google, receiver, "1//refresh-token-b", clock=clock)
+    switched.run_once()
+    # A's pending event is not sent for B, and B is not asked from A's cursor (1001): B starts from now.
+    assert len(receiver.attempts) == 1
+    assert saved(tmp_path) | {"checked_at": None} == {"account": "mailbox1@example.test", "cursor": {"history_id": "1002"},
+                                                      "checked_at": None, "outbox": []}
+    google.add_message("1//refresh-token-b", "18c0f4", raw("new in mailbox B"))
+    clock.later()
+    switched.run_once()
+    assert [event["data"] for event in receiver.events] == [{"mailbox": "gmail-a", "message_ids": ["18c0f4"]}]
+
+
+async def test_an_imap_connection_renamed_after_gateway_yaml_starts_from_the_rename(tmp_path, receiver):
     with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
         port = free_port()
         raw_config = approval_config(origin=f"http://localhost:{port}")
@@ -587,15 +613,45 @@ async def test_renaming_an_imap_connection_after_gateway_yaml_resumes_without_lo
             validity = int(client.select_folder("INBOX", readonly=True)[b"UIDVALIDITY"])
         connectors = load_config(path).audit.path.parent / "connectors"
         (connectors / "icloud-a").mkdir(parents=True)
-        (connectors / "icloud-a" / "mail-events.json").write_text(json.dumps(
-            {"cursor": {"uidvalidity": validity, "last_uid": 104}, "checked_at": time.time() - 60, "outbox": []}))
+        old = {"account": f"{USER}@localhost", "cursor": {"uidvalidity": validity, "last_uid": 104},
+               "checked_at": time.time() - 60, "outbox": []}
+        (connectors / "icloud-a" / "mail-events.json").write_text(json.dumps(old))
+        new = connectors / "icloud-b" / "mail-events.json"
         async with web_gateway(tmp_path / "gw", path=path, port=port) as (gw, http, origin, path):
             await setup(http, origin, path)
             uid = append(account, "arrives between the restart and the rename")
             renamed = await change(http, "connections/rename", id="icloud-a", name="icloud-b")
             assert renamed.status_code == 200, renamed.text
             with anyio.fail_after(20):
-                while not receiver.events:
+                while not new.exists():
                     await anyio.sleep(0.1)
-        assert receiver.events == [{**receiver.events[0], "data": {"mailbox": "icloud-b", "uidvalidity": validity, "uids": [uid]}}]
-        assert not (connectors / "icloud-a" / "mail-events.json").exists()
+        # As for Gmail: the new id starts from the rename (docs/design.md 7.8).
+        assert json.loads(new.read_text())["cursor"] == {"uidvalidity": validity, "last_uid": uid}
+        assert json.loads(new.read_text())["outbox"] == [] and receiver.attempts == []
+        assert json.loads((connectors / "icloud-a" / "mail-events.json").read_text()) == old
+
+
+def test_another_imap_mailbox_under_the_same_connection_starts_from_now(tmp_path, monkeypatch, receiver):
+    other = "other@example.test"
+    with mail_account(tmp_path / "a", USER, PASSWORD) as a, mail_account(tmp_path / "b", other, PASSWORD) as b:
+        monkeypatch.setenv("SSL_CERT_FILE", str(a.cert))
+        clock = Clock()
+        events = imap_events(tmp_path, a, receiver, clock)
+        events.run_once()
+        append(a, "for mailbox A")
+        receiver.statuses = [503]
+        clock.later()
+        events.run_once()
+        assert len(saved(tmp_path)["outbox"]) == 1
+
+        # The connection is saved with another account (web administration): a new connector process.
+        monkeypatch.setenv("SSL_CERT_FILE", str(b.cert))  # each fake server has its own self-signed certificate
+        source = ImapSource(Mailbox("localhost", b.front.port, other, PASSWORD), f"{other}@localhost")
+        switched = MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", source, clock=clock)
+        switched.run_once()
+        assert len(receiver.attempts) == 1  # A's pending event is not sent for B
+        assert saved(tmp_path)["account"] == f"{other}@localhost" and saved(tmp_path)["outbox"] == []
+        uid = append(b, "new in mailbox B")  # A's cursor is already past this UID number: it would skip it
+        clock.later()
+        switched.run_once()
+        assert [event["data"]["uids"] for event in receiver.events] == [[uid]]
