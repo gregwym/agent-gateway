@@ -13,7 +13,7 @@ import json
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from types import SimpleNamespace
 
@@ -112,7 +112,12 @@ def test_gmail_reports_mail_that_reaches_the_inbox_with_identifiers_only(tmp_pat
     # Only the history was asked for: no message was opened.
     assert {path for _, path in google.requests} <= {"/token", "/gmail/v1/users/me/history"}
     assert saved(tmp_path)["outbox"] == []
+    # As from Google, the history names messages by id and threadId only: no labels to filter on.
+    page = events.source.gmail.get("history", [("startHistoryId", "1000"), ("labelId", "INBOX")])
+    assert all(set(item["message"]) == {"id", "threadId"}
+               for record in page["history"] for field in ("messagesAdded", "labelsAdded") for item in record.get(field, []))
 
+    google.add_label(refresh, "18c0a1", "STARRED")  # a label added to inbox mail, but not INBOX
     clock.later()
     events.run_once()
     assert len(receiver.attempts) == 1  # nothing new, nothing sent
@@ -184,18 +189,29 @@ def test_a_refused_signature_keeps_the_event_and_a_refused_body_does_not_block_l
 
 def test_an_expired_gmail_history_reports_what_arrived_since_the_last_good_check(tmp_path, google, receiver):
     refresh = "1//refresh-token-a"
+    google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
+    google.add_message(refresh, "18c0d2", raw("archived a month ago"), ("INBOX",), at=time.time() - 30 * 86_400)
+    google.remove_label(refresh, "18c0d2", "INBOX")
     clock = Clock()
     events = gmail_events(tmp_path, google, receiver, refresh, clock=clock)
     events.run_once()
     last_good = saved(tmp_path)["checked_at"]
     google.add_message(refresh, "18c0d0", raw("long before"), at=last_good - 3600)
     google.add_message(refresh, "18c0d1", raw("after the last check"), at=last_good + 5)
+    google.add_label(refresh, "18c0d2", "INBOX")  # moved back while the history expires
     google.forget_history(refresh)
 
     clock.later()
     events.run_once()
-    assert receiver.events[0]["data"]["message_ids"] == ["18c0d1"]
+    # By arrival time only: the message moved back during the gap is not reported (docs/design.md 7.8).
+    assert [event["data"]["message_ids"] for event in receiver.events] == [["18c0d1"]]
     assert saved(tmp_path)["cursor"]["history_id"] == str(google.accounts[refresh]["history_id"])
+
+    google.remove_label(refresh, "18c0d2", "INBOX")
+    google.add_label(refresh, "18c0d2", "INBOX")  # with a valid cursor, a move back is reported
+    clock.later()
+    events.run_once()
+    assert receiver.events[-1]["data"]["message_ids"] == ["18c0d2"]
 
 
 def test_large_batches_are_split_and_an_unreachable_receiver_keeps_a_bounded_outbox(tmp_path, google, receiver, monkeypatch):
@@ -308,12 +324,35 @@ def test_a_renumbered_imap_inbox_reports_what_arrived_since_the_last_good_check(
         state["cursor"] = {"uidvalidity": validity + 1, "last_uid": 9}
         (tmp_path / "state" / "mail-events.json").write_text(json.dumps(state))
         fresh = append(account, "after the last check")
+        moved = move_to_inbox(account, "archived a month ago", datetime.now(timezone.utc) - timedelta(days=30))
 
         clock.later()
         events.run_once()
-        # The demo messages arrived decades ago; only the new one is reported.
-        assert receiver.events[0]["data"] == {"mailbox": "icloud-a", "uidvalidity": validity, "uids": [fresh]}
-        assert saved(tmp_path)["cursor"] == {"uidvalidity": validity, "last_uid": fresh}
+        # By arrival time only (docs/design.md 7.8): the demo messages from decades ago and the old
+        # message moved back during the gap are not reported; the new one is.
+        assert [event["data"] for event in receiver.events] == [{"mailbox": "icloud-a", "uidvalidity": validity, "uids": [fresh]}]
+        assert saved(tmp_path)["cursor"] == {"uidvalidity": validity, "last_uid": moved}
+
+        again = move_to_inbox(account, "archived again", datetime.now(timezone.utc) - timedelta(days=30))
+        clock.later()
+        events.run_once()  # with a valid cursor, a message moved in gets a new UID and is reported
+        assert receiver.events[-1]["data"]["uids"] == [again]
+
+
+def move_to_inbox(account, subject: str, when: datetime) -> int:
+    """File an old message in another folder, then MOVE it to INBOX: it keeps its INTERNALDATE."""
+    with IMAPClient("127.0.0.1", account.plain_port, ssl=False) as client:
+        client.login(account.user, account.password)
+        if not client.folder_exists("Archive"):
+            client.create_folder("Archive")
+        out = EmailMessage()
+        out["Subject"], out["From"], out["To"] = subject, "sender@example.test", USER
+        out.set_content("Private body text.")
+        client.append("Archive", out.as_bytes(), flags=(), msg_time=when)
+        client.select_folder("Archive")
+        client.move(client.search(["ALL"]), "INBOX")
+        client.select_folder("INBOX", readonly=True)
+        return max(client.search(["ALL"]))
 
 
 def events_config(google: FakeGoogle, url: str, **entry) -> dict:
