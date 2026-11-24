@@ -269,8 +269,11 @@ class FakeGoogle:
         self.base = f"http://127.0.0.1:{self.port}"
 
     def add_account(self, refresh_token: str, client_id: str, client_secret: str, scope: str | None = None) -> dict:
+        # Each account its own address, as in Gmail: the first is mailbox@, the next mailbox1@, ...
+        known = self.accounts.get(refresh_token)
+        email = known["email"] if known else f"mailbox{len(self.accounts) or ''}@example.test"
         account = {"client_id": client_id, "client_secret": client_secret, "scope": scope or self.READONLY,
-                   "messages": {}, "revoked": False,
+                   "email": email, "messages": {}, "revoked": False,
                    "history": [], "history_id": 1000, "oldest_history": 1000}  # fmt: skip
         self.accounts[refresh_token] = account
         return account
@@ -362,7 +365,7 @@ class FakeGoogle:
         account = self._account(request)
         if account is None:
             return JSONResponse({}, 401)
-        return JSONResponse({"emailAddress": "mailbox@example.test", "historyId": str(account["history_id"])})
+        return JSONResponse({"emailAddress": account["email"], "historyId": str(account["history_id"])})
 
     async def _history(self, request):
         """users.history.list: messageAdded / labelAdded records after startHistoryId, paged.

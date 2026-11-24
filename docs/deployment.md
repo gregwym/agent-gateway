@@ -219,21 +219,22 @@ Google 的控制台界面经常改版，下面按要做的事写，不按菜单�
    ```
 
 4. `docker compose run --rm admin check`：输出里每条应有 `new-mail events: <连接> -> <主机> (type ...)`；
-   ID 写错或不是自带 Gmail 连接时报 problem。然后 `docker compose up -d` 重启。
+   ID 写错或不是自带 Gmail 连接时报 problem。然后 `docker compose restart gateway`：配置只在进程启动时读取，
+   网关已在运行时 `docker compose up -d` 不会重启它（只有第一次启动用 `up -d`）。
 5. 核对：几秒内 `state/audit/connectors/<连接>/mail-events.json` 出现，里面有 `cursor`。之后来一封新邮件，
    30 秒内接收方应收到请求，文件里的 `outbox` 回到空列表；`outbox` 一直不空说明接收方拒绝或不可达
-   （密钥不对是 401，需要更正后重启）。
+   （密钥不对是 401，更正后 `docker compose restart gateway`）。
 
-URL 只接受 https。请求从 Gateway 容器出站，主机需要能访问该地址。删掉 `mail_events` 里的条目并重启即停止；
-状态文件留着无害，在网页删除连接时随连接目录一起删除；直接从 gateway.yaml 删连接时，
-手动删掉 `state/audit/connectors/<连接>`，以免以后同名的另一个邮箱从旧游标开始。停用一段时间后重新启用，会补报停用期间到达的邮件
+URL 只接受 https。请求从 Gateway 容器出站，主机需要能访问该地址。删掉 `mail_events` 里的条目并 `docker compose restart gateway`
+即停止；状态文件留着无害，在网页删除连接时随连接目录一起删除。停用一段时间后重新启用，会补报停用期间到达的邮件
 （停用超过约一周时，期间被移回收件箱的旧邮件不补报，见 design.md 7.8）；
 不需要补报时，重启前先删掉该连接的 `mail-events.json`，监听会从当前位置重新开始。
 
 **给开着通知的连接改名**：网页上直接改名会被拒绝（`mail_events` 还写着旧名称，网页改不了这个文件，改名后通知就会停）。
-先把 `mail_events` 里的 `connection` 改成新名称，`admin check`（此时会报新名称还没有对应连接，属正常）后 `docker compose up -d`；
-再到网页上改名。改名时网关把该连接的游标和待发通知（`mail-events.json`）一起移到新名称下，监听接着上次的位置继续，
-重启到改名之间到达的邮件随后补报，待发通知以新名称发出。删除连接即停止它的通知，同时删掉 `mail_events` 里的条目。
+先把 `mail_events` 里的 `connection` 改成新名称，`admin check`（此时会报新名称还没有对应连接，属正常）后
+`docker compose restart gateway`，再到网页上改名。新名称从改名时开始通知：重启到改名之间到达的邮件、旧名称下还没发出的通知
+都不会再发（design.md 7.8）。在网页上把连接换成另一个邮箱账号时同样从当时开始，旧邮箱还没发出的通知作废。
+删除连接即停止它的通知，同时删掉 `mail_events` 里的条目。
 
 ### 5.5 收尾
 

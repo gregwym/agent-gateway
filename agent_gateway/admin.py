@@ -741,20 +741,7 @@ class AdminController:
             metadata = state.get("bundled_catalog", {})
             if name in metadata:
                 metadata[renamed] = metadata.pop(name)
-            # The new-mail cursor and pending events follow the name, before a connector for it starts:
-            # a mail_events entry already naming it resumes where the old name stopped.
-            from .server import connector_state_dir
-            old, new = (connector_state_dir(self.store.base, n) / "mail-events.json" for n in (name, renamed))
-            moved = old.exists()
-            if moved:
-                new.parent.mkdir(parents=True, exist_ok=True)
-                old.replace(new)
-            try:
-                result = await self._commit(state, operation)
-            except BaseException:
-                if moved:
-                    new.replace(old)
-                raise
+            result = await self._commit(state, operation)
             return {**result, "id": renamed}
         if operation in ("connections/save", "connections/preview", "connections/review-tools"):
             cfg, _, values = self.store.effective(state)

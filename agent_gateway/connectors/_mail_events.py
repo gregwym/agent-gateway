@@ -55,6 +55,7 @@ class MailEvents:
         # No proxy from the environment, no redirects: requests go to the configured address only.
         self._http = httpx2.Client(timeout=15, trust_env=False, follow_redirects=False)
         self._next = self._delay = 0.0
+        self._account: str | None = None  # the mailbox this process reads, once known
 
     def start(self) -> None:
         threading.Thread(target=self._loop, name="mail-events", daemon=True).start()
@@ -84,17 +85,24 @@ class MailEvents:
                 self._check(state, now)
             except Exception:  # server down, credential refused: the cursor keeps its place
                 state, ok = self._load(), False  # send only what is on disk
-            if state["outbox"] and not self._send(state):  # receiver offline or refusing: events wait
-                ok = False
+            # Events go out only from the mailbox they were found in (see _check).
+            if state["outbox"] and state["account"] == self._account and not self._send(state):
+                ok = False  # receiver offline or refusing: events wait
             # Any failure: ask less often (30 s doubling to 5 min); success: back to every round.
             self._delay = 0.0 if ok else min(max(self._delay * 2, INTERVAL), MAX_DELAY)
             self._next = now + self._delay
 
     def _check(self, state: dict[str, Any], now: float) -> None:
+        self._account = self._account or self.source.account()
+        if state["account"] not in (None, self._account):
+            # The connection now reads another mailbox: the old cursor and pending events mean nothing
+            # there. Start from now, as when events are first turned on (docs/design.md 7.8).
+            state.update(cursor=None, checked_at=None, outbox=[])
+        state["account"] = self._account
         ids, fields, cursor = self.source.check(state["cursor"], state["checked_at"])
         for start in range(0, len(ids), CHUNK):
             state["outbox"].append({"id": uuid.uuid4().hex, "at": _iso(now),
-                                    "data": {**fields, self.source.key: ids[start:start + CHUNK]}})
+                                    "data": {"mailbox": self.mailbox, **fields, self.source.key: ids[start:start + CHUNK]}})
         del state["outbox"][:-OUTBOX_LIMIT]
         state["cursor"], state["checked_at"] = cursor, now
         self._save(state)
@@ -115,8 +123,7 @@ class MailEvents:
         return not state["outbox"]
 
     def _post(self, entry: dict[str, Any]) -> int | None:
-        # The connection's current id, so events queued before a rename go out under the new name.
-        body = json.dumps({"type": self.type, "occurredAt": entry["at"], "data": {"mailbox": self.mailbox, **entry["data"]}},
+        body = json.dumps({"type": self.type, "occurredAt": entry["at"], "data": entry["data"]},
                           ensure_ascii=False, separators=(",", ":")).encode()
         stamp = str(int(time.time()))  # signed afresh on every attempt: receivers check freshness
         signature = hmac.new(self._secret, f"{stamp}.{entry['id']}.".encode() + body, hashlib.sha256).hexdigest()
@@ -136,7 +143,8 @@ class MailEvents:
             saved = json.loads((self.dir / STATE).read_text(encoding="utf-8"))
         except FileNotFoundError:
             saved = {}
-        return {"cursor": saved.get("cursor"), "checked_at": saved.get("checked_at"), "outbox": saved.get("outbox", [])}
+        return {"account": saved.get("account"), "cursor": saved.get("cursor"), "checked_at": saved.get("checked_at"),
+                "outbox": saved.get("outbox", [])}
 
     def _save(self, state: dict[str, Any]) -> None:
         fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".tmp-mail-events-")  # created 0600
@@ -158,6 +166,9 @@ class GmailSource:
 
     def __init__(self, gmail) -> None:
         self.gmail = gmail
+
+    def account(self) -> str:
+        return self.gmail.get("profile")["emailAddress"]
 
     def check(self, cursor: dict[str, Any] | None, since: float | None) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
         if cursor is None:  # the first check starts from now: older mail is not new
