@@ -1,3 +1,3 @@
 """Personal / family MCP gateway."""
 
-__version__ = "0.19.5"
+__version__ = "0.20.0"
