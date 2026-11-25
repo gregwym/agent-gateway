@@ -16,7 +16,7 @@ server:
   # Host header values to accept, e.g. ["gateway.your-tailnet.ts.net:8080"].
   # Empty = no check. Set it when the gateway is reachable by name.
   allowed_hosts: []
-  max_result_bytes: 1000000
+  max_result_bytes: 8000000  # room for a 5 MB attachment after base64 encoding
 
 audit:
   path: ../state/audit/audit.jsonl   # metadata only: who, which tool, outcome, sizes

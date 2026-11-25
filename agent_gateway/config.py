@@ -59,7 +59,8 @@ class ServerCfg(_Model):
     port: int = Field(8080, ge=1, le=65535)
     # Accepted Host header values ("gateway.example.ts.net:8080"). Empty disables the check.
     allowed_hosts: list[str] = []
-    max_result_bytes: int = Field(1_000_000, ge=1_000)
+    # Fits a mail attachment at the connectors' 5 MB default after base64 encoding.
+    max_result_bytes: int = Field(8_000_000, ge=1_000)
     tool_discovery: Literal["search", "all"] = "search"
 
 

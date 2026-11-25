@@ -163,6 +163,48 @@ async def test_search_read_and_attachments(google, tmp_path):
             assert (await a.call_tool("a_gmail_get_attachment", {"id": "18c0a1", "index": 9})).is_error
 
 
+async def test_pdfs_up_to_the_attachment_limit_arrive_whole_and_larger_ones_fail_clearly(tmp_path):
+    google = FakeGoogle()
+    google.add_account(REFRESH_A, CLIENT_ID, CLIENT_SECRET)
+    statement, booklet = b"%PDF-1.4\n" + bytes(range(256)) * 5_100, b"%PDF-1.4\n" + bytes(range(256)) * 17_500  # 1.3 MB, 4.5 MB
+    mail = message("Statement", "bank@example.test", "person.a@gmail.example", "Attached.")
+    mail.add_attachment(statement, maintype="application", subtype="pdf", filename="statement.pdf")
+    mail.add_attachment(booklet, maintype="application", subtype="pdf", filename="booklet.pdf")
+    mail.add_attachment(b"item,qty\nkettle,1\n", maintype="text", subtype="csv", filename="order.csv")
+    google.add_message(REFRESH_A, "18c0d1", mail.as_bytes(), ("INBOX",))
+
+    def setup(**server):
+        raw = base_config()
+        raw["server"] = {"tool_discovery": "search", **server}  # the broker path agents use in production
+        raw["connections"] = [gmail_connection("gmail-a", "person_a", google, "gmail_token_a", "a")]
+        raw["policy"] = [{"principals": ["person_a"], "connection": "gmail-a", "tools": [f"a_gmail_{t}" for t in TOOLS], "effect": "allow"}]
+        return raw
+
+    async def fetch(client, index):
+        return await client.call_tool("gateway_call_tool", {"tool": "gmail_get_attachment", "connection": "gmail-a",
+                                                            "arguments": {"id": "18c0d1", "index": index}, "idempotency_key": f"get-{index}"})
+
+    try:
+        async with running_gateway(await prepare(tmp_path, setup(), secrets=SECRETS)) as gw, agent(gw.url, TOKEN_A) as a:
+            for index, pdf in ((0, statement), (1, booklet)):
+                got = await fetch(a, index)
+                assert not got.is_error, text_of(got)
+                assert base64.b64decode(got.content[1].resource.blob) == pdf
+            assert (await fetch(a, 2)).content[1].text == "item,qty\nkettle,1\n"
+
+        raw = setup(max_result_bytes=1_000_000)
+        raw["connections"][0]["env"]["GMAIL_MAX_ATTACHMENT_BYTES"] = "2000000"
+        async with running_gateway(await prepare(tmp_path / "small", raw, secrets=SECRETS)) as gw, agent(gw.url, TOKEN_A) as a:
+            too_big = await fetch(a, 0)
+            assert too_big.is_error and "may already have run" not in text_of(too_big)
+            assert "over this gateway's limit of 1000000 bytes" in text_of(too_big)
+            over_attachment_limit = await fetch(a, 1)
+            assert over_attachment_limit.is_error and "may already have run" not in text_of(over_attachment_limit)
+            assert "the limit is 2000000" in text_of(over_attachment_limit) and "gateway administrator" in text_of(over_attachment_limit)
+    finally:
+        google.close()
+
+
 async def test_each_person_reaches_only_their_own_account(google, tmp_path):
     async with running_gateway(await prepare(tmp_path, config(google), secrets=SECRETS)) as gw:
         async with agent(gw.url, TOKEN_A) as a, agent(gw.url, TOKEN_B) as b, agent(gw.url, TOKEN_HOUSE) as shared:

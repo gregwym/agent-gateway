@@ -138,7 +138,8 @@ def attachment(message: EmailMessage, index: int, max_bytes: int) -> types.CallT
     part = parts[index]
     data, kind, name = _bytes(part), part.get_content_type(), _name(part, index)
     if len(data) > max_bytes:
-        raise ConnectorError(f"The attachment is {len(data)} bytes; the limit is {max_bytes}.")
+        raise ConnectorError(f"The attachment is {len(data)} bytes; the limit is {max_bytes}. Open it in the mail app, "
+                             "or ask the gateway administrator to raise this connection's attachment limit.")
     about = {"filename": name, "content_type": kind, "size": len(data)}
     if kind.startswith("text/") or kind in _TEXTUAL:
         charset = part.get_content_charset() or "utf-8"

@@ -604,13 +604,15 @@ class Gateway:
             if decision == "allow":
                 outcome = "tool_error" if extra.get("is_error") else "ok"
             elif decision == "error":
-                outcome = ("execution_unknown" if extra.get("execution_uncertain") or
-                           reason in ("upstream_timeout", "upstream_invalid_reply", "result_too_large") else reason)
+                # Only a call that may change something can end with an unknown outcome; a failed read just failed.
+                uncertain = extra.get("execution_uncertain") or reason in ("upstream_timeout", "upstream_invalid_reply", "result_too_large")
+                outcome = "execution_unknown" if uncertain and tool_access(route.conn, route.tool) != "read" else reason
             self.audit.write("tool_call", client=row["client"], principal=row["principal"], tool=row["tool"],
                              connection=row["connection"], service=row["service"], account=row["account"],
                              upstream_tool=row["upstream_tool"], **({"approval": row["id"]} if approval_required else {"request_id": row["id"]}), decision=decision,
                              reason=reason, duration_ms=int((time.monotonic() - started) * 1000), **extra)
 
+        from .admin_config import tool_access
         from .web_catalog import DESCRIPTIONS
         if (self.website_catalogs and row["tool"] in DESCRIPTIONS and route is None
                 and client and client.subject == row["principal"] and row["revision"] == self.configuration_revision):
@@ -646,9 +648,12 @@ class Gateway:
         payload.pop("_meta", None)
         payload = self.scrubber.data(payload)
         size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        if size > self.cfg.server.max_result_bytes:
+        limit = self.cfg.server.max_result_bytes
+        if size > limit:
             done("error", "result_too_large", result_bytes=size)
-            return _error("The result is too large to return. Narrow the request.")
+            return _error(f"The result is too large to return: {size} bytes, over this gateway's limit of {limit} bytes. "
+                          "Narrow the request if the tool allows it; otherwise ask the gateway administrator "
+                          "to raise server.max_result_bytes.")
         clean = types.CallToolResult.model_validate(payload)
         done("allow", ok_reason, result_bytes=size, is_error=bool(clean.is_error))
         return clean

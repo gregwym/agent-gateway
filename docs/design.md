@@ -196,7 +196,8 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 - **完整正文。** `get_message` 返回纯文本正文（只有 HTML 的邮件会转成文本，也可以要原始 HTML），长邮件用
   `offset` / `max_chars` 分段读完。HTML 转文本只是为了可读，**不是**内容过滤。
 - **附件。** `get_message` 列出附件，`get_attachment` 按序号取：文本类直接返回文本，常见图片格式作为图片内容返回，
-  其余以 base64 返回。单个附件默认上限 5 MB，另受 Gateway 的 `max_result_bytes` 限制（多账号示例配置为 8 MB）。
+  其余以 base64 返回。单个附件默认上限 5 MB，另受 Gateway 的 `max_result_bytes` 限制（默认 8 MB，够 5 MB 附件
+  base64 后返回）。超限时返回的错误写明大小、上限和怎么办；读操作超限算失败，不报「执行结果未知」。
 - **Hide My Email / Sign in with Apple 的转发邮件。** 应连接实际接收转发邮件的邮箱。
   `search_messages` 的 `to` 可以按中继地址搜，结果里带 `to` 和 `delivered_to` 头；Gateway 不维护商家身份映射或订单数据。
 - **账号隔离。** 独立 connection、进程和凭据；Connector 没有「切换账号」的参数。
