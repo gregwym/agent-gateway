@@ -77,3 +77,26 @@ async def test_key_recovers_same_approval_and_new_key_is_a_separate_operation(tm
         assert (await client.call_tool(BROKER, submit)).structured_content == finished.structured_content
         assert (await client.call_tool(BROKER, {"idempotency_key": different["idempotency_key"],
                                                 "wait_seconds": 0})).structured_content["status"] == "pending"
+
+
+
+async def test_a_read_that_fails_is_failed_and_only_a_possible_write_is_unknown(tmp_path):
+    cfg = base_config()
+    cfg["server"] = {"tool_discovery": "search", "max_result_bytes": 2000}
+    cfg["policy"][1]["effect"] = "allow"
+    cfg["connections"][0]["env"]["DEMO_PADDING"] = "x" * 5000
+    async with running_gateway(await prepare(tmp_path, cfg)) as gw, agent(gw.url, TOKEN_A) as client:
+        async def call(tool, key, **arguments):
+            return await client.call_tool(BROKER, {"tool": tool, "connection": "notes-a", "arguments": arguments, "idempotency_key": key})
+
+        assert text_of(await call("notes_add_note", "add", folder="family", text="long " * 1000)) == "added"
+        read = await call("notes_list_notes", "read", folder="family")
+        assert read.is_error and "may already have run" not in text_of(read)
+        assert "this gateway's limit of 2000 bytes" in text_of(read) and "server.max_result_bytes" in text_of(read)
+        status = await client.call_tool(BROKER, {"idempotency_key": "read"})
+        assert status.structured_content == {"idempotency_key": "read", "status": "failed", "outcome": "result_too_large"}
+
+        # debug_dump has no reviewed read classification, so it may have changed something.
+        unknown = await call("notes_debug_dump", "maybe-write")
+        assert unknown.is_error and unknown.structured_content["status"] == "execution_unknown"
+        assert "may already have run" in text_of(unknown)
