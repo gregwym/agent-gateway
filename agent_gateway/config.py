@@ -255,6 +255,9 @@ class ConnectionCfg(_Model):
     command: list[str] = []
     env: dict[str, str] = {}
     secret_env: dict[str, str] = {}  # ENV_VAR -> secret name
+    # A sidecar's Unix socket: `command` runs in that container (sidecar.py). Left out of
+    # saved state when unset, so a release without sidecars can still read that state.
+    socket: str | None = Field(None, exclude_if=lambda value: value is None)
 
     # http
     url: str | None = None
@@ -324,9 +327,11 @@ class ConnectionCfg(_Model):
                     raise ValueError(f"{where}: invalid environment variable name")
             if set(self.env) & set(self.secret_env):
                 raise ValueError(f"{where}: a variable is in both env and secret_env")
+            if self.socket is not None and not os.path.isabs(self.socket):
+                raise ValueError(f"{where}: socket must be an absolute path")
         else:
-            if self.command or self.env or self.secret_env:
-                raise ValueError(f"{where}: command/env/secret_env are stdio-only")
+            if self.command or self.env or self.secret_env or self.socket:
+                raise ValueError(f"{where}: command/env/secret_env/socket are stdio-only")
             _check_url(where, self.url, self.allow_plain_http)
             if self.oauth_ref and (self.bearer_secret or self.secret_headers):
                 raise ValueError(f"{where}: OAuth cannot be combined with other credentials")

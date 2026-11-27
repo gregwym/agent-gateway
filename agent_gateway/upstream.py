@@ -1,6 +1,7 @@
 """Upstream connections: one long-lived MCP client per (service, account).
 
-The SDK's `Client` owns the transports (stdio subprocess, streamable HTTP).
+The SDK's `Client` owns the transports (stdio subprocess, streamable HTTP);
+`sidecar.connect` runs a stdio connector in another container.
 This module only decides when to connect, what credentials the connection
 gets, and whether the tools it offers still match the reviewed lock file.
 
@@ -24,7 +25,7 @@ from mcp import Client, MCPError, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from . import __version__
+from . import __version__, sidecar
 from .audit import Audit
 from .config import ConnectionCfg
 from .lock import Lock, definition_of, digest_of
@@ -88,7 +89,8 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         params = StdioServerParameters(command=conn.command[0], args=conn.command[1:], env=env)
         # The child's stderr is discarded: connectors log mail subjects and the like.
         with open(os.devnull, "w") as devnull:
-            transport = stdio_client(params, errlog=devnull)
+            # With a socket, the same command runs in that sidecar container instead.
+            transport = sidecar.connect(conn.socket, params) if conn.socket else stdio_client(params, errlog=devnull)
             async with _client(conn, transport) as client:
                 yield client
     else:

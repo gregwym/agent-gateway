@@ -204,6 +204,8 @@ direct-send grants require approval until explicitly changed.
 
 - The gateway host, administrator and local stdio connectors are trusted. Anyone
   who controls that host or runtime can access credentials and change policy.
+  A stdio connector whose manifest names a sidecar `socket` runs in that separate
+  container instead and holds only its own connection's credentials.
 - A shared agent token provides one permission set for everyone using it. Tool
   arguments and prompts cannot establish an end-user identity.
 - Gmail OAuth defaults to provider-enforced read-only access. Sending and organizing are opt-in. The Gmail `gmail.modify` scope also permits sending upstream; the Gateway exposes only the selected tools and still requires Agent grants. IMAP app passwords and
