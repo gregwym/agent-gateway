@@ -42,7 +42,7 @@ class MCPConsent(ConsentSessions):
             raise Refused("too_many_drafts", 429)
         settings = body["settings"]
         client_secret = body.get("credentials", {}).get("client_secret", "")
-        if not client_secret and conn.oauth_ref:
+        if not settings.get("oauth_client") and not client_secret and conn.oauth_ref:
             old = self.controller.oauth.get(conn.oauth_ref, conn.url)
             client = old.get("client") or {}
             if settings.get("issuer") == old.get("issuer") and settings.get("client_id") == client.get("client_id"):

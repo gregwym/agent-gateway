@@ -45,6 +45,9 @@ const messages = {
   oauth_issuer_required: ["Enter the authorization server issuer for this registered OAuth client.", "使用已注册的 OAuth 客户端时，请填写授权服务器的 issuer 地址。"],
   oauth_issuer_changed: ["The discovered authorization server differs from the configured issuer. Check the MCP address and issuer.", "发现的授权服务器与配置的 issuer 不一致，请核对 MCP 地址和 issuer。"],
   oauth_client_settings_invalid: ["Check the OAuth client ID, secret and token authentication method. Use either a registered client or a client metadata URL.", "请核对 OAuth 客户端 ID、密钥和 Token 认证方式；已注册客户端与客户端元数据 URL 只能选一种。"],
+  oauth_client_exists: ['This name is already used by an OAuth client. Choose a different name.', '该名称已被 OAuth 客户端使用，请选择另一个名称。'],
+  oauth_client_limit: ['The gateway has reached its limit for saved OAuth clients.', '网关已达 OAuth 客户端数量上限。'],
+  oauth_client_unavailable: ['The selected OAuth client is unavailable. Refresh and choose a saved client.', '所选 OAuth 客户端不可用，请刷新后选择已登记的客户端。'],
   oauth_metadata_missing: ["The server did not publish usable OAuth metadata. Check its MCP and authorization-server configuration.", "服务器没有提供有效的 OAuth 元数据，请检查 MCP 及授权服务器配置。"],
   oauth_pkce_required: ["The authorization server must support PKCE S256.", "授权服务器必须支持 PKCE S256。"],
   oauth_client_registration_required: ["This server does not support automatic client registration. Enter a registered client ID and issuer.", "此服务器不支持自动注册客户端，请填写已注册的客户端 ID 和 issuer。"],
@@ -992,12 +995,32 @@ function systemSettings() {
     [['auto', tr('Follow browser', '跟随浏览器')], ['en', 'English'], ['zh-CN', '简体中文']], state.language);
   button(preferences, tr('Save language', '保存语言'), () => mutate('settings/language', {language: language.value}));
   const card = el(app, 'section', undefined, 'card');
+  const remote = el(app, 'section', undefined, 'card');
+  el(remote, 'h2', tr('Remote MCP OAuth clients', '远程 MCP OAuth 客户端'));
+  for (const client of state.oauth_clients) el(remote, 'p', client.id + ' · ' + client.issuer);
+  button(remote, tr('Add OAuth client', '添加 OAuth 客户端'), remoteOAuthClientDialog);
   el(card, 'h2', 'Gmail OAuth');
   const {client_id: id} = state.gmail_oauth;
   el(card, 'p', id ? tr('Configured for new Gmail connections.', '新建 Gmail 连接将使用这套配置。') :
     tr('Set up one OAuth client for Gmail. Authorize each mailbox separately.', '配置一套 Gmail OAuth 客户端，每个邮箱单独授权。'), 'muted');
   if (id) el(card, 'code', id, 'url');
   button(card, id ? tr('Change OAuth client', '更换 OAuth 客户端') : tr('Configure OAuth client', '配置 OAuth 客户端'), gmailClientDialog);
+}
+function remoteOAuthClientDialog() {
+  const box = modal(tr('Add remote MCP OAuth client', '添加远程 MCP OAuth 客户端'));
+  const id = connectorNameField(box);
+  const issuer = field(box, 'Issuer', 'issuer', '', 'url');
+  const clientId = field(box, 'OAuth client ID', 'client_id');
+  const clientSecret = field(box, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password');
+  const method = select(box, tr('Client authentication', '客户端认证'), 'auth_method',
+    [['none', tr('Public client (no secret)', '公共客户端（无密钥）')], ['client_secret_post', 'Client secret in POST'], ['client_secret_basic', 'Client secret in Basic header']], 'client_secret_post');
+  el(box, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
+  button(box, tr('Save OAuth client', '保存 OAuth 客户端'), async () => {
+    await mutate('oauth-clients/save', {id: id.value.trim(), issuer: issuer.value.trim(),
+      client_id: clientId.value.trim(), client_secret: clientSecret.value, auth_method: method.value});
+    clientSecret.value = '';
+    box.close();
+  }, 'primary', tr('Saving…', '正在保存…'));
 }
 function gmailClientDialog() {
   const box = modal(tr('Gmail OAuth client', 'Gmail OAuth 客户端'));
@@ -1169,7 +1192,16 @@ function connectorForm(existing, reauthorize = false) {
       const tokenBox = el(dynamic, 'div'), headerBox = el(dynamic, 'div'), oauthBox = el(dynamic, 'div');
       credentials.token = field(tokenBox, tr('Token / API key', 'Token / API 密钥'), 'token', '', 'password', existing ? tr('Blank keeps the saved value only when the endpoint is unchanged.', '接口地址未变时，留空保留原值。') : '');
       settings.header = field(headerBox, tr('Credential header', '凭据 Header'), 'header', existing?.settings.header || 'X-API-Key');
+      settings.oauth_client = select(oauthBox, tr('System OAuth client', '系统 OAuth 客户端'), 'oauth_client',
+        [['', tr('Automatic or connection-specific', '自动注册或为此连接单独配置')], ...state.oauth_clients.map(c => [c.id, c.id + ' · ' + c.issuer])],
+        existing?.settings.oauth_client || '');
+      settings.scope = field(oauthBox, tr('Scopes (optional, space separated)', 'Scope（可选，用空格分隔）'),
+        'scope', existing?.settings.scope || '', 'text',
+        tr('Blank uses scopes requested by the MCP server. Review them on the authorization page.', '留空使用 MCP 服务器要求的范围，请在授权页面核对。'));
       const advancedOAuth = el(oauthBox, 'details');
+      const showAdvancedOAuth = () => { advancedOAuth.hidden = Boolean(settings.oauth_client.value); };
+      settings.oauth_client.addEventListener('change', showAdvancedOAuth);
+      showAdvancedOAuth();
       el(advancedOAuth, 'summary', tr('Advanced OAuth settings', 'OAuth 高级设置'));
       el(advancedOAuth, 'p', tr('Register this callback URL with the provider if you use a pre-registered client.', '使用预先注册的客户端时，请在服务商处登记此回调地址。'), 'muted');
       el(advancedOAuth, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
@@ -1177,7 +1209,6 @@ function connectorForm(existing, reauthorize = false) {
       settings.client_id = field(advancedOAuth, tr('OAuth client ID (optional)', 'OAuth 客户端 ID（可选）'), 'client_id', existing?.settings.client_id || '');
       credentials.client_secret = field(advancedOAuth, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password', existing ? tr('Leave blank to keep the saved value for this client.', '同一客户端留空保留原值。') : '');
       settings.auth_method = select(advancedOAuth, tr('Client authentication', '客户端认证'), 'auth_method', [['none', tr('Public client (no secret)', '公共客户端（无密钥）')], ['client_secret_post', 'Client secret in POST'], ['client_secret_basic', 'Client secret in Basic header']], existing?.settings.auth_method || 'none');
-      settings.scope = field(advancedOAuth, tr('Scopes (optional, space separated)', 'Scope（可选，用空格分隔）'), 'scope', existing?.settings.scope || '', 'text', tr('Blank uses the scopes requested by the MCP server. Review them on the authorization page.', '留空使用 MCP 服务器要求的范围，请在授权页面核对。'));
       settings.client_metadata_url = field(advancedOAuth, tr('Client metadata URL (optional)', '客户端元数据 URL（可选）'), 'client_metadata_url', existing?.settings.client_metadata_url || '', 'text', tr('For providers supporting URL-based client registration. Use instead of a client ID.', '用于支持 URL 客户端注册的服务商，与客户端 ID 二选一。'));
       function authFields() { tokenBox.hidden = !['bearer', 'header'].includes(settings.auth.value); headerBox.hidden = settings.auth.value !== 'header'; oauthBox.hidden = settings.auth.value !== 'oauth'; }
       settings.auth.addEventListener('change', authFields); authFields();
@@ -1220,6 +1251,13 @@ function connectorForm(existing, reauthorize = false) {
       .filter(([, input]) => input.type !== 'file').map(([k, input]) => [k, input.value]));
     if (mailProvider?.value === 'gmail') values.password = values.password.replace(/\s+/g, '');
     const fields = Object.fromEntries(Object.entries(settings).map(([k, input]) => [k, input.value]));
+    if (kind.value === 'remote') {
+      if (fields.auth !== 'oauth') delete fields.oauth_client;
+      if (fields.oauth_client) {
+        for (const key of ['issuer', 'client_id', 'auth_method', 'client_metadata_url']) delete fields[key];
+        delete values.client_secret;
+      }
+    }
     if (kind.value === 'gmail' && !systemGmail()) fields.client_id = existing.settings.client_id;
     return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values};
   }
@@ -1230,7 +1268,9 @@ function connectorForm(existing, reauthorize = false) {
   function needsOAuth() {
     return kind.value === 'remote' && settings.auth.value === 'oauth' && (
       reauthorize || needsReview() || existing?.settings.auth !== 'oauth' || credentials.client_secret.value ||
-      ['issuer', 'client_id', 'auth_method', 'scope', 'client_metadata_url'].some(key => settings[key].value !== (existing?.settings[key] || ''))
+      ['oauth_client', 'scope'].some(key => settings[key].value !== (existing?.settings[key] || '')) ||
+      (!settings.oauth_client.value && ['issuer', 'client_id', 'auth_method', 'client_metadata_url']
+        .some(key => settings[key].value !== (existing?.settings[key] || '')))
     );
   }
   function systemGmail() { return !existing?.settings.client_id || Boolean(useSystemClient?.checked); }
