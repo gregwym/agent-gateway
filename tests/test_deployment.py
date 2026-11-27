@@ -353,9 +353,14 @@ conn = ConnectionCfg(id='amazon', service='amazon-orders', account='person_a', o
                      command=command, env=env, secret_env={'ORDERS_SESSION_SECRET': 'session'}, socket=plugin.socket,
                      tools=[], timeout_seconds=30)
 async def main():
-    async with open_client(conn, {'session': '[]'}) as client:
+    async with open_client(conn, {'session': '[]'}, persistent_sidecar_state=True) as client:
         tools = await list_all_tools(client)
         calls = {name: await client.call_tool(name, {}) for name in ('check_session', 'get_orders')}
+    second = conn.model_copy(update={'id': 'second', 'account': 'second'})
+    for current, value, saved in ((second, 'second', True), (conn, 'preview', False)):
+        session = json.dumps([{'name': 'fixture', 'value': value}])
+        async with open_client(current, {'session': session}, persistent_sidecar_state=saved) as client:
+            assert await list_all_tools(client)
     print(json.dumps({'read_only': [t.name for t in tools if t.annotations and t.annotations.read_only_hint],
                       **{name: [r.is_error, r.content[0].text] for name, r in calls.items()}}))
 anyio.run(main)
@@ -367,8 +372,15 @@ anyio.run(main)
         # Without the network, an attempt to sign in or to read Amazon would fail differently.
         assert result["get_orders"][0] is True and "There's no saved Amazon session." in result["get_orders"][1]
         # The credential became the MCP's cookie file, readable by the sidecar's user only.
-        assert docker("exec", name, "stat", "-c", "%a %u", "/var/lib/amazon-orders/cookies.json") == "600 10001"
-        assert docker("exec", name, "cat", "/var/lib/amazon-orders/cookies.json") == "[]"
+        root = "/var/lib/amazon-orders"
+        first = f"{root}/amazon-orders.person_a.person_a/cookies.json"
+        second = f"{root}/amazon-orders.second.person_a/cookies.json"
+        assert docker("exec", name, "stat", "-c", "%a %u", first) == "600 10001"
+        assert docker("exec", name, "cat", first) == "[]"
+        assert json.loads(docker("exec", name, "cat", second)) == [{"name": "fixture", "value": "second"}]
+        assert set(docker("exec", name, "ls", "-1", root).splitlines()) == {
+            "amazon-orders.person_a.person_a", "amazon-orders.second.person_a",
+        }
     finally:
         docker("rm", "-f", name, check=False)
         docker("volume", "rm", sockets, state, check=False)

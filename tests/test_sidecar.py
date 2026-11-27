@@ -56,7 +56,8 @@ async def test_image_sidecar_connector_review_call_and_stop(tmp_path, socket_dir
     started = tmp_path / "started"
     secret = "private-sidecar-credential"
     # The demo connector, after recording its process and the process that started it.
-    record = ("import os, sys; open(sys.argv[1], 'w').write(f'{os.getpid()} {os.getppid()}'); "
+    record = ("import os, sys; scope = os.environ.get('AGW_SIDECAR_CONNECTION', '-'); "
+              "open(sys.argv[1], 'w').write(f'{os.getpid()} {os.getppid()} {scope}'); "
               "os.execv(sys.executable, [sys.executable, '-m', 'agent_gateway.demo_connector'])")
     image = tmp_path / "image-plugins"
     image.mkdir()
@@ -76,6 +77,7 @@ async def test_image_sidecar_connector_review_call_and_stop(tmp_path, socket_dir
                                "credentials": {"DEMO_API_KEY": "Notes key"}}]
             preview = await change(http, "connections/preview", **body)
             assert preview.status_code == 200, preview.text
+            assert started.read_text().split()[2] == "-"
             review = preview.json()
             applied = await change(http, "connections/apply", draft=review["draft"], reviewed=True, tools=review["tools"])
             assert applied.status_code == 200, applied.text
@@ -87,12 +89,13 @@ async def test_image_sidecar_connector_review_call_and_stop(tmp_path, socket_dir
             assert not result.get("error") and not result["result"].get("isError"), result
             assert secret not in str(result) + gw.audit_text()
             # The connector is the sidecar's child, not the gateway's.
-            pid, parent = map(int, started.read_text().split())
-            assert parent == sidecar.pid != os.getpid()
-            assert alive(pid)
+            pid, parent, scope = started.read_text().split()
+            assert int(parent) == sidecar.pid != os.getpid()
+            assert scope == "notes-sidecar.notes-sidecar.person_a"
+            assert alive(int(pid))
         # The gateway closed its connection, so the sidecar stopped the connector.
         with anyio.fail_after(10):
-            while alive(pid):
+            while alive(int(pid)):
                 await anyio.sleep(0.05)
         assert sidecar.poll() is None
 

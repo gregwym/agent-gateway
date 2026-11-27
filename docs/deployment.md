@@ -649,8 +649,8 @@ networks:
    不选 `sign_in`（要开浏览器登录，sidecar 里没有装浏览器）和 `update_config`（改连接器的配置）。再到「权限」里给 Agent 只读。
 
 会话失效后，工具返回「There's no saved Amazon session.」或登录失败：重新导出，在「编辑设置」里换上新文件的内容。
-sidecar 把正在用的会话（包括 Amazon 中途更新的 Cookie）存在 `amazon-orders-state` 卷的 `cookies.json`（0600），
-换了凭据，下次启动时覆盖。这个卷不用备份，丢了就重新导出。
+sidecar 在 `amazon-orders-state` 卷里给每个连接单独存一份 `cookies.json`（0600），包括 Amazon 中途更新的 Cookie。
+工具审阅使用临时文件。应用新凭据后，下次启动会覆盖对应连接的 Cookie。这个卷不用备份，丢了就重新导出。
 
 侧车使用独立 Docker 网络。启用网关的宿主端口映射时，侧车可能经宿主地址访问网关。需要阻断这条路径时，保持网关的 8080 端口不对宿主发布。
 
