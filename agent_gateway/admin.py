@@ -56,7 +56,7 @@ def needs_admin_confirmation(operation, body):
     return operation in {
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
-        "settings/gmail-oauth", "oauth-clients/save", "web-login/start", "web-login/terminate",
+        "settings/gmail-oauth", "oauth-clients/save", "proposals/reject", "web-login/start", "web-login/terminate",
         "web-catalog/publisher", "web-catalog/origins",
     }
 
@@ -80,6 +80,8 @@ class AdminController:
         self.mcp_oauth = MCPConsent(self)
         from .admin_oauth import GoogleConsent
         self.google = GoogleConsent(self)
+        from .connectors.gateway_config import Provisioning
+        self.provisioning = Provisioning(self)
         runtime.gateway = self._gateway(self.store.state)
         if not self.auth.initialized():
             self.auth.setup_link()
@@ -87,7 +89,8 @@ class AdminController:
     def _gateway(self, state):
         from .server import Gateway
         cfg, lock, values = self.store.effective(state)
-        result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver, self.oauth, self.web_sessions)
+        result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver,
+                         self.oauth, self.web_sessions, self.provisioning)
         from .catalog_sync import catalog_revision
         result.website_catalogs = self.website_catalogs
         result.configuration_revision = "web:" + str(state["revision"]) + ":" + catalog_revision(cfg, lock)
@@ -231,6 +234,7 @@ class AdminController:
                 "connections": connections, "passkeys": keys,
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
                 "oauth_clients": self.oauth.list_clients(),
+                "config_proposals": [self.provisioning.view(row) for row in self.provisioning.rows()],
                 "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
                 "plugins": [plugin.public() for plugin in plugins.values()],
@@ -299,7 +303,7 @@ class AdminController:
         result = await self._commit(state, "connections/save")
         return {**result, "saved": True, "id": conn.id}
 
-    def preview_result(self, state, conn, added, definitions, session):
+    def preview_result(self, state, conn, added, definitions, session, *, proposal=None):
         from .admin_remote import remote_tools
         cfg, _, _ = self.store.effective(state)
         kind = kind_of(conn)
@@ -331,7 +335,7 @@ class AdminController:
             raise Refused("too_many_drafts", 429)
         draft = secrets.token_urlsafe(24)
         self.drafts[draft] = {"state": state, "session": session["id"], "expires": time.time() + 600,
-                              "connection": conn.id, "remote": remote, "oauth_ref": conn.oauth_ref}
+                              "connection": conn.id, "remote": remote, "oauth_ref": conn.oauth_ref, "proposal": proposal}
         # Definitions can echo credentials. Scrub prior to displaying them too.
         scrubber = self._gateway(state).scrubber
         return {"draft": draft, "connection": conn.id, "definitions": scrubber.data(list({t.upstream: definitions[t.upstream] for t in conn.tools}.values())),
@@ -349,7 +353,7 @@ class AdminController:
         conn = conn.model_copy(update={"oauth_ref": flow["ref"]})
         if previous and conn.url == previous.url:
             return await self.save_connection(state, cfg, conn, added, previous)
-        return self.preview_result(state, conn, added, flow["definitions"], session)
+        return self.preview_result(state, conn, added, flow["definitions"], session, proposal=flow.get("proposal"))
 
     def website_connection(self, name):
         conn = next((c for c in self.runtime.gateway.cfg.connections if c.id == name and kind_of(c) == "web"), None)
@@ -380,11 +384,18 @@ class AdminController:
         return settings
 
     async def operate(self, operation, body, session, *, gmail_email=None):
+        proposal = None
+        if operation in ("oauth-clients/save", "connections/preview", "oauth/mcp/start"):
+            proposal = body.pop("proposal", None)
+            if proposal is not None:
+                self.provisioning.match(proposal, operation, body)
         if operation == "oauth/mcp/start":
-            return await self.mcp_oauth.start(body, session)
+            return await self.mcp_oauth.start(body, session, proposal=proposal)
         if operation == "oauth/mcp/complete":
             key = body.get("id")
             flow = self.mcp_oauth.complete(key, session)
+            if flow.get("proposal"):
+                self.provisioning.require(flow["proposal"])
             result = await self.finish_remote_oauth(flow, session)
             del self.mcp_oauth.flows[key]
             return result
@@ -541,9 +552,15 @@ class AdminController:
                 raise Refused("last_admin_passkey", 409)
             self.auth.approver.forget_passkey(key_id)
             return {"ok": True}
+        if operation == "proposals/reject":
+            self._revision(body)
+            if set(body) != {"id", "revision"} or not isinstance(body["id"], str):
+                raise Refused("invalid_proposal", 400)
+            self.provisioning.reject(body["id"])
+            return {"ok": True}
         if operation == "connections/test":
             conn = next((c for c in self.runtime.gateway.cfg.connections if c.id == body.get("id")), None)
-            if not conn or kind_of(conn) not in CATALOG:
+            if not conn or kind_of(conn) not in CATALOG or kind_of(conn) == "gateway_config":
                 raise Refused("unsupported_connector", 400)
             probe, arguments = CATALOG[kind_of(conn)]["probe"]
             values = self.runtime.gateway.secrets
@@ -803,7 +820,7 @@ class AdminController:
                 reason, incident = connector_failure(exc, conn.transport), secrets.token_hex(6)
                 self.runtime.gateway.audit.write("admin_connector_preview", reason=reason, detail=f"{incident}:{type(exc).__name__}")
                 raise Refused(reason, 422, incident=incident) from None
-            return self.preview_result(state, conn, added, definitions, session)
+            return self.preview_result(state, conn, added, definitions, session, proposal=proposal)
         if operation == "connections/apply":
             draft = self.drafts.get(body.get("draft"))
             if not draft or draft["session"] != session["id"] or draft["expires"] <= time.time():
@@ -812,6 +829,8 @@ class AdminController:
                 raise Refused("configuration_changed", 409)
             if body.get("reviewed") is not True:
                 raise Refused("review_required", 400)
+            if draft.get("proposal"):
+                self.provisioning.require(draft["proposal"])
             draft = copy.deepcopy(draft)
             if draft.get("remote"):
                 from .admin_remote import apply_selection

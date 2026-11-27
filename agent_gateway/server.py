@@ -185,6 +185,7 @@ class Gateway:
         approver: Approver | None = None,
         oauth=None,
         web_sessions=None,
+        config_provisioning=None,
     ) -> None:
         self.cfg = cfg
         self.lock = lock
@@ -196,9 +197,11 @@ class Gateway:
         self.oauth = oauth
         self.website_catalogs = None
         self.scrubber = Scrubber(list(secrets.values()), (lambda: oauth.sensitive) if oauth else None)
-        self.upstreams: dict[str, Upstream] = {}
-        self.routes: dict[str, ToolRoute] = {}
         from .catalog_sync import bundled_kind
+        from .connectors.gateway_config import ConfigConnection
+
+        self.upstreams: dict[str, Upstream | ConfigConnection] = {}
+        self.routes: dict[str, ToolRoute] = {}
 
         events = {e.connection: e for e in cfg.mail_events}
         # Entries without a bundled Gmail or IMAP connection, reported by `agw check`. Not logged here: with
@@ -211,7 +214,10 @@ class Gateway:
             event = events.get(conn.id) if bundled_kind(conn) in MAIL_EVENT_KINDS else None
             extra = {"AGW_MAIL_EVENTS_URL": event.url, "AGW_MAIL_EVENTS_TYPE": event.type,
                      "AGW_MAIL_EVENTS_SECRET": secrets[event.secret], "AGW_MAIL_EVENTS_MAILBOX": conn.id} if event else None
-            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir, extra)
+            if bundled_kind(conn) == "gateway_config":
+                self.upstreams[conn.id] = ConfigConnection(conn, config_provisioning)
+            else:
+                self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir, extra)
             for tool in conn.tools:
                 self.routes[tool.name] = build_route(conn, tool, lock.get(conn.id, tool.upstream))
 
@@ -445,6 +451,15 @@ class Gateway:
                 return _error("This action is outside the Agent's allowed mailbox folders or labels.")
             upstream_arguments = {**final_arguments, ARGUMENT: scope}
 
+        from .connectors.gateway_config import ConfigConnection
+        from .passkey import Refused
+        connector = self.upstreams[route.conn.id]
+        if isinstance(connector, ConfigConnection):
+            try:
+                upstream_arguments = connector.prepare(self, client_id, route.tool.upstream, upstream_arguments)
+            except Refused as exc:
+                done("deny", exc.code)
+                return _error("The gateway rejected the configuration request: " + exc.code)
         return final_arguments, upstream_arguments
 
     def _request_effect(self, principal, client_id, route, arguments, done):

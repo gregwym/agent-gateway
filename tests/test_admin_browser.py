@@ -165,6 +165,34 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 assert page.url == origin + '/admin/connections'
                 await playwright.expect(renamed).to_be_visible()
                 await playwright.expect(version).to_be_visible()
+                if not zh:
+                    await page.get_by_role('button', name='Add connector', exact=True).click()
+                    await page.get_by_label('Service', exact=True).select_option('gateway_config')
+                    await page.get_by_label('Connector name', exact=True).fill('browser-config')
+                    await page.get_by_role('button', name='Save connector', exact=True).click()
+                    await playwright.expect(page.locator('tr[data-connection=browser-config]')).to_be_visible()
+                    await page.get_by_role('link', name='Permissions', exact=True).click()
+                    await page.get_by_label('Agent', exact=True).select_option('shared-agent')
+                    await page.locator('tr[data-connection=browser-config]').get_by_role('button', name='Edit access').click()
+                    config_card = page.get_by_role('dialog', name='Permissions: browser-config', exact=True)
+                    await config_card.locator('summary').click()
+                    provision = config_card.get_by_role('row').filter(has_text='browser_config_provision')
+                    await provision.get_by_label('Effect', exact=True).select_option('allow')
+                    async with page.expect_response(lambda response: response.url.endswith('/permissions/save') and response.ok):
+                        await provision.get_by_role('button', name='Save access', exact=True).click()
+                    await config_card.get_by_role('button', name='Close', exact=True).click()
+                    reply = await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name':'browser_config_provision',
+                        'arguments':{'kind':'http_mcp', 'id':'browser-proposal',
+                                     'url':'https://example.test/mcp', 'auth':'none'}})
+                    assert json.loads(reply.json()['result']['content'][0]['text'])['status'] == 'pending'
+                    await page.get_by_role('link', name='Connectors', exact=True).click()
+                    pending = page.get_by_role('heading', name='Provisioning requests', exact=True)
+                    await playwright.expect(pending).to_be_visible()
+                    await page.get_by_role('button', name='Review', exact=True).click()
+                    await playwright.expect(page.get_by_label('MCP endpoint URL', exact=True)).to_have_value('https://example.test/mcp')
+                    await page.get_by_role('dialog', name='Add connector', exact=True).get_by_role('button', name='Close', exact=True).click()
+                    await page.get_by_role('button', name='Reject', exact=True).click()
+                    await playwright.expect(pending).not_to_be_visible()
                 assert not errors
             finally:
                 await browser.close()

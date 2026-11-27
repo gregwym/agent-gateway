@@ -30,7 +30,7 @@ class MCPConsent(ConsentSessions):
                 self.controller.oauth.discard(flow["ref"])
                 del self.flows[key]
 
-    async def start(self, body, session):
+    async def start(self, body, session, *, proposal=None):
         self.controller._revision(body)
         if body.get("kind") != "remote" or body.get("settings", {}).get("auth") != "oauth":
             raise Refused("invalid_connector", 400)
@@ -50,7 +50,7 @@ class MCPConsent(ConsentSessions):
         ref = self.controller.oauth.create(conn.url, self.redirect, settings, client_secret)
         body["credentials"] = {}
         key = secrets.token_urlsafe(32)
-        flow = {"session": session["id"], "body": body, "ref": ref, "expires": time.time() + 600,
+        flow = {"session": session["id"], "body": body, "ref": ref, "proposal": proposal, "expires": time.time() + 600,
                 "phase": "starting", "started": anyio.Event(), "returned": anyio.Event(), "done": anyio.Event()}
         self.flows[key] = flow
         self.controller.runtime.tasks.start_soon(self._run, key, conn.model_copy(update={"oauth_ref": ref}))
@@ -77,6 +77,8 @@ class MCPConsent(ConsentSessions):
             await flow["returned"].wait()
             self._active(flow)
             self.controller._revision(flow["body"])
+            if flow.get("proposal"):
+                self.controller.provisioning.require(flow["proposal"])
             if flow.get("error"):
                 raise Refused(flow["error"], 400)
             return flow["result"]
