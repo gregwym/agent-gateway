@@ -1,0 +1,9 @@
+{
+  "id": "amazon-orders",
+  "label": "Amazon Orders",
+  "kind": "stdio",
+  "socket": "/sidecars/amazon-orders/control.sock",
+  "command": ["/usr/local/bin/python", "-I", "-S", "/opt/connectors/amazon-orders/start.py"],
+  "env": {"AMAZON_COOKIE_JAR_PATH": "/var/lib/amazon-orders/cookies.json"},
+  "credentials": {"ORDERS_SESSION_SECRET": "Amazon session file (from examples.export_web_session amazon-us)"}
+}

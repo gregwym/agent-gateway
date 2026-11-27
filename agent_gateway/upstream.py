@@ -61,10 +61,12 @@ def http_client(**kwargs):
 
 @asynccontextmanager
 async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, *, auth=None, web_sessions=None,
-                      state_dir: Path | None = None, extra_env: dict[str, str] | None = None) -> AsyncIterator[Client]:
+                      state_dir: Path | None = None, extra_env: dict[str, str] | None = None,
+                      persistent_sidecar_state: bool = False) -> AsyncIterator[Client]:
     """Connect to one upstream, handing it its own credentials and nothing else.
 
     `extra_env` is what the gateway itself adds for a stdio connector (new-mail events).
+    Only a running upstream gets a permanent sidecar state directory. Probes use temporary state.
     """
     if conn.oauth_ref and oauth is None and auth is None:
         from .passkey import Refused
@@ -86,6 +88,10 @@ async def open_client(conn: ConnectionCfg, secrets: dict[str, str], oauth=None, 
         if state_dir is not None:
             env["AGW_STATE_DIR"] = str(state_dir)  # this connection's private directory (sent-mail copies, mail cursor)
         env.update(extra_env or {})
+        if conn.socket:
+            env.pop("AGW_SIDECAR_CONNECTION", None)
+            if persistent_sidecar_state:
+                env["AGW_SIDECAR_CONNECTION"] = f"{conn.service}.{conn.account}.{conn.owner}"
         params = StdioServerParameters(command=conn.command[0], args=conn.command[1:], env=env)
         # The child's stderr is discarded: connectors log mail subjects and the like.
         with open(os.devnull, "w") as devnull:
@@ -168,7 +174,7 @@ class Upstream:
             self._connecting = True
             try:
                 async with open_client(self.conn, self._secrets, self.oauth, web_sessions=self.web_sessions, state_dir=self.state_dir,
-                                       extra_env=self.extra_env) as client:
+                                       extra_env=self.extra_env, persistent_sidecar_state=True) as client:
                     with anyio.fail_after(_CONNECT_TIMEOUT):
                         await self._verify(client)
                     self._client = client
