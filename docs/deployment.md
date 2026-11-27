@@ -643,13 +643,21 @@ networks:
 在 Compose 的 `amazon-orders` sidecar 里运行。它不用账号密码登录，只用你从自己浏览器导出的会话。
 
 1. 启动 sidecar：`docker compose --profile amazon-orders up -d --no-build`。网关多挂了一个套接字卷，会重建一次。
-2. 在自己的电脑上导出会话：`python -m examples.export_web_session amazon-us ./amazon-session.json`（做法见「网站会话」）。
-3. 「连接器 → 添加连接器 → 本地连接器」选「Amazon Orders」，把文件的全部内容粘进凭据框，然后删除这个文件。
+2. 在装有 uv 和 Chrome 的 Mac 上运行下面这条命令。把 `GATEWAY_COMMIT` 换成部署对应的完整 GitHub 提交号。
+   uv 会自动准备 Python 环境。在弹出的 Chrome 中手动登录，勾选「保持登录」，然后按 `Cmd+Q` 完全退出 Chrome。
+   导出器把会话写到当前目录的 `amazon-session.json`，只有当前用户能读写。
+
+   ```sh
+   uvx --python 3.12 --from "agent-gateway[session-export] @ https://github.com/gregwym/agent-gateway/archive/GATEWAY_COMMIT.tar.gz" agw-export-session amazon-us ./amazon-session.json
+   ```
+
+3. 「连接器 → 添加连接器 → 本地连接器」选「Amazon Orders」，在「浏览器会话 JSON」选择文件，点「预览工具」。
 4. 在「审阅工具」中只勾选 `get_orders`、`get_order`、`get_tracking` 和 `check_session`。
    网关默认把 `check_session` 标为「写入」。将它的「操作类型」改成「读取」，确认四项都是「读取」后应用。
-   在「权限」中给 Agent 设为「只读」。
+   用管理员 Passkey 应用后删除本地文件。在「权限」中给 Agent 设为「只读」。
 
-会话失效后，工具返回「There's no saved Amazon session.」或登录失败：重新导出，在「编辑设置」里换上新文件的内容。
+工具返回「There's no saved Amazon session.」或登录失败时，重新导出会话，在「编辑设置」里选择新文件。
+用管理员 Passkey 保存后删除本地文件。留空会保留已保存的会话。
 sidecar 在 `amazon-orders-state` 卷里给每个连接单独存一份 `cookies.json`（0600），包括 Amazon 中途更新的 Cookie。
 工具审阅使用临时文件。应用新凭据后，下次启动会覆盖对应连接的 Cookie。这个卷不用备份，丢了就重新导出。
 

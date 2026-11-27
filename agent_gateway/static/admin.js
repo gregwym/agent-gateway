@@ -1066,6 +1066,29 @@ function googleClientFields(parent) {
   });
   return {clientId, clientSecret};
 }
+function sessionFileField(parent, name, help = '') {
+  const upload = field(parent, tr('Browser session JSON', '浏览器会话 JSON'), name, '', 'file', help);
+  upload.accept = '.json,application/json';
+  return upload;
+}
+
+async function readAmazonSession(file) {
+  const limit = 16_000;
+  const tooLarge = () => new Error(tr('The session file exceeds 16,000 characters.', '会话文件超过 16,000 个字符。'));
+  if (file.size > limit * 4) throw tooLarge();
+  const raw = await file.text();
+  if ([...raw].length > limit) throw tooLarge();
+
+  let cookies;
+  try { cookies = JSON.parse(raw); } catch {}
+  if (!Array.isArray(cookies) || !cookies.length ||
+      !cookies.every(cookie => typeof cookie?.name === 'string' &&
+        typeof cookie.value === 'string' && typeof cookie.domain === 'string')) {
+    throw new Error(tr('Select a browser session JSON file exported for Amazon Orders.', '请选择为 Amazon Orders 导出的浏览器会话 JSON 文件。'));
+  }
+  return raw;
+}
+
 function connectorForm(existing, reauthorize = false) {
   const revision = state.revision;
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
@@ -1113,14 +1136,18 @@ function connectorForm(existing, reauthorize = false) {
           if (!state.website_login) el(fields, 'p', tr('The sign-in browser is offline. You can still import a session under Advanced.', '登录浏览器暂不可用。仍可在高级选项中导入会话。'), 'hint');
           const advanced = el(fields, 'details');
           el(advanced, 'summary', tr('Advanced: import a session file', '高级：导入会话文件'));
-          const upload = field(advanced, tr('Browser session JSON', '浏览器会话 JSON'), 'session_file', '', 'file');
-          upload.accept = '.json,application/json';
-          credentials.AGwSessionUpload = upload;
+          credentials.AGwSessionUpload = sessionFileField(advanced, 'session_file');
           return;
         }
         const slots = existing?.plugin_credentials || plugin?.credentials || {};
         for (const [key, label] of Object.entries(slots)) {
-          credentials[key] = field(fields, label, key, '', 'password', existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
+          if (settings.plugin.value === 'amazon-orders' && key === 'ORDERS_SESSION_SECRET') {
+            credentials[key] = sessionFileField(fields, key, existing
+              ? tr('Leave empty to keep the saved session.', '不选文件则保留已保存的会话。') : '');
+          } else {
+            credentials[key] = field(fields, label, key, '', 'password',
+              existing ? tr('Leave blank to keep the saved value.', '留空保留已保存的值。') : '');
+          }
           credentials[key].required = !existing;
         }
       };
@@ -1189,7 +1216,8 @@ function connectorForm(existing, reauthorize = false) {
   }
   fields();
   function values() {
-    const values = Object.fromEntries(Object.entries(credentials).map(([k, input]) => [k, input.value]));
+    const values = Object.fromEntries(Object.entries(credentials)
+      .filter(([, input]) => input.type !== 'file').map(([k, input]) => [k, input.value]));
     if (mailProvider?.value === 'gmail') values.password = values.password.replace(/\s+/g, '');
     const fields = Object.fromEntries(Object.entries(settings).map(([k, input]) => [k, input.value]));
     if (kind.value === 'gmail' && !systemGmail()) fields.client_id = existing.settings.client_id;
@@ -1237,7 +1265,11 @@ function connectorForm(existing, reauthorize = false) {
         return;
       }
       if (file.size > 60000) throw new Error(tr('The browser session file exceeds 60 KB.', '浏览器会话文件超过 60 KB。'));
-      payload.credentials = file ? {AGW_WEB_SESSION: await file.text()} : {};
+      payload.credentials = {AGW_WEB_SESSION: await file.text()};
+    }
+    const amazonSession = credentials.ORDERS_SESSION_SECRET;
+    if (amazonSession?.type === 'file' && amazonSession.files.length) {
+      payload.credentials.ORDERS_SESSION_SECRET = await readAmazonSession(amazonSession.files[0]);
     }
     if (google) {
       const result = await api('oauth/start', payload); location.assign(result.url); return;
