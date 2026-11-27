@@ -40,10 +40,13 @@ dev = [
     "Radicale>=3.5,<4",
 ]
 
-browser-tests = ["playwright>=1.51,<2"]
+# Run the local Chrome session exporter.
+session-export = ["playwright>=1.51,<2"]
+browser-tests = ["agent-gateway[session-export]"]
 
 [project.scripts]
 agw = "agent_gateway.cli:main"
+agw-export-session = "agent_gateway.export_web_session:main"
 
 [tool.setuptools]
 packages = ["agent_gateway", "agent_gateway.connectors"]
