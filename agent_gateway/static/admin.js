@@ -25,10 +25,15 @@ if (setupCode) history.replaceState(null, '', location.pathname + location.searc
 window.addEventListener('popstate', () => { dialogs.replaceChildren(); if (state) render(); });
 function navigate(key, replace = false) {
   const url = tabUrls[key];
-  if (url === location.pathname + location.search + location.hash) return;
-  if (replace) history.replaceState(null, '', url);
-  else history.pushState(null, '', url);
-  render();
+  const same = url === location.pathname + location.search + location.hash;
+  if (same && key !== 'connections') return;
+  if (!same) {
+    if (replace) history.replaceState(null, '', url);
+    else history.pushState(null, '', url);
+  }
+  if (key === 'connections') {
+    refresh().catch(error => { if (state) { render(); showError(app, error); } });
+  } else render();
 }
 const messages = {
   registry_query_invalid: ['Enter a service name between 3 and 100 characters.', '请输入 3 到 100 字符的服务名称。'],
@@ -45,9 +50,13 @@ const messages = {
   oauth_issuer_required: ["Enter the authorization server issuer for this registered OAuth client.", "使用已注册的 OAuth 客户端时，请填写授权服务器的 issuer 地址。"],
   oauth_issuer_changed: ["The discovered authorization server differs from the configured issuer. Check the MCP address and issuer.", "发现的授权服务器与配置的 issuer 不一致，请核对 MCP 地址和 issuer。"],
   oauth_client_settings_invalid: ["Check the OAuth client ID, secret and token authentication method. Use either a registered client or a client metadata URL.", "请核对 OAuth 客户端 ID、密钥和 Token 认证方式；已注册客户端与客户端元数据 URL 只能选一种。"],
+  proposal_not_pending: ['This request is no longer pending. Reload the connector list.', '这条申请已结束，请刷新连接器列表。'],
+  proposal_changed: ['The connector settings differ from the provisioning request.', '连接器设置与接入申请不一致。'],
+  invalid_configuration_connector: ['Create at most one configuration connector, owned by the gateway administrator.', '网关配置连接器只能由管理员持有，且最多创建一个。'],
   oauth_client_exists: ['This name is already used by an OAuth client. Choose a different name.', '该名称已被 OAuth 客户端使用，请选择另一个名称。'],
   oauth_client_limit: ['The gateway has reached its limit for saved OAuth clients.', '网关已达 OAuth 客户端数量上限。'],
   oauth_client_unavailable: ['The selected OAuth client is unavailable. Refresh and choose a saved client.', '所选 OAuth 客户端不可用，请刷新后选择已登记的客户端。'],
+  invalid_proposal: ['Check the provisioning request. Its settings are invalid.', '请核对接入申请，设置不合法。'],
   oauth_metadata_missing: ["The server did not publish usable OAuth metadata. Check its MCP and authorization-server configuration.", "服务器没有提供有效的 OAuth 元数据，请检查 MCP 及授权服务器配置。"],
   oauth_pkce_required: ["The authorization server must support PKCE S256.", "授权服务器必须支持 PKCE S256。"],
   oauth_client_registration_required: ["This server does not support automatic client registration. Enter a registered client ID and issuer.", "此服务器不支持自动注册客户端，请填写已注册的客户端 ID 和 issuer。"],
@@ -712,12 +721,27 @@ function connections() {
   const head = el(app, 'div', undefined, 'row between page-heading');
   infoHeading(head, 'h1', title, tr('Credentials are encrypted. Testing contacts the connected service without writing data.', '凭据加密保存。验证会连接对应服务，不会写入数据。'));
   button(head, tr('Add connector', '添加连接器'), () => connectorForm(), 'primary');
+  const pending = state.config_proposals.filter(row => row.status === 'pending');
+  if (pending.length) {
+    const card = el(app, 'section', undefined, 'card');
+    el(card, 'h2', tr('Provisioning requests', '待审接入申请'));
+    for (const row of pending) {
+      const item = el(card, 'div', undefined, 'row between');
+      const summary = el(item, 'div');
+      el(summary, 'strong', row.config.id + ' · ' + row.client);
+      el(summary, 'p', row.config.url || row.config.issuer, 'url');
+      const actions = el(item, 'div', undefined, 'actions');
+      button(actions, tr('Review', '审阅'), () => row.config.kind === 'oauth_client'
+        ? remoteOAuthClientDialog(row) : connectorForm(undefined, false, row));
+      button(actions, tr('Reject', '拒绝'), () => mutate('proposals/reject', {id: row.id}));
+    }
+  }
   if (!state.connections.length) { el(app, 'p', tr('No connectors yet.', '还没有连接器。'), 'muted'); return; }
   settingsTable(app, 'connections', title, [tr('Connector', '连接器'), tr('Status', '状态'), tr('Actions', '操作')], state.connections, connectionSearchText, (row, conn) => {
     connectionRowTitle(row, conn, true);
     connectionStatus(el(row, 'td'), conn);
     const actions = el(el(row, 'td'), 'div', undefined, 'actions');
-    if (conn.kind && conn.kind !== 'demo') button(actions, tr('Edit settings', '编辑设置'), () => connectorForm(conn));
+    if (conn.kind && !['demo', 'gateway_config'].includes(conn.kind)) button(actions, tr('Edit settings', '编辑设置'), () => connectorForm(conn));
     button(actions, tr('Details', '详情'), () => connectorDetails(conn.id));
   });
 }
@@ -743,7 +767,7 @@ function connectorDetails(id) {
     }
     toolUpdateNotice(content, conn);
     const actions = el(content, 'div', undefined, 'actions');
-    if (conn.kind) button(actions, conn.kind === 'web' ? tr('Check site reachability', '验证网站连通性') : tr('Test connection', '验证连接'), async () => {
+    if (conn.kind && conn.kind !== 'gateway_config') button(actions, conn.kind === 'web' ? tr('Check site reachability', '验证网站连通性') : tr('Test connection', '验证连接'), async () => {
       try { await api('connections/test', {id}); }
       catch (error) {
         if (state) {
@@ -1006,10 +1030,11 @@ function systemSettings() {
   if (id) el(card, 'code', id, 'url');
   button(card, id ? tr('Change OAuth client', '更换 OAuth 客户端') : tr('Configure OAuth client', '配置 OAuth 客户端'), gmailClientDialog);
 }
-function remoteOAuthClientDialog() {
+function remoteOAuthClientDialog(proposal) {
   const box = modal(tr('Add remote MCP OAuth client', '添加远程 MCP OAuth 客户端'));
-  const id = connectorNameField(box);
-  const issuer = field(box, 'Issuer', 'issuer', '', 'url');
+  const id = connectorNameField(box, proposal?.config.id || '');
+  const issuer = field(box, 'Issuer', 'issuer', proposal?.config.issuer || '', 'url');
+  id.readOnly = issuer.readOnly = Boolean(proposal);
   const clientId = field(box, 'OAuth client ID', 'client_id');
   const clientSecret = field(box, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password');
   const method = select(box, tr('Client authentication', '客户端认证'), 'auth_method',
@@ -1017,7 +1042,8 @@ function remoteOAuthClientDialog() {
   el(box, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
   button(box, tr('Save OAuth client', '保存 OAuth 客户端'), async () => {
     await mutate('oauth-clients/save', {id: id.value.trim(), issuer: issuer.value.trim(),
-      client_id: clientId.value.trim(), client_secret: clientSecret.value, auth_method: method.value});
+      client_id: clientId.value.trim(), client_secret: clientSecret.value, auth_method: method.value,
+      ...(proposal && {proposal: proposal.id})});
     clientSecret.value = '';
     box.close();
   }, 'primary', tr('Saving…', '正在保存…'));
@@ -1112,13 +1138,14 @@ async function readAmazonSession(file) {
   return raw;
 }
 
-function connectorForm(existing, reauthorize = false) {
+function connectorForm(existing, reauthorize = false, proposal) {
   const revision = state.revision;
+  const seed = existing?.settings || proposal?.config || {};
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
-  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).filter(([key]) => key !== 'local' || existing || state.plugins?.some(p => p.kind !== 'web')).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = !!existing;
+  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).filter(([key]) => key !== 'local' || existing || state.plugins?.some(p => p.kind !== 'web')).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = Boolean(existing || proposal);
   const fixed = el(form, 'div', undefined, 'form-grid');
-  const name = connectorNameField(fixed, existing?.id || ''); name.disabled = !!existing;
+  const name = connectorNameField(fixed, existing?.id || proposal?.config.id || ''); name.disabled = !!existing; name.readOnly = !!proposal;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Group: ', '群组共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
   const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider, useSystemClient;
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
@@ -1178,26 +1205,30 @@ function connectorForm(existing, reauthorize = false) {
       return;
     }
     if (kind.value === 'remote') {
-      if (!existing) button(dynamic, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
+      if (!existing && !proposal) button(dynamic, tr('Search MCP Registry', '搜索 MCP Registry'), () => registryPicker(result => {
         settings.url.value = result.url;
         settings.service.value = result.service;
         settings.auth.value = result.auth || '';
         settings.auth.dispatchEvent(new Event('change'));
         name.focus();
       }));
-      settings.url = field(dynamic, tr('MCP endpoint URL', 'MCP 接口地址'), 'url', existing?.settings.url || '', 'url'); settings.url.required = true;
-      settings.service = field(dynamic, tr('Service ID', '服务标识'), 'service', existing?.settings.service || 'remote-mcp', 'text', tr('Use the same ID for accounts that expose the same service tools.', '同一服务的不同账号使用相同标识。')); settings.service.disabled = !!existing;
-      settings.auth = select(dynamic, tr('Authentication', '认证方式'), 'auth', [['', tr('Choose authentication', '选择认证方式')], ['none', tr('None', '无需认证')], ['bearer', 'Bearer token'], ['header', tr('API key header', 'API 密钥 Header')], ['oauth', 'OAuth']], existing?.settings.auth || 'oauth');
+      settings.url = field(dynamic, tr('MCP endpoint URL', 'MCP 接口地址'), 'url', seed.url || '', 'url'); settings.url.required = true;
+      settings.service = field(dynamic, tr('Service ID', '服务标识'), 'service', seed.service || 'remote-mcp', 'text', tr('Use the same ID for accounts that expose the same service tools.', '同一服务的不同账号使用相同标识。')); settings.service.disabled = !!existing;
+      settings.auth = select(dynamic, tr('Authentication', '认证方式'), 'auth', [['', tr('Choose authentication', '选择认证方式')], ['none', tr('None', '无需认证')], ['bearer', 'Bearer token'], ['header', tr('API key header', 'API 密钥 Header')], ['oauth', 'OAuth']], seed.auth || 'oauth');
       settings.auth.required = true;
       const tokenBox = el(dynamic, 'div'), headerBox = el(dynamic, 'div'), oauthBox = el(dynamic, 'div');
       credentials.token = field(tokenBox, tr('Token / API key', 'Token / API 密钥'), 'token', '', 'password', existing ? tr('Blank keeps the saved value only when the endpoint is unchanged.', '接口地址未变时，留空保留原值。') : '');
       settings.header = field(headerBox, tr('Credential header', '凭据 Header'), 'header', existing?.settings.header || 'X-API-Key');
       settings.oauth_client = select(oauthBox, tr('System OAuth client', '系统 OAuth 客户端'), 'oauth_client',
         [['', tr('Automatic or connection-specific', '自动注册或为此连接单独配置')], ...state.oauth_clients.map(c => [c.id, c.id + ' · ' + c.issuer])],
-        existing?.settings.oauth_client || '');
+        seed.oauth_client || '');
       settings.scope = field(oauthBox, tr('Scopes (optional, space separated)', 'Scope（可选，用空格分隔）'),
-        'scope', existing?.settings.scope || '', 'text',
+        'scope', seed.scope || '', 'text',
         tr('Blank uses scopes requested by the MCP server. Review them on the authorization page.', '留空使用 MCP 服务器要求的范围，请在授权页面核对。'));
+      if (proposal) {
+        for (const key of ['url', 'service', 'scope']) settings[key].readOnly = true;
+        settings.auth.disabled = settings.oauth_client.disabled = true;
+      }
       const advancedOAuth = el(oauthBox, 'details');
       const showAdvancedOAuth = () => { advancedOAuth.hidden = Boolean(settings.oauth_client.value); };
       settings.oauth_client.addEventListener('change', showAdvancedOAuth);
@@ -1259,7 +1290,8 @@ function connectorForm(existing, reauthorize = false) {
       }
     }
     if (kind.value === 'gmail' && !systemGmail()) fields.client_id = existing.settings.client_id;
-    return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values};
+    return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values,
+      ...(proposal && {proposal: proposal.id})};
   }
   function needsReview() {
     if (kind.value === 'local') return !existing;

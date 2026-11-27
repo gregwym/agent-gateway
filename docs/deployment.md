@@ -545,6 +545,21 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 最后一个管理员 Passkey 不能从网页删除；所有设备都丢失时，由主机管理员用 `agw approval enroll <admin.owner>`
 生成恢复注册链接，再从网页撤销丢失的 Passkey。
 
+### 让 Agent 申请接入
+
+在「连接器」新增一个由网关管理员持有的「网关配置」连接器。在「权限」给相应 Agent 开通读取或提交申请，
+然后用 `gateway_search_tools` 搜索 `gateway_config`。通过 `gateway_call_tool` 调用返回的
+`gateway_config_read` 或 `gateway_config_provision`。读工具列出可选 OAuth client 引用、
+该 Agent 已获准的远程连接和自己的申请状态。结果不含凭据。
+
+预注册 OAuth client 缺失时，先提交 `{"kind":"oauth_client","id":"example","issuer":"https://auth.example.test"}`。
+管理员在「待审接入申请」打开表单，用 Passkey 保存已在提供商处登记的 client。再提交 `http_mcp` 类型的
+申请，填写 `id`、`url`、`auth`，需要时填写 `oauth_client` 和 `scope`。使用自动注册时留空
+`oauth_client`。审批前网关只保存待审记录，操作队列和待审列表中的申请字段均加密。管理员确认预览并保存连接后，继续在「权限」按现有规则授予服务工具。
+
+降级到不支持「网关配置」连接器的版本前，在管理页移除此连接器。让队列中仍待 Passkey 审批的配置提交过期，或使用
+`agw approval cancel <id>` 取消。备份申请记录时包含 `approvals.sqlite` 与 `admin.enc.proposals`。
+
 <a id="connector-plugins"></a>
 
 ### 连接器扩展

@@ -55,6 +55,7 @@ class ApprovalRequest:
     client_token_sha256: str = field(default="", repr=False)
     target_sha256: str = ""
     background: bool = False
+    protect_arguments: bool = False
     id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     created_at: float = field(default_factory=time.time)
     ttl_seconds: int = 300

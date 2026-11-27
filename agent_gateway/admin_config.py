@@ -58,6 +58,9 @@ CATALOG = {
                   "tools": [("reminders_lists", "lists"), ("reminders_list", "list"), ("reminders_get", "get")],
                   "probe": ("reminders_lists", {})},
     "local": LOCAL_SPEC,
+    "gateway_config": {"label": "Gateway configuration / 网关配置", "fields": [], "secrets": [],
+                       "tools": [("read", "read"), ("provision", "provision")],
+                       "writes": {"provision"}, "probe": (None, {})},
     "demo": {"label": "Demo notes / 模拟笔记", "fields": [], "secrets": [],
              "tools": [("list_notes", "list"), ("get_note", "get"), ("add_note", "add")],
              "probe": ("list_notes", {"folder": "inbox"})},
@@ -197,7 +200,8 @@ def kind_of(conn):
         return "remote"
     command = " ".join(conn.command)
     for needle, kind in (("demo_connector.py", "demo"), ("agent_gateway.demo_connector", "demo"), ("connectors.imap_mail", "imap"),
-                         ("connectors.caldav_calendar", "caldav"), ("connectors.gmail", "gmail")):
+                         ("connectors.caldav_calendar", "caldav"), ("connectors.gmail", "gmail"),
+                         ("connectors.gateway_config", "gateway_config")):
         if needle in command:
             return kind
     return None
@@ -364,6 +368,9 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
 
     if kind == "remote":
         return make_remote(name, owner, account, settings, provided, previous, values, credential_ref)
+    if kind == "gateway_config" and (not cfg.admin or owner != cfg.admin.owner or any(
+            conn.id != name and kind_of(conn) == kind for conn in cfg.connections)):
+        raise Refused("invalid_configuration_connector", 400)
     fresh = {}
 
     def field(key, default=""):
@@ -481,7 +488,7 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
                 fresh.get(ref, values.get(ref)) == values.get(previous.secret_env.get(key)) for key, ref in raw["secret_env"].items()):
             raw["mailbox_email"] = previous.mailbox_email
             raw["mailbox_aliases"] = previous.mailbox_aliases
-    else:
+    elif kind == "reminders":
         raw.update(transport="http", url=field("url"), command=[], bearer_secret=secret("token", ""))
         parts = urlsplit(raw["url"])
         if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.fragment or parts.query:

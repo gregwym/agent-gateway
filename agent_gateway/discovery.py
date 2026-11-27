@@ -75,7 +75,7 @@ BY_NAME = {tool.name: tool for tool in TOOLS}
 
 def shared_name(route):
     kind = kind_of(route.conn)
-    namespace = {"imap": "mail", "caldav": "calendar", "gmail": "gmail", "demo": "notes", "reminders": "reminders", "web": "web"}.get(kind)
+    namespace = {"imap": "mail", "caldav": "calendar", "gmail": "gmail", "demo": "notes", "reminders": "reminders", "web": "web", "gateway_config": "gateway_config"}.get(kind)
     raw = f"{namespace or 'service_' + route.conn.service}_{route.tool.upstream}"
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", raw)
     if cleaned != raw or len(cleaned) > 64:

@@ -162,7 +162,8 @@ def make_approver(cfg: Config, audit: Audit) -> Approver:
         return DenyAllApprover()
     from .passkey import PasskeyApprover  # imported only when used, so the core does not need WebAuthn
 
-    approver = PasskeyApprover(cfg.approvals, audit, retention_days=cfg.audit.retention_days)
+    approver = PasskeyApprover(cfg.approvals, audit, retention_days=cfg.audit.retention_days,
+                               protected_key_file=cfg.secrets.key_file if cfg.admin else None)
     approver.name_of = cfg.name_of
     return approver
 
@@ -185,6 +186,7 @@ class Gateway:
         approver: Approver | None = None,
         oauth=None,
         web_sessions=None,
+        config_provisioning=None,
     ) -> None:
         self.cfg = cfg
         self.lock = lock
@@ -196,9 +198,11 @@ class Gateway:
         self.oauth = oauth
         self.website_catalogs = None
         self.scrubber = Scrubber(list(secrets.values()), (lambda: oauth.sensitive) if oauth else None)
-        self.upstreams: dict[str, Upstream] = {}
-        self.routes: dict[str, ToolRoute] = {}
         from .catalog_sync import bundled_kind
+        from .connectors.gateway_config import ConfigConnection
+
+        self.upstreams: dict[str, Upstream | ConfigConnection] = {}
+        self.routes: dict[str, ToolRoute] = {}
 
         events = {e.connection: e for e in cfg.mail_events}
         # Entries without a bundled Gmail or IMAP connection, reported by `agw check`. Not logged here: with
@@ -211,7 +215,10 @@ class Gateway:
             event = events.get(conn.id) if bundled_kind(conn) in MAIL_EVENT_KINDS else None
             extra = {"AGW_MAIL_EVENTS_URL": event.url, "AGW_MAIL_EVENTS_TYPE": event.type,
                      "AGW_MAIL_EVENTS_SECRET": secrets[event.secret], "AGW_MAIL_EVENTS_MAILBOX": conn.id} if event else None
-            self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir, extra)
+            if bundled_kind(conn) == "gateway_config":
+                self.upstreams[conn.id] = ConfigConnection(conn, config_provisioning)
+            else:
+                self.upstreams[conn.id] = Upstream(conn, own, lock, audit, oauth, web_sessions, state_dir, extra)
             for tool in conn.tools:
                 self.routes[tool.name] = build_route(conn, tool, lock.get(conn.id, tool.upstream))
 
@@ -445,6 +452,15 @@ class Gateway:
                 return _error("This action is outside the Agent's allowed mailbox folders or labels.")
             upstream_arguments = {**final_arguments, ARGUMENT: scope}
 
+        from .connectors.gateway_config import ConfigConnection
+        from .passkey import Refused
+        connector = self.upstreams[route.conn.id]
+        if isinstance(connector, ConfigConnection):
+            try:
+                upstream_arguments = connector.prepare(self, client_id, route.tool.upstream, upstream_arguments)
+            except Refused as exc:
+                done("deny", exc.code)
+                return _error("The gateway rejected the configuration request: " + exc.code)
         return final_arguments, upstream_arguments
 
     def _request_effect(self, principal, client_id, route, arguments, done):
@@ -516,12 +532,15 @@ class Gateway:
         return False
 
     def _approval_request(self, client, route, final_arguments, *, requires_approval=True):
+        from .connectors.gateway_config import ConfigConnection, PROPOSE
+
         return ApprovalRequest(
             principal=client.subject, client_id=client.id, tool=route.tool.name, connection=route.conn.id,
             service=route.conn.service, account=route.conn.account, upstream_tool=route.tool.upstream,
             arguments_sha256=arguments_digest(final_arguments), arguments=final_arguments, owner=route.conn.owner,
             approvers=self.cfg.approvers_of(route.conn) if requires_approval else (), configuration_revision=self.configuration_revision,
             client_token_sha256=client.token_sha256, background=not requires_approval,
+            protect_arguments=(route.tool.upstream == PROPOSE and isinstance(self.upstreams[route.conn.id], ConfigConnection)),
             target_sha256=arguments_digest({
                 "connection": route.conn.model_dump(mode="json", exclude={"tools", "mailbox_email", "mailbox_aliases"}),
                 "tool": route.tool.model_dump(mode="json"),

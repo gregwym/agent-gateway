@@ -18,6 +18,7 @@ MODULES = {
     "agent_gateway.connectors.imap_mail": "imap",
     "agent_gateway.connectors.caldav_calendar": "caldav",
     "agent_gateway.connectors.gmail": "gmail",
+    "agent_gateway.connectors.gateway_config": "gateway_config",
     "agent_gateway.demo_connector": "demo",
 }
 
@@ -58,6 +59,9 @@ def bundled_manifest(conn):
     elif kind == "caldav":
         from .connectors.caldav_calendar import build_tools
         tools = [t.as_mcp() for t in build_tools(SimpleNamespace(zone=ZoneInfo(conn.env.get("CALDAV_TIMEZONE", "UTC"))))]
+    elif kind == "gateway_config":
+        from .connectors.gateway_config import definitions
+        tools = definitions()
     else:
         from .demo_connector import tool_definitions
         tools = tool_definitions()
