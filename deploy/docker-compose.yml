@@ -42,6 +42,7 @@ services:
       - ${AGW_KEY_DIR:-./data/key}:/key:ro
       - ${AGW_HOME:-./data}/state:/state
       - browser-sockets:/browser
+      - amazon-orders-socket:/sidecars/amazon-orders
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
       interval: 30s
@@ -73,6 +74,26 @@ services:
       timeout: 5s
       retries: 3
 
+  # The Amazon Orders connector (docs/deployment.md, "Amazon 订单"), started only with
+  # `--profile amazon-orders`. Same image; it holds the Amazon session and no Gateway data,
+  # and uses a separate network. The gateway reaches it over the socket.
+  amazon-orders:
+    <<: *gateway
+    profiles: ["amazon-orders"]
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "agent_gateway.sidecar", "/sidecars/amazon-orders/control.sock"]
+    mem_limit: 384m
+    pids_limit: 128
+    networks: [amazon-orders]
+    volumes:
+      - amazon-orders-socket:/sidecars/amazon-orders
+      - amazon-orders-state:/var/lib/amazon-orders   # the live session (cookies.json)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.socket(socket.AF_UNIX).connect('/sidecars/amazon-orders/control.sock')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # One-off admin commands, run by a human on this host. Same image, writable mounts:
   #   docker compose run --rm admin secret init
   #   docker compose run --rm admin secret set notes_key_a
@@ -89,3 +110,8 @@ services:
 
 volumes:
   browser-sockets:
+  amazon-orders-socket:
+  amazon-orders-state:
+
+networks:
+  amazon-orders:

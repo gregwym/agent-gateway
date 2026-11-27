@@ -637,6 +637,26 @@ networks:
 
 不需要出网的连接器把 `networks` 换成 `network_mode: none`。连接器要保存的文件放在 sidecar 自己的卷里。
 
+#### Amazon 订单
+
+镜像带了 Amazon Orders 连接器（amazon-orders-mcp 3.0.1，依赖的版本和哈希锁在 `connectors/amazon-orders/requirements.txt`），
+在 Compose 的 `amazon-orders` sidecar 里运行。它不用账号密码登录，只用你从自己浏览器导出的会话。
+
+1. 启动 sidecar：`docker compose --profile amazon-orders up -d --no-build`。网关多挂了一个套接字卷，会重建一次。
+2. 在自己的电脑上导出会话：`python -m examples.export_web_session amazon-us ./amazon-session.json`（做法见「网站会话」）。
+3. 「连接器 → 添加连接器 → 本地连接器」选「Amazon Orders」，把文件的全部内容粘进凭据框，然后删除这个文件。
+4. 审阅工具时只选要用的读取工具，例如 `get_orders`、`get_order`、`get_tracking`、`check_session`。
+   不选 `sign_in`（要开浏览器登录，sidecar 里没有装浏览器）和 `update_config`（改连接器的配置）。再到「权限」里给 Agent 只读。
+
+会话失效后，工具返回「There's no saved Amazon session.」或登录失败：重新导出，在「编辑设置」里换上新文件的内容。
+sidecar 把正在用的会话（包括 Amazon 中途更新的 Cookie）存在 `amazon-orders-state` 卷的 `cookies.json`（0600），
+换了凭据，下次启动时覆盖。这个卷不用备份，丢了就重新导出。
+
+侧车使用独立 Docker 网络。启用网关的宿主端口映射时，侧车可能经宿主地址访问网关。需要阻断这条路径时，保持网关的 8080 端口不对宿主发布。
+
+这份会话就是完整的 Amazon 登录。连接器的代码现在只读，但被投毒的版本可以用它下单，或者把它发到别处；
+所以版本锁定，升级只走审过的 PR。
+
 ### 网站会话
 
 在手机或电脑打开「连接器 → 添加连接器 → 网站」，选择站点预设或用「其他网站」输入登录地址，再点「登录网站」。在登录页点选输入框，

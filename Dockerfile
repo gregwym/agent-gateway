@@ -28,6 +28,14 @@ FROM base AS gateway
 # Run directly from the source tree.
 COPY agent_gateway ./agent_gateway
 COPY examples ./examples
+# Third-party connectors, run only in their sidecar containers (docs/deployment.md). Wheels only,
+# no dependency resolution: nothing from these packages runs at build time.
+COPY connectors /opt/connectors
+RUN pip install --require-hashes --only-binary=:all: --no-deps --target /opt/connectors/amazon-orders/lib \
+      -r /opt/connectors/amazon-orders/requirements.txt \
+ && test -z "$(find /opt/connectors -type l)" \
+ && install -d -o agw -g agw -m 0700 /sidecars/amazon-orders /var/lib/amazon-orders
+ENV AGW_IMAGE_PLUGINS_DIR=/opt/connectors/plugins
 USER 10001:10001
 ENV AGW_CONFIG=/config/gateway.yaml
 EXPOSE 8080

@@ -323,3 +323,52 @@ anyio.run(main)
     finally:
         docker("rm", "-f", name, check=False)
         docker("volume", "rm", name, check=False)
+
+
+async def test_amazon_orders_sidecar_without_a_session_reports_it_and_does_not_sign_in():
+    image = os.environ["AGW_TEST_IMAGE"]
+    name = "agw-amazon-acceptance-" + uuid.uuid4().hex[:12]
+    sockets, state = f"{name}-sockets", f"{name}-state"
+    mount = ["-v", f"{sockets}:/sidecars/amazon-orders"]
+    hardened = ["--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--tmpfs", "/tmp"]
+    try:
+        # No chown: the image creates both mount points for UID 10001, and a new volume takes that over.
+        docker("run", "-d", "--name", name, *hardened, "--init", *mount, "-v", f"{state}:/var/lib/amazon-orders",
+               "--entrypoint", "python", image, "-m", "agent_gateway.sidecar", "/sidecars/amazon-orders/control.sock")
+        # The gateway's end: the manifest that comes with the image, an empty cookie array as the session.
+        probe = """
+import json, time
+import anyio
+from agent_gateway.config import ConnectionCfg
+from agent_gateway.plugins import connector_plugins
+from agent_gateway.upstream import list_all_tools, open_client
+for _ in range(75):
+    if 'amazon-orders' in connector_plugins(None):
+        break
+    time.sleep(.2)
+plugin = connector_plugins(None)['amazon-orders']
+command, env = plugin.connection()
+conn = ConnectionCfg(id='amazon', service='amazon-orders', account='person_a', owner='person_a', transport='stdio',
+                     command=command, env=env, secret_env={'ORDERS_SESSION_SECRET': 'session'}, socket=plugin.socket,
+                     tools=[], timeout_seconds=30)
+async def main():
+    async with open_client(conn, {'session': '[]'}) as client:
+        tools = await list_all_tools(client)
+        calls = {name: await client.call_tool(name, {}) for name in ('check_session', 'get_orders')}
+    print(json.dumps({'read_only': [t.name for t in tools if t.annotations and t.annotations.read_only_hint],
+                      **{name: [r.is_error, r.content[0].text] for name, r in calls.items()}}))
+anyio.run(main)
+"""
+        with anyio.fail_after(60):
+            result = json.loads(docker("run", "--rm", *hardened, *mount, "--entrypoint", "python", image, "-c", probe))
+        assert {"check_session", "get_orders", "get_order", "get_tracking"} <= set(result["read_only"])
+        assert result["check_session"][0] is False and json.loads(result["check_session"][1])["signed_in"] is False
+        # Without the network, an attempt to sign in or to read Amazon would fail differently.
+        assert result["get_orders"][0] is True and "There's no saved Amazon session." in result["get_orders"][1]
+        # The credential became the MCP's cookie file, readable by the sidecar's user only.
+        assert docker("exec", name, "stat", "-c", "%a %u", "/var/lib/amazon-orders/cookies.json") == "600 10001"
+        assert docker("exec", name, "cat", "/var/lib/amazon-orders/cookies.json") == "[]"
+    finally:
+        docker("rm", "-f", name, check=False)
+        docker("volume", "rm", sockets, state, check=False)
