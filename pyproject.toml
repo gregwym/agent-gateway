@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-gateway"
-version = "0.20.0"
+version = "0.21.0"
 description = "A small self-hosted MCP gateway for a household: per-person identity, tool allowlists, credential isolation, audit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     # The MCP transports, auth middleware and client all come from the official SDK.
     "mcp>=2.3,<3",
-    "pydantic>=2.7,<3",
+    "pydantic>=2.12,<3",
     "PyYAML>=6,<7",
     "cryptography>=43",
     "jsonschema>=4.20,<5",

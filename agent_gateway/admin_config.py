@@ -401,7 +401,7 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
             return previous.model_copy(update={"secret_env": refs}), fresh
         command, env = plugin.connection()
         return ConnectionCfg(id=name, service=plugin.id, account=account, owner=owner, plugin=plugin.id,
-                             transport="stdio", command=command, env=env, secret_env=refs,
+                             transport="stdio", command=command, env=env, secret_env=refs, socket=plugin.socket,
                              max_concurrency=1, timeout_seconds=60, tools=[]), fresh
 
     service = {"demo": "notes", "imap": "imap-mail", "caldav": "caldav-calendar"}.get(kind, kind)

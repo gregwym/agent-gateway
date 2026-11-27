@@ -585,6 +585,58 @@ stdio MCP 示例：
 避免给 CLI 工具开放可执行脚本、任意文件路径或重新配置程序的选项。网页管理员不能提交命令；CLI 参数
 按清单传递，网关不调用 Shell。CLI 预览只检查工具定义。stdio 预览会启动 MCP 程序并列出工具。
 
+派生镜像也可以把清单放进镜像，用 `AGW_IMAGE_PLUGINS_DIR` 指向所在目录；主机 `plugins/` 里同 ID 的清单优先。
+
+#### 在独立容器里运行 stdio 连接器
+
+本地 stdio 连接器是网关的子进程，与网关同权（见设计文档第 6 节）。不想给第三方连接器这种信任时，
+在清单里加 `socket`（容器内的绝对路径），这个连接器就改在另一个容器（sidecar）里运行：
+
+```json
+{
+  "id": "inventory-mcp",
+  "label": "Inventory MCP",
+  "kind": "stdio",
+  "socket": "/sidecars/inventory/control.sock",
+  "command": ["/opt/connectors/inventory-mcp", "--stdio"],
+  "credentials": {"INVENTORY_TOKEN": "Inventory token"}
+}
+```
+
+网关连到这个 Unix socket，把命令、参数和这条连接的环境变量（含它的凭据）发给 sidecar。sidecar 按本地连接器的方式启动程序：
+同样的最小环境，同样的退出流程。之后双方转发 MCP 消息。一次 socket 连接对应一个进程，任一端断开，进程就结束。
+sidecar 不挂载 `/config`、`/secrets`、`/key`、`/state`，连接器只拿到自己这一份凭据。
+socket 文件存在时，这个扩展才出现在「本地连接器」里。
+
+能连上 socket 的进程可以在 sidecar 里运行任意命令，所以 socket 卷只挂给网关和这个 sidecar。
+命名卷第一次挂载时沿用镜像里同一路径的属主，派生镜像要先建好目录（写在 `USER` 之前）：
+`RUN install -d -o agw -g agw -m 0700 /sidecars/inventory`。Compose 示例：
+
+```yaml
+services:
+  gateway:
+    volumes:
+      - inventory-socket:/sidecars/inventory   # 加在原有挂载之后
+  inventory:
+    image: ${AGW_INVENTORY_IMAGE}              # 安装了连接器的派生镜像
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp"]
+    networks: [inventory]                      # 需要出网时用自己的网络，不与网关共用
+    entrypoint: ["python", "-m", "agent_gateway.sidecar", "/sidecars/inventory/control.sock"]
+    volumes: ["inventory-socket:/sidecars/inventory"]
+volumes:
+  inventory-socket:
+networks:
+  inventory:
+```
+
+不需要出网的连接器把 `networks` 换成 `network_mode: none`。连接器要保存的文件放在 sidecar 自己的卷里。
+
 ### 网站会话
 
 在手机或电脑打开「连接器 → 添加连接器 → 网站」，选择站点预设或用「其他网站」输入登录地址，再点「登录网站」。在登录页点选输入框，
@@ -755,5 +807,7 @@ docker compose up -d --no-build
 ```
 
 回滚：把两个变量改回上一版的 tag，再 `docker compose up -d --no-build`。旧 tag 一直保留在 ghcr.io 上。
+0.21.0 以前的版本读不了含 sidecar 连接（清单带 `socket`）的 `admin.enc`：回滚到这些版本前，先在网页删除这类连接，
+或者换回升级前备份的 `admin.enc`。
 
 依赖版本锁在 `requirements.txt`（带哈希）。升级依赖 = 重新生成该文件并跑完整测试，不要在镜像里放开版本。

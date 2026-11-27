@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from .config import ENV_NAME, NAME
 
 _logger = logging.getLogger("agent_gateway")
 MANIFEST_ENV = "AGW_CLI_MANIFEST"
+IMAGE_PLUGINS_ENV = "AGW_IMAGE_PLUGINS_DIR"
 SPEC = {"label": "Local connector / 本地连接器", "fields": ["plugin"], "secrets": [],
         "tools": [], "probe": (None, {})}
 
@@ -68,11 +70,14 @@ class Plugin(ManifestModel):
     env: dict[str, str] = Field(default_factory=dict, max_length=24)
     credentials: dict[str, str] = Field(default_factory=dict, max_length=12)
     tools: dict[str, Action] = Field(default_factory=dict, max_length=40)
+    socket: str | None = None  # a sidecar's Unix socket; see sidecar.py
 
     web: dict | None = None
 
     @model_validator(mode="after")
     def _check(self):
+        if self.socket is not None and (self.kind != "stdio" or not Path(self.socket).is_absolute()):
+            raise ValueError("a sidecar socket needs a stdio connector and an absolute path")
         if self.kind == "web":
             from .web_profiles import WebProfile
             if self.command or self.env or self.credentials or self.tools or self.web is None:
@@ -143,4 +148,9 @@ def connector_plugins(directory: Path | None):
     from .web_profiles import bundled_profiles
     bundled = {key: Plugin(id=key, label=label, kind="web", web=profile.model_dump())
                for key, (label, profile) in bundled_profiles().items()}
-    return load_plugins(directory) | bundled
+    # An image can ship manifests for connectors it installs; the host's manifests override them by ID.
+    image = os.environ.get(IMAGE_PLUGINS_ENV)
+    plugins = load_plugins(Path(image) if image else None) | load_plugins(directory)
+    # A sidecar connector is offered only where its sidecar is running.
+    return {key: plugin for key, plugin in plugins.items()
+            if plugin.socket is None or Path(plugin.socket).exists()} | bundled

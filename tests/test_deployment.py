@@ -273,3 +273,53 @@ assert call('close') == {}
     finally:
         docker("rm", "-f", name, check=False)
         docker("volume", "rm", name, check=False)
+
+
+async def test_sidecar_container_runs_connectors_without_gateway_data():
+    image = os.environ["AGW_TEST_IMAGE"]
+    name = "agw-sidecar-acceptance-" + uuid.uuid4().hex[:12]
+    sockets = "/sidecars/acceptance"
+    mount = ["-v", f"{name}:{sockets}"]
+    hardened = ["--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp"]
+    try:
+        docker("volume", "create", name)
+        docker("run", "--rm", "--network", "none", "--user", "0:0", *mount, "--entrypoint", "python", image,
+               "-c", f"import os; os.chown({sockets!r}, 10001, 10001); os.chmod({sockets!r}, 0o700)")
+        docker("run", "-d", "--name", name, "--network", "none", *hardened, "--init", *mount,
+               "-e", "HOME=/sidecar-home", "-e", "SIDECAR_PRIVATE=sidecar-only",
+               "--entrypoint", "python", image, "-m", "agent_gateway.sidecar", f"{sockets}/control.sock")
+        metadata = json.loads(docker("inspect", name))[0]
+        assert metadata["Config"]["User"] == "10001:10001"
+        assert [mount["Destination"] for mount in metadata["Mounts"]] == [sockets]
+        docker("exec", name, "python", "-c",
+               "import os; assert not any(os.path.exists(p) for p in ('/config', '/secrets', '/key', '/state'))")
+        # The gateway's end, in a second container of the same image.
+        probe = """
+import os, sys, time
+import anyio
+from agent_gateway.config import ConnectionCfg
+from agent_gateway.upstream import open_client
+for _ in range(75):
+    if os.path.exists(sys.argv[1]):
+        break
+    time.sleep(.2)
+conn = ConnectionCfg(id='notes', service='notes', account='person_a', owner='person_a', transport='stdio',
+                     command=[sys.executable, '-m', 'agent_gateway.demo_connector'], env={'DEMO_ACCOUNT': 'person_a'},
+                     secret_env={'DEMO_API_KEY': 'notes_key'}, socket=sys.argv[1], tools=[])
+async def main():
+    async with open_client(conn, {'notes_key': 'fake-sidecar-secret'}) as client:
+        print((await client.call_tool('debug_dump', {})).content[0].text)
+anyio.run(main)
+"""
+        dump = docker("run", "--rm", "--network", "none", *hardened, *mount, "--entrypoint", "python", image,
+                      "-c", probe, f"{sockets}/control.sock")
+        # It ran in the sidecar, with the sidecar's minimal environment and this connection's credential.
+        assert "HOME=/sidecar-home" in dump and "DEMO_API_KEY=fake-sidecar-secret" in dump
+        assert "SIDECAR_PRIVATE" not in dump
+        # Closing the connection stopped the connector; only the sidecar is left.
+        with anyio.fail_after(10):
+            while "demo_connector" in docker("top", name):
+                await anyio.sleep(0.2)
+    finally:
+        docker("rm", "-f", name, check=False)
+        docker("volume", "rm", name, check=False)
