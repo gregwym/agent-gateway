@@ -32,6 +32,18 @@ from mcp.shared.message import SessionMessage
 
 logger = logging.getLogger("agent_gateway")
 
+
+class _NoRawInput(logging.Filter):
+    def filter(self, record):
+        # The SDK logs a connector's unparsable stdout line with the parse error, and
+        # that line can hold credentials. Keep the message, drop the traceback.
+        record.exc_info = record.exc_text = record.stack_info = None
+        return True
+
+
+# Also applies in the gateway, which imports this module for local stdio connectors.
+logging.getLogger("mcp.client.stdio").addFilter(_NoRawInput())
+
 _MAX_LINE = 32 * 1024 * 1024
 _LAUNCH_TIMEOUT = 10
 _ENDED = (anyio.EndOfStream, anyio.IncompleteRead, anyio.DelimiterNotFound,

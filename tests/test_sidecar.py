@@ -14,7 +14,7 @@ from helpers import TOKEN_A, agent, base_config, prepare, running_gateway, text_
 from test_admin import change, rpc, setup, state, web_gateway
 
 from agent_gateway.config import ConnectionCfg
-from agent_gateway.plugins import IMAGE_PLUGINS_ENV, connector_plugins
+from agent_gateway.plugins import IMAGE_PLUGINS_ENV, MANIFEST_ENV, Plugin, connector_plugins
 from agent_gateway.upstream import open_client
 
 pytestmark = pytest.mark.anyio
@@ -28,9 +28,10 @@ def socket_dir():
 
 
 @contextmanager
-def running_sidecar(path, **env):
+def running_sidecar(path, log=None, **env):
     path.unlink(missing_ok=True)
-    process = subprocess.Popen([sys.executable, "-m", "agent_gateway.sidecar", str(path)], env={**os.environ, **env})
+    process = subprocess.Popen([sys.executable, "-m", "agent_gateway.sidecar", str(path)],
+                               env={**os.environ, **env}, stderr=log)
     try:
         deadline = time.monotonic() + 15
         while not path.exists():
@@ -108,6 +109,31 @@ async def test_sidecar_connector_gets_only_its_connection_environment(socket_dir
     assert "DEMO_API_KEY=sidecar-test-key" in dump and "DEMO_ACCOUNT=person_a" in dump
     # The minimal environment of a stdio connector, taken from the sidecar and nothing more.
     assert "HOME=/sidecar-home" in dump and "SIDECAR_PRIVATE" not in dump
+
+
+async def test_sidecar_log_leaves_out_a_connector_line_it_cannot_parse(tmp_path, socket_dir):
+    socket = socket_dir / "control.sock"
+    secret = "sidecar-log-credential"
+    # The connector prints its credential on stdout before speaking MCP.
+    noisy = ("import os, sys; print('not json', os.environ['DEMO_API_KEY'], flush=True); "
+             "os.execv(sys.executable, [sys.executable, '-m', 'agent_gateway.demo_connector'])")
+    conn = ConnectionCfg(id="notes", service="notes", account="person_a", owner="person_a", transport="stdio",
+                         command=[sys.executable, "-c", noisy], secret_env={"DEMO_API_KEY": "notes_key"},
+                         socket=str(socket), tools=[])
+    log_path = tmp_path / "sidecar.log"
+    with log_path.open("w") as log, running_sidecar(socket, log):
+        async with open_client(conn, {"notes_key": secret}) as client:
+            assert "account=" in text_of(await client.call_tool("whoami", {}))
+    log = log_path.read_text()
+    assert "Failed to parse JSONRPC message" in log and secret not in log
+
+
+def test_cli_manifest_without_a_socket_reads_in_a_release_without_sidecars():
+    plugin = Plugin(id="fixture", label="Fixture", kind="cli", command=[sys.executable, "-c", "print(1)"],
+                    tools={"get_value": {"description": "Read a fixture", "access": "read"}})
+    _, env = plugin.connection()
+    # The connection keeps this manifest; 0.20.0 rejects any field it does not know.
+    assert "socket" not in json.loads(env[MANIFEST_ENV])
 
 
 async def test_gateway_reconnects_after_the_sidecar_restarts(tmp_path, socket_dir):

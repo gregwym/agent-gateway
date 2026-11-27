@@ -70,7 +70,9 @@ class Plugin(ManifestModel):
     env: dict[str, str] = Field(default_factory=dict, max_length=24)
     credentials: dict[str, str] = Field(default_factory=dict, max_length=12)
     tools: dict[str, Action] = Field(default_factory=dict, max_length=40)
-    socket: str | None = None  # a sidecar's Unix socket; see sidecar.py
+    # A sidecar's Unix socket; see sidecar.py. Left out when unset: a CLI connection saves
+    # this manifest in its environment, and a release without sidecars must still read it.
+    socket: str | None = Field(None, exclude_if=lambda value: value is None)
 
     web: dict | None = None
 
