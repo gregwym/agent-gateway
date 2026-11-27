@@ -645,8 +645,9 @@ networks:
 1. 启动 sidecar：`docker compose --profile amazon-orders up -d --no-build`。网关多挂了一个套接字卷，会重建一次。
 2. 在自己的电脑上导出会话：`python -m examples.export_web_session amazon-us ./amazon-session.json`（做法见「网站会话」）。
 3. 「连接器 → 添加连接器 → 本地连接器」选「Amazon Orders」，把文件的全部内容粘进凭据框，然后删除这个文件。
-4. 审阅工具时只选要用的读取工具，例如 `get_orders`、`get_order`、`get_tracking`、`check_session`。
-   不选 `sign_in`（要开浏览器登录，sidecar 里没有装浏览器）和 `update_config`（改连接器的配置）。再到「权限」里给 Agent 只读。
+4. 在「审阅工具」中只勾选 `get_orders`、`get_order`、`get_tracking` 和 `check_session`。
+   网关默认把 `check_session` 标为「写入」。将它的「操作类型」改成「读取」，确认四项都是「读取」后应用。
+   在「权限」中给 Agent 设为「只读」。
 
 会话失效后，工具返回「There's no saved Amazon session.」或登录失败：重新导出，在「编辑设置」里换上新文件的内容。
 sidecar 在 `amazon-orders-state` 卷里给每个连接单独存一份 `cookies.json`（0600），包括 Amazon 中途更新的 Cookie。
