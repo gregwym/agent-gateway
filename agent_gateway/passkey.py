@@ -109,9 +109,10 @@ def _now() -> int:
 
 
 class PasskeyApprover(RequestStore):
-    def __init__(self, cfg: ApprovalsCfg, audit: Audit, retention_days: int = 90) -> None:
+    def __init__(self, cfg: ApprovalsCfg, audit: Audit, retention_days: int = 90, *, protected_key_file=None) -> None:
         self.cfg = cfg
-        super().__init__(cfg.store, audit, retention_days, cfg.request_ttl_seconds, extra_schema=_SCHEMA)
+        super().__init__(cfg.store, audit, retention_days, cfg.request_ttl_seconds, extra_schema=_SCHEMA,
+                         protected_key_file=protected_key_file)
         self._server = Fido2Server(
             {"id": cfg.rp_id, "name": "Agent Gateway"}, verify_origin=lambda origin: origin == cfg.origin
         )
@@ -267,7 +268,7 @@ class PasskeyApprover(RequestStore):
         shown = {key: row[key] for key in row.keys() if key not in private}
         shown["approvers"] = json.loads(row["approvers"])
         is_open = shown["status"] in _OPEN
-        shown["arguments"] = json.loads(row["arguments"]) if is_open and row["arguments"] is not None else None
+        shown["arguments"] = json.loads(self._decode_arguments(row)) if is_open and row["arguments"] is not None else None
         shown["preview"] = json.loads(row["preview"]) if is_open and row["preview"] is not None else None
         people = {row["principal"], row["owner"], *shown["approvers"]}
         if row["decided_by"]:

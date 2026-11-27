@@ -22,6 +22,8 @@ ISSUER = 'https://auth.example.test'
 class Remote:
     def __init__(self, monkeypatch, mode='oauth', url=URL):
         self.url = url
+        origin = urlsplit(url)
+        self.metadata_url = f'{origin.scheme}://{origin.netloc}/.well-known/oauth-protected-resource{origin.path}'
         self.mode = mode
         self.requests = []
         self.calls = []
@@ -42,8 +44,8 @@ class Remote:
     def handle(self, request):
         self.requests.append(request)
         url = str(request.url)
-        if url.startswith('https://mcp.example.test/.well-known/oauth-protected-resource'):
-            return httpx2.Response(200, json={'resource': URL, 'authorization_servers': [self.issuer], 'scopes_supported': self.grant_scope.split()})
+        if url == self.metadata_url:
+            return httpx2.Response(200, json={'resource': self.url, 'authorization_servers': [self.issuer], 'scopes_supported': self.grant_scope.split()})
         if '/.well-known/' in url:
             data = {'issuer': self.issuer, 'authorization_endpoint': self.issuer + '/authorize', 'token_endpoint': self.issuer + '/token',
                     'response_types_supported': ['code'], 'code_challenge_methods_supported': self.pkce,
@@ -59,7 +61,7 @@ class Remote:
             return httpx2.Response(201, json={**data, 'client_id': 'test-client', 'client_secret': 'private-client-secret', 'token_endpoint_auth_method':'client_secret_post'})
         if url.endswith('/token'):
             form = parse_qs(request.content.decode())
-            assert form['resource'] == [URL]
+            assert form['resource'] == [self.url]
             if self.fail_token:
                 return httpx2.Response(400, json={'error': self.fail_token, 'error_description':'private-provider-detail'})
             if form['grant_type'] == ['authorization_code']:
@@ -78,7 +80,7 @@ class Remote:
         authenticated = self.mode == 'none' or request.headers.get('Authorization') == 'Bearer ' + self.access or (
             self.mode == 'header' and request.headers.get('X-API-Key') == self.access)
         if not authenticated:
-            return httpx2.Response(401, headers={'WWW-Authenticate': 'Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp"'}, json={'error':'unauthorized'})
+            return httpx2.Response(401, headers={'WWW-Authenticate': f'Bearer resource_metadata="{self.metadata_url}"'}, json={'error':'unauthorized'})
         if self.denied:
             return httpx2.Response(403, headers={'WWW-Authenticate':'Bearer error="insufficient_scope"'} if self.denied == 'scope' else {})
         if request.method == 'GET':

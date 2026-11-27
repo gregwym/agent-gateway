@@ -10,7 +10,7 @@ from mcp_types import Tool, ToolAnnotations
 from ._base import result, string, text
 from ..config import NAME
 from ..credentials import EncryptedFileStore
-from ..oauth import https_url
+from ..oauth import https_url, requested_scope
 from ..passkey import Refused
 
 READ, PROPOSE = "read", "provision"
@@ -65,7 +65,9 @@ class Provisioning:
         for conn in self.controller.runtime.gateway.cfg.connections:
             if args["kind"] == "http_mcp" and conn.id == args["id"]:
                 settings = self.controller.connection_settings(conn)
-                return "applied" if all(settings.get(key, "") == args.get(key, "")
+                scope = requested_scope(args["url"], args.get("scope")) if args["auth"] == "oauth" else None
+                expected = args | {"scope": scope or ""}
+                return "applied" if all(settings.get(key, "") == expected.get(key, "")
                                         for key in ("url", "auth", "service", "scope", "oauth_client")) else "conflict"
         gateway = self.controller.runtime.gateway
         client = next((c for c in gateway.cfg.clients if c.id == row["client"] and c.token_sha256 == row["token"]), None)

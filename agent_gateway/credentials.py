@@ -38,7 +38,7 @@ class SecretStore(Protocol):
 class EncryptedFileStore:
     def __init__(self, path: Path, key_file: Path) -> None:
         self._path = Path(path)
-        self._fernet = Fernet(_read_key(Path(key_file)))
+        self._fernet = key_cipher(Path(key_file))
 
     @staticmethod
     def create_key(key_file: Path) -> None:
@@ -94,7 +94,7 @@ class EncryptedFileStore:
         return sorted(self._load())
 
 
-def _read_key(key_file: Path) -> bytes:
+def key_cipher(key_file: Path) -> Fernet:
     try:
         mode = key_file.stat().st_mode
         key = key_file.read_bytes().strip()
@@ -103,10 +103,9 @@ def _read_key(key_file: Path) -> bytes:
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise SecretStoreError("the key file is readable by group or others; chmod 600 it")
     try:
-        Fernet(key)
+        return Fernet(key)
     except ValueError:
         raise SecretStoreError("the key file does not contain a valid key") from None
-    return key
 
 
 class Scrubber:

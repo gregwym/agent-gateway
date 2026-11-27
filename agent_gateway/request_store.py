@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .approval import ApprovalRequest, canonical
+from .credentials import key_cipher
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS request_keys (
 """
 _OPEN = ("pending", "approved")
 _MAX_PENDING_PER_CLIENT = 5
+_SEALED = "fernet:"
 
 
 def key_digest(key: str) -> str:
@@ -59,8 +61,9 @@ class IdempotencyConflict(Exception):
 
 
 class RequestStore:
-    def __init__(self, path, audit, retention_days, request_ttl_seconds=600, *, extra_schema=""):
+    def __init__(self, path, audit, retention_days, request_ttl_seconds=600, *, extra_schema="", protected_key_file=None):
         self.path = path
+        self._cipher = key_cipher(protected_key_file) if protected_key_file else None
         self.audit = audit
         self._retention = retention_days * 86_400
         self.request_ttl_seconds = request_ttl_seconds
@@ -139,14 +142,27 @@ class RequestStore:
             self._insert_request(db, request_id, request, now, now + self.request_ttl_seconds, status="queued", key=key)
         return request_id
 
-    @staticmethod
-    def _insert_request(db, request_id, request, now, expires, *, status="pending", key=None):
+    def _decode_arguments(self, row):
+        raw = row["arguments"]
+        if not raw.startswith(_SEALED):
+            return raw
+        sealed = raw.removeprefix(_SEALED).encode("ascii")
+        request_id, arguments = self._cipher.decrypt(sealed).decode("utf-8").split("\n", 1)
+        if request_id != row["id"]:
+            raise ValueError("protected arguments belong to a different request")
+        return arguments
+
+    def _insert_request(self, db, request_id, request, now, expires, *, status="pending", key=None):
+        arguments = canonical(request.arguments)
+        if request.protect_arguments:
+            sealed = self._cipher.encrypt(request_id.encode("ascii") + b"\n" + arguments)
+            arguments = _SEALED.encode("ascii") + sealed
         db.execute(
             "INSERT INTO requests (id, binding, status, client, principal, tool, connection, service, account, owner,"
             " upstream_tool, approvers, arguments, preview, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, request.binding, status, request.client_id, request.principal, request.tool,
              request.connection, request.service, request.account, request.owner, request.upstream_tool,
-             json.dumps(sorted(request.approvers)), canonical(request.arguments).decode("utf-8"),
+             json.dumps(sorted(request.approvers)), arguments.decode("utf-8"),
              None if request.preview is None else json.dumps(request.preview, ensure_ascii=False), now, expires),
         )
         db.execute("INSERT INTO dispatch VALUES (?,?,?)",
@@ -181,6 +197,8 @@ class RequestStore:
                 db.execute("UPDATE requests SET status='cancelled', outcome='approver_key_revoked', arguments=NULL, preview=NULL WHERE id=?", (request_id,))
                 return None
             db.execute("UPDATE requests SET status='used', used=?, arguments=NULL, preview=NULL WHERE id=?", (now, request_id))
+            if row["arguments"] is not None:
+                return dict(row) | {"arguments": self._decode_arguments(row)}
             return dict(row)
 
     @staticmethod

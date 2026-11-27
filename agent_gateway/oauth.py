@@ -84,6 +84,12 @@ def _origin(url):
     return parsed.hostname, parsed.port or 443
 
 
+def requested_scope(url, scope):
+    # Linear's read-only endpoint advertises "read write" in the challenge
+    # even though its protected resource metadata lists only "read".
+    return scope or ("read" if url == "https://mcp.linear.app/mcp/readonly" else None)
+
+
 class OAuthVault:
     def __init__(self, cfg, clients=None):
         self.clients = clients or dict
@@ -126,11 +132,7 @@ class OAuthVault:
         named_client = self.clients().get(identifier) if identifier else None
         if identifier and not named_client:
             raise Refused("oauth_client_unavailable", 409)
-        scope = settings.get("scope") or None
-        # Linear's read-only endpoint advertises "read write" in the challenge
-        # even though its protected resource metadata lists only "read".
-        if scope is None and url == "https://mcp.linear.app/mcp/readonly":
-            scope = "read"
+        scope = requested_scope(url, settings.get("scope"))
         ref = secrets.token_hex(32)
         metadata = OAuthClientMetadata(redirect_uris=[redirect], client_name="Agent Gateway", application_type="web",
                                       token_endpoint_auth_method=settings.get("auth_method") or "none",

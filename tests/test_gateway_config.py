@@ -1,12 +1,15 @@
 """Use the normal management and MCP routes to provision disposable resources."""
 import json
+import sqlite3
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from helpers import TOKEN_A, TOKEN_HOUSE, prepare
-from passkey_helpers import approval_config
+from passkey_helpers import Page, approval_config, request_id_in
 from service_helpers import free_port
+
+from agent_gateway.request_store import RequestStore
 from test_admin import change, rpc, setup, state, web_gateway
 from test_admin_remote import ISSUER, Remote, URL, apply, consent_complete
 
@@ -131,3 +134,62 @@ async def test_config_permission_and_two_stage_provision(tmp_path, monkeypatch):
         configured = next(row for row in (await state(http))["connections"] if row["id"] == "authorized")
         assert configured["settings"]["oauth_client"] == "shared-oauth"
         assert configured["access"]["shared-agent"] == "none"
+
+
+        linear = "https://mcp.linear.app/mcp/readonly"
+        dynamic = Remote(monkeypatch, url=linear)
+        dynamic.grant_scope = "read"
+        request = {"kind": "http_mcp", "id": "dynamic-mcp", "auth": "oauth", "url": linear}
+        submitted = await invoke(TOKEN_HOUSE, propose, "dynamic-applied", request)
+        dynamic_id = json.loads(submitted["result"]["content"][0]["text"])["id"]
+        assert dynamic.requests == []
+        started = await change(http, "oauth/mcp/start", **{**form, "id": request["id"], "proposal": dynamic_id,
+                               "settings": {"url": linear, "auth": "oauth", "service": "remote-mcp"}})
+        assert started.status_code == 200, started.text
+        dynamic.query = parse_qs(urlsplit(started.json()["url"]).query)
+        assert dynamic.query["scope"] == ["read"]
+        assert any(call.url.path == "/register" for call in dynamic.requests)
+        assert (await apply(http, await consent_complete(http, dynamic))).status_code == 200
+        result = await invoke(TOKEN_HOUSE, read, "read-dynamic", {})
+        proposals = json.loads(result["result"]["content"][0]["text"])["proposals"]
+        assert next(row for row in proposals if row["id"] == dynamic_id)["status"] == "applied"
+
+
+@pytest.mark.parametrize("needs_approval", [True, False])
+async def test_provisioning_queue_protects_arguments(tmp_path, monkeypatch, needs_approval):
+    # Hold the dispatcher at the queue boundary so both paths leave a durable request to inspect.
+    dispatch_queue = RequestStore.dispatch_queue
+    paused = True
+    monkeypatch.setattr(RequestStore, "dispatch_queue", lambda store, limit: [] if paused else dispatch_queue(store, limit))
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        key, _ = await setup(http, origin, path)
+        assert (await change(http, "connections/save", kind="gateway_config", id="config", owner="person_a")).status_code == 200
+        access = "read_write_approval" if needs_approval else "read_write_direct"
+        assert (await change(http, "permissions/connection", client="agent-a", connection="config",
+                             access=access, approver="person_a")).status_code == 200
+        endpoint = "https://synthetic-private.example.test/mcp"
+        args = {"kind": "http_mcp", "id": "new-remote", "url": endpoint, "auth": "none"}
+        wrapped = {"connection": "config", "tool": "gateway_config_provision", "arguments": args,
+                   "idempotency_key": "protected", "background": True}
+        response = (await rpc(origin, TOKEN_A, "tools/call", {"name": "gateway_call_tool", "arguments": wrapped})).json()
+        result = response["result"]["structuredContent"]
+        assert result["status"] == ("pending" if needs_approval else "queued")
+        store = gw.app.state.runtime.gateway.approver
+        with sqlite3.connect(store.path) as db:
+            saved, = db.execute("SELECT arguments FROM requests").fetchone()
+        assert endpoint not in saved
+        assert endpoint.encode() not in store.path.read_bytes()
+
+        if needs_approval:
+            page = Page(origin, origin)
+            request_id = request_id_in(result["approval_url"])
+            status, details = await page.view(request_id)
+            assert status == 200 and details["arguments"] == args
+            status, details = await page.decide("approve", request_id, key, origin=origin)
+            assert status == 200, details
+        paused = False
+        watched = (await rpc(origin, TOKEN_A, "tools/call", {"name": "gateway_call_tool",
+                             "arguments": {"idempotency_key": "protected", "wait_seconds": 10}})).json()
+        assert watched["result"]["structuredContent"]["status"] == "succeeded"
+        rows = gw.app.state.admin.provisioning.rows()
+        assert len(rows) == 1 and rows[0]["config"]["url"] == endpoint
