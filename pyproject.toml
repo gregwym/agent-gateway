@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-gateway"
-version = "0.22.0"
+version = "0.23.0"
 description = "A small self-hosted MCP gateway for a household: per-person identity, tool allowlists, credential isolation, audit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,10 +40,13 @@ dev = [
     "Radicale>=3.5,<4",
 ]
 
-browser-tests = ["playwright>=1.51,<2"]
+# Run the local Chrome session exporter.
+session-export = ["playwright>=1.51,<2"]
+browser-tests = ["agent-gateway[session-export]"]
 
 [project.scripts]
 agw = "agent_gateway.cli:main"
+agw-export-session = "agent_gateway.export_web_session:main"
 
 [tool.setuptools]
 packages = ["agent_gateway", "agent_gateway.connectors"]
