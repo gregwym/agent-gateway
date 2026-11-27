@@ -5,7 +5,7 @@ from .config import ConnectionCfg, NAME, ToolCfg, allocate_tool_name
 from .oauth import https_url
 from .passkey import Refused
 
-FIELDS = ["url", "service", "auth", "header", "issuer", "client_id", "auth_method", "scope", "client_metadata_url"]
+FIELDS = ["url", "service", "auth", "header", "issuer", "client_id", "auth_method", "scope", "client_metadata_url", "oauth_client"]
 SPEC = {"label": "Remote MCP / 远程 MCP", "fields": FIELDS, "secrets": ["token", "client_secret"], "tools": [], "probe": (None, {})}
 
 
@@ -15,6 +15,8 @@ def make_remote(name, owner, account, settings, provided, previous, values, cred
     auth = settings.get("auth", "none")
     if not re.fullmatch(NAME, service) or auth not in ("none", "bearer", "header", "oauth"):
         raise Refused("invalid_remote_settings", 400)
+    if settings.get("oauth_client") and auth != "oauth":
+        raise Refused("oauth_client_settings_invalid", 400)
     if previous and previous.service != service:
         raise Refused("connector_identity_is_fixed", 409)
     raw = {"id": name, "owner": owner, "service": service, "account": account,

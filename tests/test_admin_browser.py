@@ -74,8 +74,21 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await playwright.expect(page.get_by_role('row').filter(has_text='browser-agent')).to_have_count(0)
                 assert (await rpc(origin, token)).status_code == 401
 
+                await page.get_by_role('link', name=t('Settings', '设置'), exact=True).click()
+                await page.get_by_role('button', name=t('Add OAuth client', '添加 OAuth 客户端'), exact=True).click()
+                client_form = page.get_by_role('dialog', name=t('Add remote MCP OAuth client', '添加远程 MCP OAuth 客户端'))
+                await client_form.get_by_label(t('Connector name', '连接器名称')).fill('system-mcp')
+                await client_form.get_by_label('Issuer').fill('https://auth.example.test')
+                await client_form.get_by_label('OAuth client ID').fill('browser-test-id')
+                await client_form.get_by_label(t('OAuth client secret', 'OAuth 客户端密钥')).fill('synthetic-browser-secret')
+                await client_form.get_by_role('button', name=t('Save OAuth client', '保存 OAuth 客户端')).click()
+                await playwright.expect(page.get_by_text('system-mcp · https://auth.example.test')).to_be_visible()
+                assert 'synthetic-browser-secret' not in await page.locator('body').inner_text()
+
                 await page.get_by_role('link', name=t('Connectors','连接器'), exact=True).click()
                 await page.get_by_role('button', name=t('Add connector','添加连接器'), exact=True).click()
+                await page.get_by_label(t('System OAuth client', '系统 OAuth 客户端')).select_option('system-mcp')
+                await playwright.expect(page.get_by_text(t('Advanced OAuth settings', 'OAuth 高级设置'))).not_to_be_visible()
                 service = page.get_by_label(t('Service', '服务'), exact=True)
                 await playwright.expect(service).to_have_value('remote')
                 assert await service.locator('option').last.get_attribute('value') == 'demo'

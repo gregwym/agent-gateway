@@ -131,8 +131,8 @@ async def remote_preview(http, mode='none', name='remote-notes'):
                         credentials={'token':'private-bearer-token'} if mode in ('bearer','header') else {})
 
 
-async def consent_start(http, remote, **settings):
-    reply = await change(http, 'oauth/mcp/start', kind='remote', id='remote-notes', owner='person_a',
+async def consent_start(http, remote, *, name='remote-notes', **settings):
+    reply = await change(http, 'oauth/mcp/start', kind='remote', id=name, owner='person_a',
                          settings={'url':URL, 'auth':'oauth', **settings}, credentials={})
     assert reply.status_code == 200, reply.text
     remote.query = parse_qs(urlsplit(reply.json()['url']).query)
@@ -541,3 +541,50 @@ async def test_remote_http_failures_keep_the_original_cause(tmp_path,monkeypatch
 def test_suggested_remote_access(name, definition, expected):
     from agent_gateway.admin_remote import suggested_access
     assert suggested_access(name, definition) == expected
+
+
+async def test_remote_connections_share_system_client_and_keep_independent_grants(tmp_path, monkeypatch):
+    remote = Remote(monkeypatch)
+    remote.no_registration = True
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        client = {'id': 'system-notes', 'issuer': ISSUER, 'client_id': 'system-client-id',
+                  'client_secret': 'synthetic-system-secret', 'auth_method': 'client_secret_post'}
+        response = await change(http, 'oauth-clients/save', **client)
+        assert response.status_code == 200, response.text
+        assert (await state(http))['oauth_clients'] == [
+            {'id': 'system-notes', 'issuer': ISSUER, 'auth_method': 'client_secret_post'}
+        ]
+        assert client['client_secret'] not in (await http.get('/admin/api/state')).text
+        assert (await change(http, 'oauth-clients/save', **client)).status_code == 200
+        assert (await change(http, 'oauth-clients/save', **{**client, 'issuer': 'https://another.example.test'})).status_code == 409
+        assert b'synthetic-system-secret' not in (tmp_path / 'admin.enc').read_bytes()
+        for name, scope in [('remote-notes', 'notes.read'), ('remote-other', 'notes.write')]:
+            remote.grant_scope = scope
+            assert (await consent_start(http, remote, name=name, oauth_client='system-notes', scope=scope))['client_id'] == ['system-client-id']
+            assert (await apply(http, await consent_complete(http, remote))).status_code == 200
+        assert not any(request.url.path == '/register' for request in remote.requests)
+        forms = [parse_qs(request.content.decode()) for request in remote.requests if request.url.path == '/token']
+        assert [form['client_secret'] for form in forms] == [['synthetic-system-secret']] * 2
+        controller = gw.app.state.admin
+        records = list(OAuthVault(controller.store.base).records.values())
+        assert len(records) == 2
+        assert all(grant['system_client'] == 'system-notes' and 'client' not in grant for grant in records)
+        assert {grant['tokens']['scope'] for grant in records} == {'notes.read', 'notes.write'}
+        assert len({grant['tokens']['refresh_token'] for grant in records}) == 2
+        assert all(row['settings']['oauth_client'] == 'system-notes'
+                   for row in (await state(http))['connections'] if row['id'].startswith('remote-'))
+
+
+async def test_system_oauth_client_cannot_follow_a_different_issuer(tmp_path, monkeypatch):
+    remote = Remote(monkeypatch)
+    async with web_gateway(tmp_path) as (_, http, origin, path):
+        await setup(http, origin, path)
+        assert (await change(http, 'oauth-clients/save', id='saved', issuer='https://wrong.example.test',
+                             client_id='saved-id', client_secret='secret-for-wrong-issuer')).status_code == 200
+        response = await change(http, 'oauth/mcp/start', kind='remote', id='remote-notes', owner='person_a',
+                                settings={'url': URL, 'auth': 'oauth', 'oauth_client': 'saved'}, credentials={})
+        assert response.status_code == 422, response.text
+        assert response.json()['error'] == 'oauth_issuer_changed'
+        assert not any(request.url.path in ('/register', '/token') for request in remote.requests)
+        assert all(b'secret-for-wrong-issuer' not in request.content for request in remote.requests)

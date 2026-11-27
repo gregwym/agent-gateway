@@ -56,7 +56,7 @@ def needs_admin_confirmation(operation, body):
     return operation in {
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
-        "settings/gmail-oauth", "web-login/start", "web-login/terminate",
+        "settings/gmail-oauth", "oauth-clients/save", "web-login/start", "web-login/terminate",
         "web-catalog/publisher", "web-catalog/origins",
     }
 
@@ -72,7 +72,7 @@ class AdminController:
         self.tests = {}
         from .oauth import OAuthVault
         from .admin_mcp_oauth import MCPConsent
-        self.oauth = OAuthVault(self.store.base)
+        self.oauth = OAuthVault(self.store.base, lambda: self.store.state.get("oauth_clients", {}))
         from .web_sessions import WebSessions
         self.web_sessions = WebSessions(self.store.base)
         self.website_login = WebsiteLogin(self)
@@ -230,6 +230,7 @@ class AdminController:
                                                for conn in gw.cfg.connections for t in conn.tools)} for c in gw.cfg.clients],
                 "connections": connections, "passkeys": keys,
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
+                "oauth_clients": self.oauth.list_clients(),
                 "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
                 "plugins": [plugin.public() for plugin in plugins.values()],
@@ -367,10 +368,15 @@ class AdminController:
         settings = settings_of(conn)
         if conn.oauth_ref:
             record = self.oauth.records.get(conn.oauth_ref, {})
-            client = record.get("client") or {}
-            settings.update(issuer=record.get("issuer") or "", scope=record.get("requested_scope") or "",
-                            client_id="" if record.get("client_metadata_url") else client.get("client_id", ""), auth_method=client.get("token_endpoint_auth_method") or "none",
-                            client_metadata_url=record.get("client_metadata_url") or "")
+            settings["scope"] = record.get("requested_scope") or ""
+            if identifier := record.get("system_client"):
+                settings["oauth_client"] = identifier
+            else:
+                client = record.get("client") or {}
+                settings.update(issuer=record.get("issuer") or "",
+                                client_id="" if record.get("client_metadata_url") else client.get("client_id", ""),
+                                auth_method=client.get("token_endpoint_auth_method") or "none",
+                                client_metadata_url=record.get("client_metadata_url") or "")
         return settings
 
     async def operate(self, operation, body, session, *, gmail_email=None):
@@ -583,6 +589,21 @@ class AdminController:
             state.setdefault("languages", {})[self.auth.owner] = body["language"]
             self.store.save(state)
             return {"language": body["language"]}
+        if operation == "oauth-clients/save":
+            from .oauth import system_client_details
+            identifier, details = system_client_details(body)
+            state = self.store.candidate()
+            clients = state.setdefault("oauth_clients", {})
+            if identifier in clients:
+                if clients[identifier] == details:
+                    return {"revision": state["revision"], "id": identifier}
+                raise Refused("oauth_client_exists", 409)
+            if len(clients) >= 50:
+                raise Refused("oauth_client_limit", 409)
+            clients[identifier] = details
+            result = await self._commit(state, operation)
+            self.oauth.remember({"client": details})
+            return {**result, "id": identifier}
         if operation == "settings/gmail-oauth":
             from .admin_oauth import saved_gmail_client
             state = self.store.candidate()
@@ -764,9 +785,9 @@ class AdminController:
                     raise Refused("oauth_reauthorization_required", 400)
                 if operation == "connections/save":
                     saved = self.connection_settings(conn)
-                    fields = ("issuer", "client_id", "auth_method", "scope", "client_metadata_url")
+                    fields = ("issuer", "client_id", "auth_method", "scope", "client_metadata_url", "oauth_client")
                     if body.get("credentials", {}).get("client_secret") or any(
-                            key in body["settings"] and body["settings"][key] != saved[key] for key in fields):
+                            key in body["settings"] and body["settings"][key] != saved.get(key, "") for key in fields):
                         raise Refused("oauth_reauthorization_required", 400)
             if operation == "connections/save":
                 previous = next((c for c in cfg.connections if c.id == conn.id), None)

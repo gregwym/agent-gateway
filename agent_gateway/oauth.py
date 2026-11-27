@@ -6,6 +6,7 @@ connection. Each grant has one refresh lock shared by every HTTP client.
 import copy
 import json
 import logging
+import re
 import secrets
 import time
 from urllib.parse import urlsplit
@@ -13,10 +14,11 @@ from urllib.parse import urlsplit
 import anyio
 import httpx2
 from mcp.client.auth.oauth2 import OAuthClientProvider
-from mcp.client.auth.utils import create_client_registration_request, extract_field_from_www_auth
+from mcp.client.auth.utils import create_client_registration_request, extract_field_from_www_auth, issuers_match
 from mcp.client.auth.exceptions import OAuthFlowError, OAuthRegistrationError, OAuthTokenError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 
+from .config import NAME
 from .credentials import EncryptedFileStore
 from .passkey import Refused
 
@@ -58,8 +60,33 @@ def oauth_error(exc):
     return connector_failure(exc, "http")
 
 
+_CLIENT_METHODS = {"none", "client_secret_post", "client_secret_basic"}
+
+
+def system_client_details(body):
+    if set(body) - {"revision", "id", "issuer", "client_id", "client_secret", "auth_method"}:
+        raise Refused("oauth_client_settings_invalid", 400)
+    identifier, client_id = body.get("id"), body.get("client_id")
+    secret = body.get("client_secret", "")
+    method = body.get("auth_method") or ("client_secret_post" if secret else "none")
+    if (not isinstance(identifier, str) or not re.fullmatch(NAME, identifier)
+            or not isinstance(client_id, str) or not 1 <= len(client_id) <= 4096
+            or not isinstance(secret, str) or len(secret) > 4096
+            or any(ord(char) < 33 or ord(char) == 127 for char in client_id + secret)
+            or not isinstance(method, str) or method not in _CLIENT_METHODS or (method == "none") == bool(secret)):
+        raise Refused("oauth_client_settings_invalid", 400)
+    return identifier, {"issuer": https_url(body.get("issuer")), "client_id": client_id,
+                        "client_secret": secret, "auth_method": method}
+
+
+def _origin(url):
+    parsed = urlsplit(url)
+    return parsed.hostname, parsed.port or 443
+
+
 class OAuthVault:
-    def __init__(self, cfg):
+    def __init__(self, cfg, clients=None):
+        self.clients = clients or dict
         self.file = EncryptedFileStore(cfg.admin.state.with_name(cfg.admin.state.name + ".oauth"), cfg.secrets.key_file)
         self.records = {key: json.loads(self.file.get(key)) for key in self.file.names()}
         self.persisted = set(self.records)
@@ -68,6 +95,22 @@ class OAuthVault:
         self.sensitive = set()
         for record in self.records.values():
             self.remember(record)
+        for client in self.clients().values():
+            self.remember({"client": client})
+
+    def list_clients(self):
+        return [{"id": identifier, "issuer": details["issuer"], "auth_method": details["auth_method"]}
+                for identifier, details in sorted(self.clients().items())]
+
+    def client_info(self, record):
+        if not (identifier := record.get("system_client")):
+            return record.get("client")
+        client = self.clients().get(identifier)
+        if not client or not issuers_match(client["issuer"], record["issuer"]):
+            raise Refused("oauth_client_unavailable", 409)
+        return {"client_id": client["client_id"], "client_secret": client["client_secret"] or None,
+                "issuer": client["issuer"], "redirect_uris": record["metadata"]["redirect_uris"],
+                "token_endpoint_auth_method": client["auth_method"]}
 
     def remember(self, record):
         self.sensitive.update(v for k, v in record.get("tokens", {}).items() if k in ("access_token", "refresh_token") and v)
@@ -76,6 +119,13 @@ class OAuthVault:
             self.sensitive.add(secret)
 
     def create(self, url, redirect, settings, client_secret=""):
+        identifier = settings.get("oauth_client")
+        if identifier and (client_secret or settings.get("issuer") or settings.get("client_id")
+                           or settings.get("client_metadata_url") or settings.get("auth_method") not in (None, "", "none")):
+            raise Refused("oauth_client_settings_invalid", 400)
+        named_client = self.clients().get(identifier) if identifier else None
+        if identifier and not named_client:
+            raise Refused("oauth_client_unavailable", 409)
         scope = settings.get("scope") or None
         # Linear's read-only endpoint advertises "read write" in the challenge
         # even though its protected resource metadata lists only "read".
@@ -89,12 +139,15 @@ class OAuthVault:
                   "created": time.time(), "issuer": settings.get("issuer") or None,
                   "requested_scope": scope,
                   "client_metadata_url": settings.get("client_metadata_url") or None}
+        if named_client:
+            record.update(system_client=identifier, issuer=named_client["issuer"])
+            record["metadata"]["token_endpoint_auth_method"] = named_client["auth_method"]
         if settings.get("client_id"):
             if not record["issuer"]:
                 raise Refused("oauth_issuer_required", 400)
             https_url(record["issuer"])
             method = settings.get("auth_method") or ("client_secret_post" if client_secret else "none")
-            if method not in ("none", "client_secret_post", "client_secret_basic") or (method != "none" and not client_secret) or (method == "none" and client_secret):
+            if method not in _CLIENT_METHODS or (method != "none" and not client_secret) or (method == "none" and client_secret):
                 raise Refused("oauth_client_settings_invalid", 400)
             record["metadata"]["token_endpoint_auth_method"] = method
             record["client"] = OAuthClientInformationFull(client_id=settings["client_id"], client_secret=client_secret or None,
@@ -198,17 +251,23 @@ class GrantStorage:
 
     async def set_tokens(self, tokens):
         record = self.vault.get(self.ref)
+        if record.get("system_client") and record.get("requested_scope") and tokens.scope is not None:
+            if set(tokens.scope.split()) - set(record["requested_scope"].split()):
+                raise Refused("oauth_scope_rejected", 400)
         record["tokens"] = tokens.model_dump(mode="json")
         record["expires"] = time.time() + tokens.expires_in if tokens.expires_in is not None else None
         record.pop("error", None)
         self.vault.save(self.ref)
 
     async def get_client_info(self):
-        data = self.vault.get(self.ref).get("client")
+        data = self.vault.client_info(self.vault.get(self.ref))
         return OAuthClientInformationFull.model_validate(data) if data else None
 
     async def set_client_info(self, info):
-        self.vault.get(self.ref)["client"] = info.model_dump(mode="json")
+        record = self.vault.get(self.ref)
+        if record.get("system_client"):
+            raise Refused("oauth_issuer_changed", 400)
+        record["client"] = info.model_dump(mode="json")
         self.vault.save(self.ref)
 
 
@@ -222,7 +281,12 @@ class ManagedOAuth(OAuthClientProvider):
         self.context.lock = vault.locks.setdefault(ref, anyio.Lock())
 
     def _select_authorization_server(self, advertised):
-        expected = self.vault.get(self.ref).get("issuer")
+        record = self.vault.get(self.ref)
+        expected = record.get("issuer")
+        if record.get("system_client"):
+            if not any(issuers_match(expected, issuer) for issuer in advertised):
+                raise Refused("oauth_issuer_changed", 400)
+            return expected
         if expected and expected not in advertised:
             raise Refused("oauth_issuer_changed", 400)
         return expected or advertised[0]
@@ -232,6 +296,8 @@ class ManagedOAuth(OAuthClientProvider):
         meta = self.context.oauth_metadata
         if not meta:
             raise Refused("oauth_metadata_missing", 400)
+        if record.get("system_client") and (not self.context.protected_resource_metadata or not self.context.client_info):
+            raise Refused("oauth_issuer_changed", 400)
         if "S256" not in (meta.code_challenge_methods_supported or []):
             raise Refused("oauth_pkce_required", 400)
         https_url(str(meta.authorization_endpoint))
@@ -280,12 +346,18 @@ class ManagedOAuth(OAuthClientProvider):
                     https_url(str(outbound.url), query=True)
                     # No credentialed fallback to a different issuer when discovery fails.
                     record = self.vault.get(self.ref)
+                    if record.get("system_client") and outbound is not request and outbound.method == "GET":
+                        allowed = record["issuer"] if self.context.protected_resource_metadata else record["url"]
+                        if _origin(str(outbound.url)) != _origin(allowed):
+                            raise Refused("oauth_issuer_changed", 400)
                     if outbound is not request and outbound.method == "POST":
                         meta = self.context.oauth_metadata
                         if not meta:
                             raise Refused("oauth_metadata_missing", 400)
                         expected = record.get("issuer")
                         if expected and expected != str(meta.issuer):
+                            raise Refused("oauth_issuer_changed", 400)
+                        if record.get("system_client") and not self.context.client_info:
                             raise Refused("oauth_issuer_changed", 400)
                         if not self.context.client_info:
                             if not meta.registration_endpoint:
