@@ -143,6 +143,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 row = card.get_by_role('row').filter(has_text='browser_notes_list')
                 await row.get_by_label(t('Effect','权限效果'), exact=True).select_option('allow')
                 await row.get_by_role('button', name=t('Save access','保存权限'), exact=True).click()
+                await playwright.expect(card.get_by_role('status')).to_have_text(t('Permissions updated.', '权限已更新。'))
                 await playwright.expect(row.get_by_label(t('Effect','权限效果'), exact=True)).to_have_value('allow')
                 await row.get_by_role('button', name=t('Argument limits','参数限制'), exact=True).click()
                 await page.get_by_label(t('Fixed arguments (JSON object)','固定参数（JSON 对象）'), exact=True).fill('{"folder":"family"}')

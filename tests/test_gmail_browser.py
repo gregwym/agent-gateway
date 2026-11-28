@@ -116,6 +116,7 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         await folders.select_option('selected')
         await box.get_by_role('checkbox', name='Orders/Receipts').check()
         await box.get_by_role('button', name=t('Save connection access', '保存连接权限'), exact=True).click()
+        await playwright.expect(box.get_by_role('status')).to_have_text(t('Connection permissions updated.', '连接权限已更新。'))
         await playwright.expect(box.get_by_role('checkbox', name='Orders/Receipts')).to_be_checked()
         await box.get_by_role('button', name=t('Close', '关闭'), exact=True).click()
 
