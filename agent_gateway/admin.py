@@ -344,6 +344,8 @@ class AdminController:
                               "connection": conn.id, "remote": remote, "oauth_ref": conn.oauth_ref, "proposal": proposal,
                               "staged_version": staged_version}
         grants = self.provisioning.require(proposal)["config"].get("grants", []) if proposal else []
+        if proposal:
+            self.provisioning.record_error(proposal, None)
         # Definitions can echo credentials. Scrub prior to displaying them too.
         scrubber = self._gateway(state).scrubber
         return {"draft": draft, "connection": conn.id, "definitions": scrubber.data(list({t.upstream: definitions[t.upstream] for t in conn.tools}.values())),
@@ -864,21 +866,26 @@ class AdminController:
             draft = self.drafts.get(body.get("draft"))
             if not draft or draft["session"] != session["id"] or draft["expires"] <= time.time():
                 raise Refused("draft_expired", 409)
-            if draft["state"]["revision"] != self.store.state["revision"]:
-                raise Refused("configuration_changed", 409)
-            if body.get("reviewed") is not True:
-                raise Refused("review_required", 400)
-            row = self.provisioning.require(draft["proposal"]) if draft["proposal"] else None
-            if draft["staged_version"]:
-                self.provisioning.staged(row, draft["staged_version"])
-            draft = copy.deepcopy(draft)
-            if draft.get("remote"):
-                from .admin_remote import apply_selection
-                apply_selection(draft, body)
-            if row and row["config"].get("prepared"):
-                self.provisioning.apply_grants(row, draft)
-                self.provisioning.mark_applied(row, draft["state"])
-            result = await self._commit(draft["state"], operation)
+            try:
+                if draft["state"]["revision"] != self.store.state["revision"]:
+                    raise Refused("configuration_changed", 409)
+                if body.get("reviewed") is not True:
+                    raise Refused("review_required", 400)
+                row = self.provisioning.require(draft["proposal"]) if draft["proposal"] else None
+                if draft["staged_version"]:
+                    self.provisioning.staged(row, draft["staged_version"])
+                draft = copy.deepcopy(draft)
+                if draft.get("remote"):
+                    from .admin_remote import apply_selection
+                    apply_selection(draft, body)
+                if row and row["config"].get("prepared"):
+                    self.provisioning.apply_grants(row, draft)
+                    self.provisioning.mark_applied(row, draft["state"])
+                result = await self._commit(draft["state"], operation)
+            except Refused as exc:
+                if draft["proposal"]:
+                    self.provisioning.record_error(draft["proposal"], exc.code)
+                raise
             self.drafts.pop(body["draft"], None)
             if draft["staged_version"]:
                 self.provisioning.finish_intake(draft["proposal"])

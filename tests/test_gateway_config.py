@@ -295,7 +295,16 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
         reviewed = await consent_complete(http, upstream)
         draft = reviewed.json()["draft"]
         assert reviewed.json()["proposal_grants"] == args["grants"]
-        assert (await apply(http, reviewed, [{"upstream": "write.note", "access": "write"}])).status_code == 409
+        after_retry = await invoke("gateway_config_read", "successful-retry-readback", {})
+        rows = json.loads(after_retry["result"]["content"][0]["text"])["proposals"]
+        assert "last_error" not in next(row for row in rows if row["id"] == remote["id"])
+        refused = await apply(http, reviewed, [{"upstream": "write.note", "access": "write"}])
+        assert refused.status_code == 409
+        assert refused.json()["error"] == "proposal_tool_grant_changed"
+        after_apply = await invoke("gateway_config_read", "apply-failure-readback", {})
+        rows = json.loads(after_apply["result"]["content"][0]["text"])["proposals"]
+        failure = next(row for row in rows if row["id"] == remote["id"])
+        assert failure["status"] == "pending" and failure["last_error"] == refused.json()["error"]
         assert all(row["id"] != args["id"] for row in (await state(http))["connections"])
         assert (await apply(http, reviewed)).status_code == 200
         assert (await change(http, "connections/apply", draft=draft, reviewed=True, tools=[])).status_code == 409

@@ -214,11 +214,14 @@ class Provisioning:
         } | {row["id"]: row["expires_at"]}
 
     def record_error(self, identifier, reason):
-        rows = self.rows()
-        row = next((row for row in rows if row["id"] == identifier), None)
-        if row and row["config"].get("prepared"):
+        row = next((row for row in self.stored_rows(self.prepared) if row["id"] == identifier), None)
+        if row is None or row.get("last_error") == reason or self.status(row) != "pending":
+            return
+        if reason is None:
+            row.pop("last_error")
+        else:
             row["last_error"] = reason
-            self.save_row(row)
+        self.save_row(row)
 
     def apply_grants(self, row, draft):
         args = row["config"]
