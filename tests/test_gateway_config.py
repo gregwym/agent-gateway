@@ -273,26 +273,28 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
             assert (await runner.get(origin + "/admin/api/state", headers=headers)).status_code == 401
             assert (await rpc(origin, ticket)).status_code == 401
             assert (await runner.put(other["intake_url"], headers=headers, json=credentials)).status_code == 401
+            command = [sys.executable, "-m", "agent_gateway.cli", "stage", origin, oauth["id"]]
+            env = {key: value for key, value in os.environ.items() if key != "AGW_AGENT_TOKEN"}
+            payload = json.dumps(credentials)
             if use_digest:
                 digest_auth = {"Authorization": f"Bearer {digest}"}
                 assert (await runner.put(oauth["intake_url"], headers=digest_auth, json=credentials)).status_code == 401
-                cli = await anyio.run_process(
-                    [sys.executable, "-m", "agent_gateway.cli", "stage", origin, oauth["id"], "--intake-token-stdin"],
-                    env={key: value for key, value in os.environ.items() if key != "AGW_AGENT_TOKEN"},
-                    input=(ticket + "\n" + json.dumps(credentials)).encode(), check=False,
-                )
-                assert cli.returncode == 0, cli.stderr.decode()
-                version = json.loads(cli.stdout)["version"]
-                assert ticket.encode() not in cli.stdout and credentials["client_secret"].encode() not in cli.stdout
-                assert not cli.stderr
+                command.append("--intake-token-stdin")
+                payload = ticket + "\n" + payload
+            else:
+                env["AGW_AGENT_TOKEN"] = TOKEN_HOUSE
+            cli = await anyio.run_process(command, env=env, input=payload.encode(), check=False)
+            assert cli.returncode == 0, cli.stderr.decode()
+            receipt = json.loads(cli.stdout)
+            assert receipt["proposal"] == oauth["id"]
+            version = receipt["version"]
+            assert all(value.encode() not in cli.stdout for value in (ticket, TOKEN_HOUSE, credentials["client_secret"]))
+            assert not cli.stderr
+            if use_digest:
                 duplicate = await propose("duplicate-client", client_args | {"intake_sha256": other_digest})
                 assert duplicate["id"] == oauth["id"] and duplicate["staged_version"] == version
                 new_auth = {"Authorization": f"Bearer {other_ticket}"}
                 assert (await runner.put(oauth["intake_url"], headers=new_auth, json=credentials)).status_code == 401
-            else:
-                staged = await runner.put(oauth["intake_url"], headers=headers, json=credentials)
-                assert staged.status_code == 200, staged.text
-                version = staged.json()["version"]
             assert (await runner.put(oauth["intake_url"], headers=headers, json=credentials)).status_code == 401
             assert (await runner.post(oauth["intake_url"], headers=auth)).status_code == 409
             if not use_digest:
@@ -339,6 +341,9 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
                 expiring_ticket = (await runner.post(expired["intake_url"], headers=auth)).json()["token"]
                 stage_auth = {"Authorization": f"Bearer {expiring_ticket}"}
                 staged = await runner.put(expired["intake_url"], headers=stage_auth, json=credentials)
+                assert staged.status_code == 200
+                replay = await runner.put(expired["intake_url"], headers=stage_auth, json=credentials)
+                assert replay.status_code == 401
                 intake_store = gw.app.state.admin.provisioning.intake
                 record = json.loads(intake_store.get(expired["id"]))
                 intake_store.set(expired["id"], json.dumps(record | {"expires_at": 0}))
