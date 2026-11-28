@@ -17,6 +17,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,14 @@ CHUNK = 200  # identifiers per event, far below webhook body limits (OpenBot: 64
 OUTBOX_LIMIT = 1000  # events kept for a receiver that stays unreachable; the oldest go first
 MARGIN = 60  # a resync also covers this much before the last good check (clock differences)
 STATE = "mail-events.json"
+WEB_STATE = "mail-events-web.json"
+
+
+@dataclass(frozen=True)
+class DeliveryTarget:
+    url: str
+    event_type: str
+    secret: str = field(repr=False)
 
 
 def from_environment(source: Callable[[], Any]) -> MailEvents | None:
@@ -39,22 +49,30 @@ def from_environment(source: Callable[[], Any]) -> MailEvents | None:
     Admin commands that start a connector only to list its tools get no state directory,
     so they never watch.
     """
-    url, directory = os.environ.get("AGW_MAIL_EVENTS_URL"), os.environ.get("AGW_STATE_DIR")
-    if not url or not directory:
+    directory = os.environ.get("AGW_STATE_DIR")
+    if not directory:
         return None
-    return MailEvents(directory, url, setting("AGW_MAIL_EVENTS_TYPE"), setting("AGW_MAIL_EVENTS_SECRET"),
-                      setting("AGW_MAIL_EVENTS_MAILBOX"), source())
+    if targets := os.environ.get("AGW_MAIL_EVENTS_TARGETS"):
+        destinations = {key: DeliveryTarget(**value) for key, value in json.loads(targets).items()}
+        return MailEvents(directory, setting("AGW_MAIL_EVENTS_MAILBOX"), source(), destinations)
+    if not (url := os.environ.get("AGW_MAIL_EVENTS_URL")):
+        return None
+    destination = DeliveryTarget(url, setting("AGW_MAIL_EVENTS_TYPE"), setting("AGW_MAIL_EVENTS_SECRET"))
+    return MailEvents(directory, setting("AGW_MAIL_EVENTS_MAILBOX"), source(), {"": destination}, legacy=True)
 
 
 class MailEvents:
-    def __init__(self, directory, url: str, event_type: str, secret: str, mailbox: str, source, *,
-                 clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, directory, mailbox: str, source, targets: dict[str, DeliveryTarget], *,
+                 clock: Callable[[], float] = time.time, legacy: bool = False) -> None:
         self.dir = Path(directory)
-        self.url, self.type, self.mailbox, self.source, self.clock = url, event_type, mailbox, source, clock
-        self._secret = secret.encode()
+        self.mailbox, self.source, self.clock = mailbox, source, clock
+        self._legacy = legacy
+        self._targets = targets
+        self._state_file = self.dir / (STATE if self._legacy else WEB_STATE)
         # No proxy from the environment, no redirects: requests go to the configured address only.
         self._http = httpx2.Client(timeout=15, trust_env=False, follow_redirects=False)
         self._next = self._delay = 0.0
+        self._delivery_wait: dict[str, tuple[float, float]] = {}
         self._account: str | None = None  # the mailbox this process reads, once known
 
     def start(self) -> None:
@@ -70,7 +88,7 @@ class MailEvents:
 
     def run_once(self) -> None:
         now = self.clock()
-        if now < self._next:
+        if self._legacy and now < self._next:
             return
         self.dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.dir, 0o700)
@@ -81,54 +99,81 @@ class MailEvents:
             except BlockingIOError:
                 return
             state, ok = self._load(), True
-            try:
-                self._check(state, now)
-            except Exception:  # server down, credential refused: the cursor keeps its place
-                state, ok = self._load(), False  # send only what is on disk
+            checked = now >= self._next
+            if checked:
+                try:
+                    self._check(state, now)
+                except Exception:  # server down, credential refused: the cursor keeps its place
+                    state, ok = self._load(), False  # send only what is on disk
             # Events go out only from the mailbox they were found in (see _check).
-            if state["outbox"] and state["account"] == self._account and not self._send(state):
-                ok = False  # receiver offline or refusing: events wait
-            # Any failure: ask less often (30 s doubling to 5 min); success: back to every round.
-            self._delay = 0.0 if ok else min(max(self._delay * 2, INTERVAL), MAX_DELAY)
-            self._next = now + self._delay
+            if state["account"] == self._account:
+                self._deliver(state, now)
+            if checked:
+                if self._legacy and state["queues"].get(""):
+                    ok = False
+                self._delay = 0.0 if ok else min(max(self._delay * 2, INTERVAL), MAX_DELAY)
+                self._next = now + self._delay
 
     def _check(self, state: dict[str, Any], now: float) -> None:
         self._account = self._account or self.source.account()
         if state["account"] not in (None, self._account):
             # The connection now reads another mailbox: the old cursor and pending events mean nothing
             # there. Start from now, as when events are first turned on (docs/design.md 7.8).
-            state.update(cursor=None, checked_at=None, outbox=[])
+            state.update(cursor=None, checked_at=None, queues={})
+        queues = state["queues"]
+        if queues and not (queues.keys() & self._targets.keys()):
+            state.update(cursor=None, checked_at=None)
         state["account"] = self._account
         ids, fields, cursor = self.source.check(state["cursor"], state["checked_at"])
-        for start in range(0, len(ids), CHUNK):
-            state["outbox"].append({"id": uuid.uuid4().hex, "at": _iso(now),
-                                    "data": {"mailbox": self.mailbox, **fields, self.source.key: ids[start:start + CHUNK]}})
-        del state["outbox"][:-OUTBOX_LIMIT]
+        state["queues"] = {key: queues.get(key, []) for key in self._targets}
+        for outbox in state["queues"].values():
+            for start in range(0, len(ids), CHUNK):
+                outbox.append({"id": uuid.uuid4().hex, "at": _iso(now),
+                               "data": {"mailbox": self.mailbox, **fields, self.source.key: ids[start:start + CHUNK]}})
+            del outbox[:-OUTBOX_LIMIT]
         state["cursor"], state["checked_at"] = cursor, now
         self._save(state)
 
-    def _send(self, state: dict[str, Any]) -> bool:
-        """Deliver the outbox in order; False when the receiver has to be asked again later."""
+    def _deliver(self, state: dict[str, Any], now: float) -> None:
+        queues = state["queues"]
+        pending = [key for key in self._targets if queues.get(key) and now >= self._delivery_wait.get(key, (0, 0))[0]]
+        if not pending:
+            return
+        if len(pending) == 1:
+            key = pending[0]
+            counts = [self._send(self._targets[key], queues[key])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as pool:
+                counts = list(pool.map(self._send, (self._targets[key] for key in pending),
+                                       (queues[key] for key in pending)))
+        for key, count in zip(pending, counts, strict=True):
+            del queues[key][:count]
+            if queues[key]:
+                delay = min(max(self._delivery_wait.get(key, (0, 0))[1] * 2, INTERVAL), MAX_DELAY)
+                self._delivery_wait[key] = (now + delay, delay)
+            else:
+                self._delivery_wait.pop(key, None)
+        if any(counts):
+            self._save(state)
+
+    def _send(self, target: DeliveryTarget, outbox: list[dict[str, Any]]) -> int:
         done = 0
-        for entry in state["outbox"]:
-            status = self._post(entry)
+        for entry in outbox:
+            status = self._post(target, entry)
             # 2xx: accepted, or a repeat of an accepted delivery. 400 and 413 refuse the body
             # itself, which a retry cannot change; keeping it would hold back every later event.
             if status is None or not (200 <= status < 300 or status in (400, 413)):
                 break
             done += 1
-        if done:
-            del state["outbox"][:done]
-            self._save(state)
-        return not state["outbox"]
+        return done
 
-    def _post(self, entry: dict[str, Any]) -> int | None:
-        body = json.dumps({"type": self.type, "occurredAt": entry["at"], "data": entry["data"]},
+    def _post(self, target: DeliveryTarget, entry: dict[str, Any]) -> int | None:
+        body = json.dumps({"type": target.event_type, "occurredAt": entry["at"], "data": entry["data"]},
                           ensure_ascii=False, separators=(",", ":")).encode()
         stamp = str(int(time.time()))  # signed afresh on every attempt: receivers check freshness
-        signature = hmac.new(self._secret, f"{stamp}.{entry['id']}.".encode() + body, hashlib.sha256).hexdigest()
+        signature = hmac.new(target.secret.encode(), f"{stamp}.{entry['id']}.".encode() + body, hashlib.sha256).hexdigest()
         try:
-            reply = self._http.post(self.url, content=body, headers={
+            reply = self._http.post(target.url, content=body, headers={
                 "content-type": "application/json",
                 "x-openbot-timestamp": stamp,
                 "x-openbot-delivery-id": entry["id"],
@@ -140,20 +185,24 @@ class MailEvents:
 
     def _load(self) -> dict[str, Any]:
         try:
-            saved = json.loads((self.dir / STATE).read_text(encoding="utf-8"))
+            saved = json.loads(self._state_file.read_text(encoding="utf-8"))
         except FileNotFoundError:
             saved = {}
+        queues = {"": saved.get("outbox", [])} if self._legacy else saved.get("queues", {})
         return {"account": saved.get("account"), "cursor": saved.get("cursor"), "checked_at": saved.get("checked_at"),
-                "outbox": saved.get("outbox", [])}
+                "queues": queues}
 
     def _save(self, state: dict[str, Any]) -> None:
         fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".tmp-mail-events-")  # created 0600
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle)
+                record = dict(state)
+                if self._legacy:
+                    record["outbox"] = record.pop("queues").get("", [])
+                json.dump(record, handle)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, self.dir / STATE)
+            os.replace(tmp, self._state_file)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise

@@ -187,6 +187,8 @@ class Gateway:
         oauth=None,
         web_sessions=None,
         config_provisioning=None,
+        *,
+        web_mail_targets: dict[str, dict[str, dict[str, str]]] | None = None,
     ) -> None:
         self.cfg = cfg
         self.lock = lock
@@ -197,7 +199,9 @@ class Gateway:
         self.approver: Approver = approver or make_approver(cfg, audit)
         self.oauth = oauth
         self.website_catalogs = None
-        self.scrubber = Scrubber(list(secrets.values()), (lambda: oauth.sensitive) if oauth else None)
+        web_mail_targets = web_mail_targets or {}
+        signing_keys = [target["secret"] for targets in web_mail_targets.values() for target in targets.values()]
+        self.scrubber = Scrubber([*secrets.values(), *signing_keys], (lambda: oauth.sensitive) if oauth else None)
         from .catalog_sync import bundled_kind
         from .connectors.gateway_config import ConfigConnection
 
@@ -215,6 +219,10 @@ class Gateway:
             event = events.get(conn.id) if bundled_kind(conn) in MAIL_EVENT_KINDS else None
             extra = {"AGW_MAIL_EVENTS_URL": event.url, "AGW_MAIL_EVENTS_TYPE": event.type,
                      "AGW_MAIL_EVENTS_SECRET": secrets[event.secret], "AGW_MAIL_EVENTS_MAILBOX": conn.id} if event else None
+            if conn.id in web_mail_targets and bundled_kind(conn) in MAIL_EVENT_KINDS:
+                targets = web_mail_targets[conn.id]
+                extra = {"AGW_MAIL_EVENTS_TARGETS": json.dumps(targets, sort_keys=True),
+                         "AGW_MAIL_EVENTS_MAILBOX": conn.id} if targets else None
             if bundled_kind(conn) == "gateway_config":
                 self.upstreams[conn.id] = ConfigConnection(conn, config_provisioning)
             else:
