@@ -349,10 +349,19 @@ def cmd_stage(args: argparse.Namespace) -> int:
     except ValueError:
         print("error: expected a gateway origin and a proposal ID", file=sys.stderr)
         return 2
-    agent_token = os.environ.get("AGW_AGENT_TOKEN")
-    if not agent_token:
-        print("error: AGW_AGENT_TOKEN is required", file=sys.stderr)
-        return 2
+    ticket = agent_token = None
+    if args.intake_token_stdin:
+        line = sys.stdin.buffer.readline(64)
+        match = re.fullmatch(rb"(agw_intake_[A-Za-z0-9_-]{43})\r?\n", line)
+        if not match:
+            print("error: expected an intake token on the first line of standard input", file=sys.stderr)
+            return 2
+        ticket = match[1].decode("ascii")
+    else:
+        agent_token = os.environ.get("AGW_AGENT_TOKEN")
+        if not agent_token:
+            print("error: AGW_AGENT_TOKEN is required", file=sys.stderr)
+            return 2
     try:
         raw = sys.stdin.buffer.read(16001)
         credentials = json.loads(raw)
@@ -364,9 +373,10 @@ def cmd_stage(args: argparse.Namespace) -> int:
     endpoint = args.origin.rstrip("/") + "/admin/intake/" + args.proposal
     try:
         with httpx2.Client(timeout=15, follow_redirects=False, trust_env=False) as http:
-            issued = http.post(endpoint, headers={"Authorization": "Bearer " + agent_token})
-            issued.raise_for_status()
-            ticket = issued.json()["token"]
+            if agent_token:
+                issued = http.post(endpoint, headers={"Authorization": "Bearer " + agent_token})
+                issued.raise_for_status()
+                ticket = issued.json()["token"]
             staged = http.put(endpoint, headers={"Authorization": "Bearer " + ticket}, json=credentials)
             staged.raise_for_status()
             result = staged.json()
@@ -413,6 +423,8 @@ def main(argv: list[str] | None = None) -> int:
     p_stage = sub.add_parser("stage", help="deliver a JSON credential object from stdin to one proposal")
     p_stage.add_argument("origin", help="gateway HTTPS origin")
     p_stage.add_argument("proposal", help="prepared proposal ID")
+    p_stage.add_argument("--intake-token-stdin", action="store_true",
+                         help="read a one-time intake token on the first line before the credentials JSON")
     p_stage.set_defaults(func=cmd_stage)
 
     args = parser.parse_args(argv)

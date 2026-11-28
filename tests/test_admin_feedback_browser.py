@@ -137,9 +137,13 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         await playwright.expect(details).to_contain_text('alias@example.test')
 
 
-async def test_prepared_proposals_review_in_browser_without_credential_fields(tmp_path, monkeypatch):
+@pytest.mark.parametrize("auth", ["bearer", "oauth"])
+async def test_prepared_proposals_review_in_browser_without_credential_fields(tmp_path, monkeypatch, auth):
+    import hashlib
     import json
+    import secrets
     import sys
+    from urllib.parse import parse_qs, urlencode, urlsplit
 
     from helpers import TOKEN_HOUSE, prepare
     from passkey_helpers import approval_config
@@ -151,28 +155,46 @@ async def test_prepared_proposals_review_in_browser_without_credential_fields(tm
     raw["admin"] = {"owner": "person_a", "state": "admin.enc"}
     raw["server"]["tool_discovery"] = "search"
     path = await prepare(tmp_path, raw)
-    remote = Remote(monkeypatch, mode="bearer")
+    remote = Remote(monkeypatch, mode=auth)
+    remote.no_registration = True
+    remote.grant_scope = "notes.read"
     async with admin_page(tmp_path, 'en-US', path=path, port=port) as (page, origin):
         await page.evaluate("""() => mutate('permissions/connection', {
           client: 'shared-agent', connection: 'gateway_config', access: 'read_write_direct'
         })""")
 
-        async def prepare_request(config, credentials):
+        confirmations = []
+        operations = {"oauth-clients/save", "oauth/mcp/start", "connections/preview", "connections/apply"}
+
+        def remember_confirmation(request):
+            operation = urlsplit(request.url).path.removeprefix("/admin/api/")
+            if request.method == "POST" and operation in operations and "confirmation" in request.post_data_json:
+                confirmations.append(operation)
+
+        page.on("request", remember_confirmation)
+
+        async def prepare_request(config, credentials=None):
+            args = {"prepared": True, **config}
+            if credentials is not None:
+                token = "agw_intake_" + secrets.token_urlsafe(32)
+                args["intake_sha256"] = hashlib.sha256(token.encode()).hexdigest()
             response = await rpc(origin, TOKEN_HOUSE, "tools/call", {"name": "gateway_call_tool", "arguments": {
                 "connection": "gateway_config", "tool": "gateway_config_provision",
-                "idempotency_key": config["id"], "arguments": {"prepared": True, **config},
+                "idempotency_key": config["id"], "arguments": args,
             }})
             proposal = json.loads(response.json()["result"]["content"][0]["text"])
             await page.goto(origin + "/admin/connections")
             card = page.get_by_role('heading', name='Provisioning requests').locator('..')
             row = card.locator('.row').filter(has_text=config["id"])
-            await playwright.expect(row.get_by_text('Waiting for credentials')).to_be_visible()
-            stage = await anyio.run_process(
-                [sys.executable, "-m", "agent_gateway.cli", "stage", origin, proposal["id"]],
-                input=json.dumps(credentials).encode(), env={**os.environ, "AGW_AGENT_TOKEN": TOKEN_HOUSE},
-            )
-            assert json.loads(stage.stdout)["proposal"] == proposal["id"]
-            assert all(secret.encode() not in stage.stdout for secret in credentials.values())
+            if credentials is not None:
+                await playwright.expect(row.get_by_text('Waiting for credentials')).to_be_visible()
+                stage = await anyio.run_process(
+                    [sys.executable, "-m", "agent_gateway.cli", "stage", origin, proposal["id"], "--intake-token-stdin"],
+                    input=(token + "\n" + json.dumps(credentials)).encode(),
+                    env={key: value for key, value in os.environ.items() if key != "AGW_AGENT_TOKEN"},
+                )
+                assert json.loads(stage.stdout)["proposal"] == proposal["id"]
+                assert all(private.encode() not in stage.stdout for private in (token, *credentials.values()))
             await page.goto(proposal["review_url"])
             dialog = page.locator('dialog[open]').last
             await playwright.expect(dialog).to_be_visible()
@@ -188,16 +210,27 @@ async def test_prepared_proposals_review_in_browser_without_credential_fields(tm
         await playwright.expect(client).to_have_count(0)
         assert not remote.requests
 
-        connection, connector_review = await prepare_request(
-            {"kind": "http_mcp", "id": "browser-remote", "url": URL, "auth": "bearer",
-             "grants": [{"client": "shared-agent", "tool": "read.note", "access": "read"}]},
-            {"token": remote.access},
-        )
+        config = {"kind": "http_mcp", "id": "browser-remote", "url": URL, "auth": auth,
+                  "grants": [{"client": "shared-agent", "tool": "read.note", "access": "read"}]}
+        credentials = {"token": remote.access} if auth == "bearer" else None
+        if auth == "oauth":
+            async def accept_consent(route):
+                remote.query = parse_qs(urlsplit(route.request.url).query)
+                callback, = remote.query["redirect_uri"]
+                query = urlencode({"state": remote.query["state"][0], "code": "fake-code"})
+                await route.fulfill(status=302, headers={"Location": callback + "?" + query})
+
+            await page.route(ISSUER + "/authorize?*", accept_consent)
+            config.update(oauth_client="browser-oauth", scope="notes.read")
+        connection, connector_review = await prepare_request(config, credentials)
         await playwright.expect(connector_review.get_by_text('shared-agent · read.note · Read')).to_be_visible()
-        await connector_review.get_by_role('button', name='Approve and load tools').click()
+        button = "Start OAuth authorization" if auth == "oauth" else "Approve and load tools"
+        await connector_review.get_by_role('button', name=button).click()
         tools = page.get_by_role('dialog', name='Review tool definitions')
         await playwright.expect(tools.get_by_text('shared-agent · read.note · Read')).to_be_visible()
         await tools.get_by_role('checkbox', name='I reviewed these definitions and permissions.').check()
         await tools.get_by_role('button', name='Apply connector').click()
         await playwright.expect(connection).to_have_count(0)
         await playwright.expect(page.locator('tr[data-connection="browser-remote"]')).to_be_visible()
+        review = "oauth/mcp/start" if auth == "oauth" else "connections/preview"
+        assert confirmations == ["oauth-clients/save", review, "connections/apply"]

@@ -564,9 +564,14 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 对 `http_mcp`，提交端点和认证方式。需要授权 Agent 时，加入 `grants`，每项给出 `client`、上游工具名 `tool` 和 `access`。
 可用权限是 `read`、`write`（调用时需审批）、`write_direct`（调用时无需审批）。
 
-需要凭据时，由获授权的程序将 JSON 经标准输入传给 `agw stage <网关 HTTPS 地址> <申请 ID>`。
-程序从已有安全配置读取申请者的 `AGW_AGENT_TOKEN`。OAuth 客户端使用 `client_id`、`client_secret` 和可选的 `auth_method`。
-Bearer 或 Header 认证使用 `token`。凭据有效期为 15 分钟，且不会超过申请有效期。管理员在「待审接入申请」核对配置和权限。
+需要凭据时，由获授权的程序通过 `agw stage` 投递。OAuth 客户端的凭据 JSON 使用 `client_id`、`client_secret` 和可选的 `auth_method`。Bearer 或 Header 认证使用 `token`。
+
+1. 投递程序在内存中为本次申请生成一次性值 `"agw_intake_" + secrets.token_urlsafe(32)`。将完整值的 SHA-256 小写十六进制摘要交给有申请权限的 Agent。
+2. Agent 在 `gateway_config_provision` 的 `prepared` 申请中将该摘要填入 `intake_sha256`，然后把回包里的申请 `id` 交给投递程序。
+3. 同一个投递程序运行 `agw stage <网关 HTTPS 地址> <申请 ID> --intake-token-stdin`。用私有标准输入管道写入一次性值和换行，再写入凭据 JSON。只有摘要与申请信息经过 MCP。投递程序保留原值和凭据，避免写进日志、命令行参数或聊天。
+
+已有调用方可以继续从安全配置读取申请者的 `AGW_AGENT_TOKEN`，运行 `agw stage <网关 HTTPS 地址> <申请 ID>`，并且仅将凭据 JSON 写入标准输入。
+投递授权有效期为 15 分钟，且不会超过申请有效期。管理员在「待审接入申请」核对配置和权限。
 需要 OAuth 同意时，先完成上游授权，再审阅工具及其读写类型并应用。申请者用 `gateway_config_read` 确认当前状态。
 
 未设置 `prepared` 的申请沿用原表单。预注册 OAuth client 缺失时，先提交 `{"kind":"oauth_client","id":"example","issuer":"https://auth.example.test"}`。
