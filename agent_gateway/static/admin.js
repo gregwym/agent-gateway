@@ -13,7 +13,7 @@ const app = document.getElementById('app');
 const dialogs = document.getElementById('dialogs');
 const version = document.getElementById('gateway-version');
 const tabUrls = {overview: '/admin/', members: '/admin/members', agents: '/admin/agents',
-  connections: '/admin/connections', permissions: '/admin/permissions', settings: '/admin/settings'};
+  connections: '/admin/connections', permissions: '/admin/permissions', audit: '/admin/audit', settings: '/admin/settings'};
 let csrf = '', state = null, subject = '', dismissNotice;
 const filters = {connections: "", permissions: ""};
 let setupCode = new URLSearchParams(location.hash.slice(1)).get('setup') || '';
@@ -36,6 +36,7 @@ function navigate(key, replace = false) {
   } else render();
 }
 const messages = {
+  audit_unavailable: ['Audit history is temporarily unavailable.', '暂时无法读取审计历史。'],
   registry_query_invalid: ['Enter a service name between 3 and 100 characters.', '请输入 3 到 100 字符的服务名称。'],
   registry_cursor_invalid: ['This results page is no longer available. Search again.', '此结果页已无法读取，请重新搜索。'],
   registry_rate_limited: ['The MCP Registry is limiting requests. Try again shortly or enter the endpoint manually.', 'MCP Registry 正在限制请求，请稍后重试或手动填写接口地址。'],
@@ -502,7 +503,7 @@ function render() {
   button(identity, nameOf(state.owner), () => renameMember(state.members.find(m => m.id === state.owner)), 'profile-name');
   button(identity, tr('Sign out', '退出'), async () => { await api('auth/logout', {}); csrf = ''; state = null; dialogs.replaceChildren(); await welcome(true); });
   const nav = el(app, 'nav'); nav.setAttribute('aria-label', tr('Administration', '管理导航'));
-  const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '群组成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')], ['settings', tr('Settings', '设置')]];
+  const tabs = [['overview', tr('Overview', '总览')], ['members', tr('Members', '群组成员')], ['agents', tr('Agents', 'Agent 接入')], ['connections', tr('Connectors', '连接器')], ['permissions', tr('Permissions', '权限')], ['audit', tr('Audit history', '审计历史')], ['settings', tr('Settings', '设置')]];
   for (const [key, label] of tabs) {
     const link = el(nav, 'a', label, tab === key ? 'button active' : 'button');
     link.href = tabUrls[key];
@@ -512,12 +513,83 @@ function render() {
       event.preventDefault(); navigate(key);
     });
   }
-  ({overview, members, agents, connections, permissions, settings: systemSettings})[tab]();
+  ({overview, members, agents, connections, permissions, audit: auditHistory, settings: systemSettings})[tab]();
   const params = new URLSearchParams(location.search);
   if (tab === 'connections' && params.has('review_operation_rules') && params.has('proposal')) {
     history.replaceState(null, '', tabUrls.connections);
     websiteOperationRules(params.get('review_operation_rules'), params.get('proposal')).catch(error => showError(app, error));
   }
+}
+function auditHistory() {
+  el(app, 'h1', tr('Audit history', '审计历史'));
+  const form = el(app, 'form', undefined, 'card');
+  const grid = el(form, 'div', undefined, 'form-grid');
+  const client = field(grid, tr('Agent ID', 'Agent 标识'), 'client');
+  const connection = field(grid, tr('Connector ID', '连接器标识'), 'connection');
+  client.maxLength = connection.maxLength = 48;
+  const outcomes = {
+    allow: tr('Allowed', '已放行'), deny: tr('Denied', '已拒绝'), error: tr('Error', '错误'),
+    queued: tr('Queued', '排队中'), pending: tr('Awaiting approval', '待审批'), approve: tr('Approved', '已批准'), cancel: tr('Cancelled', '已取消'),
+  };
+  const result = select(grid, tr('Result', '结果'), 'result', [
+    ['', tr('All results', '全部结果')], ...Object.entries(outcomes),
+  ]);
+  const submit = el(form, 'button', tr('Apply filters', '应用筛选'), 'primary');
+  submit.type = 'submit';
+  const history = el(app, 'section');
+  const status = el(history, 'p', '', 'muted');
+  status.setAttribute('role', 'status');
+  const rows = el(history, 'div');
+  const events = {
+    tool_call: tr('Tool call', '工具调用'), tool_blocked: tr('Tool blocked', '工具已拦截'),
+    auth_failed: tr('Authentication failed', '认证失败'), admin_login: tr('Admin sign-in', '管理员登录'),
+    approval_requested: tr('Approval requested', '请求审批'), approval_decided: tr('Approval decided', '审批结果'),
+    approval_cancelled: tr('Approval cancelled', '审批已取消'), startup: tr('Gateway started', '网关启动'),
+  };
+  async function load() {
+    submit.disabled = true;
+    history.setAttribute('aria-busy', 'true');
+    status.textContent = tr('Loading audit history…', '正在读取审计历史…');
+    rows.replaceChildren();
+    try {
+      const data = await api('audit', {client: client.value.trim(), connection: connection.value.trim(), result: result.value});
+      if (!history.isConnected) return;
+      status.textContent = data.truncated
+        ? tr('Showing matches within the recent history limit.', '筛选结果仅覆盖读取上限内的近期记录。')
+        : '';
+      if (data.items.length === 0) {
+        el(rows, 'p', tr('No matching audit events.', '没有匹配的审计事件。'), 'empty');
+        return;
+      }
+      const table = el(el(rows, 'div', undefined, 'table-wrap'), 'table');
+      const heading = el(el(table, 'thead'), 'tr');
+      for (const label of [tr('Time', '时间'), tr('Event / tool', '事件／工具'), 'Agent',
+        tr('Connector', '连接器'), tr('Result / reason', '结果／原因')]) el(heading, 'th', label);
+      const body = el(table, 'tbody');
+      for (const item of data.items) {
+        const row = el(body, 'tr');
+        const time = el(el(row, 'td'), 'time', new Date(item.ts).toLocaleString(document.documentElement.lang));
+        time.dateTime = item.ts;
+        const event = el(row, 'td', events[item.event] || item.event);
+        if (item.tool) el(el(event, 'div'), 'code', item.tool);
+        el(row, 'td', item.client ?? '—');
+        el(row, 'td', item.connection ?? '—');
+        const outcome = el(row, 'td');
+        el(outcome, 'span', outcomes[item.result] ?? '—', ['deny', 'error'].includes(item.result) ? 'badge bad' : 'badge');
+        if (item.reason) el(el(outcome, 'div'), 'code', item.reason);
+      }
+    } catch (error) {
+      if (history.isConnected) {
+        status.textContent = '';
+        el(rows, 'p', errorText(error), 'error').setAttribute('role', 'alert');
+      }
+    } finally {
+      submit.disabled = false;
+      history.removeAttribute('aria-busy');
+    }
+  }
+  form.addEventListener('submit', event => { event.preventDefault(); load(); });
+  load();
 }
 function overview() {
   const hero = el(app, 'section', undefined, 'hero'); el(hero, 'p', tr('Ready when you are', '准备就绪'), 'eyebrow');

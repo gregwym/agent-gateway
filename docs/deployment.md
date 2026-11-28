@@ -821,6 +821,9 @@ GraphQL mutation 始终按写入处理；HTTP 读取规则不会改变 GraphQL �
 
 ## 11. 审计日志
 
+管理员可在网关管理台的「审计历史」查看近期事件，按 Agent 标识、连接器标识或结果筛选。
+列表从最新记录开始，受读取文件、字节和记录数上限约束。页面只显示审计元数据中的必要字段。
+
 `state/audit/audit.jsonl`，每行一个 JSON，每个 UTC 日切一个文件，保留 `audit.retention_days` 个。
 
 事件：`tool_call`、`auth_failed`、`tool_blocked`、`startup`，以及审批相关的 `approval_requested`、`approval_decided`、

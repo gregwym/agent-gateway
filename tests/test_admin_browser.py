@@ -74,6 +74,24 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await playwright.expect(page.get_by_role('row').filter(has_text='browser-agent')).to_have_count(0)
                 assert (await rpc(origin, token)).status_code == 401
 
+                gw.gateway.audit.write('tool_call', client='agent-a', connection='notes-a',
+                                       tool='a_list_notes', decision='allow', reason='ok')
+                gw.gateway.audit.write('tool_call', client='agent-a', connection='notes-a',
+                                       tool='a_list_notes', decision='allow', is_error=True)
+                await page.get_by_role('link', name=t('Audit history', '审计历史'), exact=True).click()
+                assert page.url == origin + '/admin/audit'
+                await playwright.expect(page.get_by_role('heading', name=t('Audit history', '审计历史'))).to_be_visible()
+                await playwright.expect(page.get_by_role('row').filter(has_text='a_list_notes')).to_have_count(2)
+                await page.get_by_label(t('Agent ID', 'Agent 标识'), exact=True).fill('agent-a')
+                await page.get_by_label(t('Connector ID', '连接器标识'), exact=True).fill('notes-a')
+                await page.get_by_label(t('Result', '结果'), exact=True).select_option('error')
+                await page.get_by_role('button', name=t('Apply filters', '应用筛选')).click()
+                events = page.locator('tbody tr')
+                await playwright.expect(events).to_have_count(1)
+                await playwright.expect(events.first).to_contain_text(t('Error', '错误'))
+                await playwright.expect(events.first).to_contain_text('a_list_notes')
+                assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+
                 await page.get_by_role('link', name=t('Settings', '设置'), exact=True).click()
                 await page.get_by_role('button', name=t('Add OAuth client', '添加 OAuth 客户端'), exact=True).click()
                 client_form = page.get_by_role('dialog', name=t('Add remote MCP OAuth client', '添加远程 MCP OAuth 客户端'))

@@ -14,7 +14,7 @@ import anyio
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
-from . import __version__, registry
+from . import __version__, audit_history, registry
 from .admin_auth import AdminAuth, COOKIE
 from .admin_web_login import WebsiteLogin
 from .admin_config import (
@@ -24,6 +24,7 @@ from .admin_config import (
 from .auth import hash_token, new_token
 from .catalog_sync import bundled_kind
 from .config import NAME, ToolCfg, WebOperationRule, is_mail_send, valid_mailbox_paths
+from .discovery import BY_NAME as DISCOVERY_TOOLS
 from .lock import Lock, definition_of, digest_of
 from .passkey import Refused, _json, _static, _PAGE_HEADERS
 from .plugins import MANIFEST_ENV, connector_plugins
@@ -1032,6 +1033,22 @@ class AdminController:
                     return response
                 if operation == "registry/search":
                     return _json(await registry.search(body), 200)
+                if operation == "audit":
+                    try:
+                        query = audit_history.filters(body)
+                    except ValueError:
+                        raise Refused("invalid_argument", 400) from None
+                    gateway = self.runtime.gateway
+                    cfg = gateway.cfg.audit
+                    tools = gateway.routes.keys() | DISCOVERY_TOOLS.keys()
+                    try:
+                        result = await anyio.to_thread.run_sync(
+                            audit_history.recent, cfg.path, cfg.retention_days, query, tools,
+                        )
+                    except OSError:
+                        raise Refused("audit_unavailable", 503) from None
+                    self.auth.session(token)
+                    return _json(result, 200)
                 browser_control = operation in ("web-login/start", "web-login/terminate")
                 if operation.startswith("web-login/") and not browser_control:
                     return _json(await self.website_login.input(operation.split("/", 1)[1], body, session, token), 200)
@@ -1078,7 +1095,7 @@ class AdminController:
             return HTMLResponse(page, status_code=error.status_code, headers=_ADMIN_PAGE_HEADERS)
 
         return [Route("/", page), Route("/admin", page), Route("/admin/", page),
-                *(Route(f"/admin/{section}", page) for section in ("members", "agents", "connections", "permissions", "settings")),
+                *(Route(f"/admin/{section}", page) for section in ("members", "agents", "connections", "permissions", "audit", "settings")),
                 Route("/admin/oauth/google/callback", oauth_callback),
                 Route("/admin/oauth/mcp/callback", oauth_callback),
                 Route("/admin/assets/{name}", asset),
