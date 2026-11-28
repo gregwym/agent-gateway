@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_gateway import __version__
+from agent_gateway import __version__, export_web_session
 from agent_gateway.credentials import EncryptedFileStore
 from helpers import TOKEN_HOUSE
 from test_admin import rpc, web_gateway
@@ -213,7 +213,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await browser.close()
 
 
-async def test_amazon_session_file_create_and_rotate(tmp_path):
+async def test_amazon_session_file_create_and_rotate(tmp_path, monkeypatch):
     directory = tmp_path / 'plugins'
     directory.mkdir()
     slot = 'ORDERS_SESSION_SECRET'
@@ -224,8 +224,8 @@ async def test_amazon_session_file_create_and_rotate(tmp_path):
         'credentials': {slot: 'Amazon session file'},
     }))
 
-    def session(value):
-        return json.dumps([{'name': 'session', 'value': value, 'domain': '.amazon.com', 'path': '/'}])
+    def session(value, name='x-main'):
+        return json.dumps([{'name': name, 'value': value, 'domain': '.amazon.com', 'path': '/', 'expires': -1}])
 
     def select_file(contents):
         return {'name': 'amazon-session.json', 'mimeType': 'application/json', 'buffer': contents.encode()}
@@ -246,10 +246,18 @@ async def test_amazon_session_file_create_and_rotate(tmp_path):
             def saved_session():
                 saved = json.loads(store.get('state'))
                 connector = next(item for item in saved['config']['connections'] if item['id'] == 'orders')
-                return saved['secrets'][connector['secret_env'][slot]]
+                return json.loads(saved['secrets'][connector['secret_env'][slot]])
 
             first = session('synthetic-amazon-session-first')
-            updated = session('synthetic-amazon-session-updated')
+            updated = session('"synthetic-amazon-session-updated"')
+            visitor = session('synthetic-visitor', name='session-id')
+            exported = tmp_path / 'exported-session.json'
+            with monkeypatch.context() as capture:
+                capture.setattr(sys, 'argv', ['agw-export-session', 'amazon-orders', str(exported)])
+                capture.setattr(export_web_session, 'find_chrome', lambda _: 'synthetic-chrome')
+                capture.setattr(export_web_session, 'sign_in', lambda *args: 0)
+                capture.setattr(export_web_session, 'saved_cookies', lambda *args: json.loads(updated))
+                export_web_session.main()
             await page.goto((tmp_path / 'admin-setup-link').read_text().strip())
             await page.get_by_role('button', name='Create administrator passkey').click()
             await page.get_by_role('link', name='Connectors', exact=True).click()
@@ -259,6 +267,10 @@ async def test_amazon_session_file_create_and_rotate(tmp_path):
             await page.get_by_label('Connector name', exact=True).fill('orders')
             picker = page.get_by_label('Browser session JSON', exact=True)
             await playwright.expect(picker).to_have_attribute('type', 'file')
+            await picker.set_input_files(select_file(visitor))
+            await page.get_by_role('button', name='Preview tools', exact=True).click()
+            await playwright.expect(page.get_by_role('alert')).to_contain_text('no valid Amazon Orders sign-in')
+            assert not store_file.exists()
             await picker.set_input_files(select_file(first))
             async with page.expect_response(
                 lambda response: response.url.endswith('/connections/preview') and response.status == 200
@@ -271,7 +283,7 @@ async def test_amazon_session_file_create_and_rotate(tmp_path):
             await review.get_by_role('button', name='Apply connector').click()
             connection = page.locator('tr[data-connection=orders]')
             await playwright.expect(connection).to_be_visible()
-            assert saved_session() == first
+            assert saved_session() == json.loads(first)
 
             await page.get_by_role('link', name='Permissions', exact=True).click()
             await page.get_by_label('Agent', exact=True).select_option('agent-a')
@@ -296,24 +308,29 @@ async def test_amazon_session_file_create_and_rotate(tmp_path):
             await picker.set_input_files(select_file('invalid-synthetic-session-json'))
             await save.click()
             await playwright.expect(editor.get_by_role('alert')).to_contain_text('Select a browser session JSON file')
-            assert saved_session() == first
+            assert saved_session() == json.loads(first)
+            await picker.set_input_files(select_file(visitor))
+            await save.click()
+            await playwright.expect(editor.get_by_role('alert')).to_contain_text('no valid Amazon Orders sign-in')
+            assert saved_session() == json.loads(first)
             await picker.set_input_files([])
             await save.click()
             await playwright.expect(editor).to_have_count(0)
-            assert saved_session() == first
+            assert saved_session() == json.loads(first)
 
             editor = await edit()
-            await picker.set_input_files(select_file(updated))
+            await picker.set_input_files(exported)
             async with page.expect_response(
                 lambda response: response.url.endswith('/connections/save') and response.status == 200
             ) as rotation:
                 await editor.get_by_role('button', name='Save connector', exact=True).click()
             await playwright.expect(editor).to_have_count(0)
-            assert saved_session() == updated
+            assert saved_session() == json.loads(updated)
             assert json.loads(store.get('state'))['config']['policy'] == original_policy
             public = (await page.locator('body').inner_text() + gw.audit_text()
                       + await (await preview.value).text() + await (await rotation.value).text())
-            for marker in ('synthetic-amazon-session-first', 'synthetic-amazon-session-updated', 'invalid-synthetic-session-json'):
+            for marker in ('synthetic-amazon-session-first', 'synthetic-amazon-session-updated',
+                           'invalid-synthetic-session-json', 'synthetic-visitor'):
                 assert marker not in public
                 assert marker.encode() not in store_file.read_bytes()
         finally:

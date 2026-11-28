@@ -44,7 +44,15 @@ _CREDENTIAL_FIELDS = {"authorization", "cookie", "cookies", "setcookie", "passwo
 _TLS = ssl.create_default_context()
 
 
-def import_session(raw, profile, extra_origins=()):
+def _valid_cookie_value(value, allow_quoted_values):
+    if not isinstance(value, str) or len(value) > 8192:
+        return False
+    if allow_quoted_values and value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return _COOKIE_VALUE.fullmatch(value) is not None
+
+
+def import_session(raw, profile, extra_origins=(), *, allow_quoted_values=False):
     """Accept a cookie array or a Playwright storageState, discarding other sites and storage."""
     hosts = tuple(urlsplit(origin).hostname for origin in (profile.origin, *extra_origins))
     if len(raw.encode("utf-8")) > 60_000:
@@ -67,8 +75,8 @@ def import_session(raw, profile, extra_origins=()):
             continue
         name, value, path = item.get("name"), item.get("value"), item.get("path", "/")
         expires = item.get("expires", item.get("expirationDate", -1))
-        if not (isinstance(name, str) and _COOKIE_NAME.fullmatch(name) and isinstance(value, str)
-                and _COOKIE_VALUE.fullmatch(value) and isinstance(path, str) and path.startswith("/")
+        if not (isinstance(name, str) and _COOKIE_NAME.fullmatch(name)
+                and _valid_cookie_value(value, allow_quoted_values) and isinstance(path, str) and path.startswith("/")
                 and len(path) <= 512 and re.fullmatch(r"[^\x00-\x20\x7f;]*", path)
                 and type(expires) in (int, float) and -1 <= expires <= 253402300799):
             continue
