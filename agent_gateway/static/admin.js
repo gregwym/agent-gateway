@@ -53,6 +53,7 @@ const messages = {
   oauth_client_settings_invalid: ["Check the OAuth client ID, secret and token authentication method. Use either a registered client or a client metadata URL.", "请核对 OAuth 客户端 ID、密钥和 Token 认证方式；已注册客户端与客户端元数据 URL 只能选一种。"],
   proposal_not_pending: ['This request is no longer pending. Reload the connector list.', '这条申请已结束，请刷新连接器列表。'],
   proposal_changed: ['The connector settings differ from the provisioning request.', '连接器设置与接入申请不一致。'],
+  invalid_intake_token: ['The credential upload authorization is invalid or expired.', '凭据投递授权无效或已过期。'],
   proposal_credentials_changed: ['The staged credentials expired or changed. Reload the request after the credentials are delivered again.', '暂存凭据已过期或变更，请在重新投递后刷新申请。'],
   proposal_tool_grant_changed: ['A requested permission does not match the selected tools or access types. Ask the Agent to revise the request.', '申请的权限与所选工具或读写类型不一致，请让 Agent 修改申请。'],
   invalid_configuration_connector: ['The gateway manages its built-in configuration connector.', '网关自动管理内置的网关配置连接器。'],
