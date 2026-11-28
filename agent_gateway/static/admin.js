@@ -53,6 +53,9 @@ const messages = {
   oauth_client_settings_invalid: ["Check the OAuth client ID, secret and token authentication method. Use either a registered client or a client metadata URL.", "请核对 OAuth 客户端 ID、密钥和 Token 认证方式；已注册客户端与客户端元数据 URL 只能选一种。"],
   proposal_not_pending: ['This request is no longer pending. Reload the connector list.', '这条申请已结束，请刷新连接器列表。'],
   proposal_changed: ['The connector settings differ from the provisioning request.', '连接器设置与接入申请不一致。'],
+  invalid_intake_token: ['The credential upload authorization is invalid or expired.', '凭据投递授权无效或已过期。'],
+  proposal_credentials_changed: ['The staged credentials expired or changed. Reload the request after the credentials are delivered again.', '暂存凭据已过期或变更，请在重新投递后刷新申请。'],
+  proposal_tool_grant_changed: ['A requested permission does not match the selected tools or access types. Ask the Agent to revise the request.', '申请的权限与所选工具或读写类型不一致，请让 Agent 修改申请。'],
   invalid_configuration_connector: ['The gateway manages its built-in configuration connector.', '网关自动管理内置的网关配置连接器。'],
   oauth_client_exists: ['This name is already used by an OAuth client. Choose a different name.', '该名称已被 OAuth 客户端使用，请选择另一个名称。'],
   oauth_client_limit: ['The gateway has reached its limit for saved OAuth clients.', '网关已达 OAuth 客户端数量上限。'],
@@ -524,6 +527,12 @@ function render() {
   if (tab === 'connections' && params.has('review_operation_rules') && params.has('proposal')) {
     history.replaceState(null, '', tabUrls.connections);
     websiteOperationRules(params.get('review_operation_rules'), params.get('proposal')).catch(error => showError(app, error));
+  } else if (tab === 'connections' && params.has('proposal')) {
+    const row = state.config_proposals.find(proposal => proposal.config.prepared && proposal.id === params.get('proposal'));
+    if (row?.status === 'pending' && (!row.credentials_required || row.staged_version)) {
+      history.replaceState(null, '', tabUrls.connections);
+      preparedProposalDialog(row);
+    }
   }
 }
 function auditHistory() {
@@ -808,9 +817,17 @@ function connections() {
       const summary = el(item, 'div');
       el(summary, 'strong', row.config.id + ' · ' + row.client);
       el(summary, 'p', row.config.url || row.config.issuer, 'url');
+      if (row.last_error) el(summary, 'p', serverError({error: row.last_error}, 400).message, 'error');
       const actions = el(item, 'div', undefined, 'actions');
-      button(actions, tr('Review', '审阅'), () => row.config.kind === 'oauth_client'
-        ? remoteOAuthClientDialog(row) : connectorForm(undefined, false, row));
+      if (row.credentials_required && !row.staged_version) {
+        el(summary, 'p', tr('Waiting for credentials', '等待凭据投递'), 'muted');
+      } else {
+        button(actions, tr('Review', '审阅'), () => {
+          if (row.config.prepared) preparedProposalDialog(row);
+          else if (row.config.kind === 'oauth_client') remoteOAuthClientDialog(row);
+          else connectorForm(undefined, false, row);
+        });
+      }
       button(actions, tr('Reject', '拒绝'), () => mutate('proposals/reject', {id: row.id}));
     }
   }
@@ -1149,6 +1166,49 @@ function mailWebhookDialog(target) {
     key.value = '';
     box.close();
   }, 'primary', tr('Saving…', '正在保存…'));
+}
+
+function proposedGrants(parent, grants) {
+  if (!grants?.length) return;
+  el(parent, 'h3', tr('Requested Agent permissions', '申请的 Agent 权限'));
+  const list = el(parent, 'ul');
+  const access = {
+    read: tr('Read', '读取'),
+    write: tr('Write with approval', '写入需审批'),
+    write_direct: tr('Write without approval', '写入无需审批'),
+  };
+  for (const grant of grants) el(list, 'li', grant.client + ' · ' + grant.tool + ' · ' + access[grant.access]);
+}
+
+function preparedProposalDialog(row) {
+  const cfg = row.config;
+  const client = cfg.kind === 'oauth_client';
+  const oauth = !client && cfg.auth === 'oauth';
+  const box = modal(client ? tr('Review OAuth client', '审阅 OAuth 客户端') : tr('Review connector request', '审阅连接器申请'));
+  el(box, 'h3', cfg.id);
+  el(box, 'p', cfg.issuer || cfg.url, 'url');
+  if (client) {
+    el(box, 'p', tr('OAuth client ID: ', 'OAuth 客户端 ID：') + row.staged_client_id);
+    el(box, 'p', tr('Client authentication: ', '客户端认证：') + row.staged_auth_method);
+    el(box, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
+  } else {
+    el(box, 'p', identityLabel(cfg.owner) + ' · ' + cfg.service + ' · ' + cfg.auth);
+    if (cfg.header) el(box, 'p', tr('Credential header: ', '凭据 Header：') + cfg.header);
+    if (cfg.oauth_client) el(box, 'p', tr('System OAuth client: ', '系统 OAuth 客户端：') + cfg.oauth_client);
+    if (oauth) el(box, 'p', tr('Requested scopes: ', '申请的授权范围：') + (cfg.scope || tr('from the upstream service', '由上游提供')));
+    proposedGrants(box, cfg.grants);
+  }
+  if (row.staged_version) el(box, 'p', tr('Staged credential version: ', '暂存凭据版本：') + row.staged_version);
+  const operation = client ? 'oauth-clients/save' : oauth ? 'oauth/mcp/start' : 'connections/preview';
+  const label = client ? tr('Approve and save', '批准并保存') : oauth ? tr('Start OAuth authorization', '开始 OAuth 授权') : tr('Approve and load tools', '批准并读取工具');
+  button(box, label, async () => {
+    const payload = {proposal: row.id, ...(row.staged_version && {staged_version: row.staged_version})};
+    const result = client ? await mutate(operation, payload)
+      : await api(operation, {revision: state.revision, ...payload});
+    if (client) box.close();
+    else if (oauth) location.assign(result.url);
+    else showReview(result, box);
+  }, 'primary');
 }
 
 function remoteOAuthClientDialog(proposal) {
@@ -1744,7 +1804,8 @@ function showReview(result, form) {
   const review = modal(tr('Review tool definitions', '审阅工具定义'));
   el(review, 'p', result.connection + ' · ' + identityLabel(result.owner), 'muted');
   if (result.google_account) el(review, 'p', tr('Authorized Google account: ', '已授权的 Google 账号：') + result.google_account, 'hint');
-  el(review, 'p', tr('Grant Agent access to new tools under Permissions.', '新增工具默认不授权，请在「权限」中配置。'), 'hint');
+  if (result.proposal_grants?.length) proposedGrants(review, result.proposal_grants);
+  else el(review, 'p', tr('Grant Agent access to new tools under Permissions.', '新增工具默认不授权，请在「权限」中配置。'), 'hint');
   if (result.oauth?.issuer) el(review, 'p', tr('Authorization server: ', '授权服务器：') + result.oauth.issuer, 'hint');
   if (result.oauth?.scope) el(review, 'p', tr('Granted scopes: ', '已授权范围：') + result.oauth.scope, 'hint');
   if (result.remote && !result.fixed_access) el(review, 'p', tr('Confirm each tool’s access. Deselecting a tool or changing it from Read to Write removes its existing grants.', '请核对工具类型。取消选择工具或将其从读取改为写入，会撤销已有授权。'), 'hint');

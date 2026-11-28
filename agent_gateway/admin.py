@@ -21,7 +21,7 @@ from .admin_config import (
     CATALOG, CONNECTION_ACCESS, CONNECTOR_NAME, ManagedStore, catalog_additions, connection_access,
     extend_catalog_tools, kind_of, mailbox_metadata, make_connection, member_name, settings_of, tool_access,
 )
-from .auth import hash_token, new_token
+from .auth import StaticTokenVerifier, hash_token, new_token
 from .catalog_sync import bundled_kind
 from .config import NAME, ToolCfg, WebOperationRule, is_mail_send, valid_mailbox_paths
 from .discovery import BY_NAME as DISCOVERY_TOOLS
@@ -107,6 +107,10 @@ class AdminController:
                 now = time.time()
                 self.drafts = {k: v for k, v in self.drafts.items() if v["expires"] > now}
                 self.mcp_oauth.sweep()
+                try:
+                    self.provisioning.prune_intake()
+                except Exception:
+                    self.runtime.gateway.audit.write("provisioning_cleanup_failed", reason="storage_unavailable")
                 try:
                     self.oauth.prune({c.oauth_ref for c in self.runtime.gateway.cfg.connections if c.oauth_ref})
                 except Exception:
@@ -238,7 +242,7 @@ class AdminController:
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
                 "oauth_clients": self.oauth.list_clients(),
                 "mail_webhooks": mail_webhooks.view(self.store.state, gw.cfg),
-                "config_proposals": [self.provisioning.view(row) for row in self.provisioning.rows()],
+                "config_proposals": [self.provisioning.view(row, admin=True) for row in self.provisioning.rows()],
                 "gmail_oauth": {"default": self.store.state.get("gmail_oauth_client"),
                                 "clients": [name for name, details in self.oauth.clients().items() if gmail_compatible_client(details)],
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
@@ -308,7 +312,7 @@ class AdminController:
         result = await self._commit(state, "connections/save")
         return {**result, "saved": True, "id": conn.id}
 
-    def preview_result(self, state, conn, added, definitions, session, *, proposal=None):
+    def preview_result(self, state, conn, added, definitions, session, *, proposal=None, staged_version=None):
         from .admin_remote import remote_tools
         cfg, _, _ = self.store.effective(state)
         kind = kind_of(conn)
@@ -340,11 +344,15 @@ class AdminController:
             raise Refused("too_many_drafts", 429)
         draft = secrets.token_urlsafe(24)
         self.drafts[draft] = {"state": state, "session": session["id"], "expires": time.time() + 600,
-                              "connection": conn.id, "remote": remote, "oauth_ref": conn.oauth_ref, "proposal": proposal}
+                              "connection": conn.id, "remote": remote, "oauth_ref": conn.oauth_ref, "proposal": proposal,
+                              "staged_version": staged_version}
+        grants = self.provisioning.require(proposal)["config"].get("grants", []) if proposal else []
+        if proposal:
+            self.provisioning.record_error(proposal, None)
         # Definitions can echo credentials. Scrub prior to displaying them too.
         scrubber = self._gateway(state).scrubber
         return {"draft": draft, "connection": conn.id, "definitions": scrubber.data(list({t.upstream: definitions[t.upstream] for t in conn.tools}.values())),
-                "owner": conn.owner, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote, "fixed_access": cli,
+                "owner": conn.owner, "proposal_grants": grants, "existing": any(c.id == conn.id for c in cfg.connections), "remote": remote, "fixed_access": cli,
                 "tools": [{"upstream": t.upstream, "access": tool_access(conn, t)} for t in conn.tools],
                 "oauth": self.oauth.status(conn.oauth_ref) if conn.oauth_ref else None}
 
@@ -389,16 +397,32 @@ class AdminController:
         return settings
 
     async def operate(self, operation, body, session, *, gmail_email=None):
-        proposal = None
+        proposal = staged_version = row = None
         if operation in ("oauth-clients/save", "connections/preview", "oauth/mcp/start"):
             proposal = body.pop("proposal", None)
             if proposal is not None:
-                self.provisioning.match(proposal, operation, body)
+                row = self.provisioning.require(proposal)
+                if row["config"].get("prepared"):
+                    staged_version = body.get("staged_version")
+                    body = self.provisioning.prepared_body(row, operation, body)
+                else:
+                    self.provisioning.match(proposal, operation, body)
         if operation == "oauth/mcp/start":
-            return await self.mcp_oauth.start(body, session, proposal=proposal)
+            try:
+                return await self.mcp_oauth.start(body, session, proposal=proposal)
+            except Refused as exc:
+                if proposal:
+                    self.provisioning.record_error(proposal, exc.code)
+                raise
         if operation == "oauth/mcp/complete":
             key = body.get("id")
-            flow = self.mcp_oauth.complete(key, session)
+            original = self.mcp_oauth.flows.get(key)
+            try:
+                flow = self.mcp_oauth.complete(key, session)
+            except Refused as exc:
+                if original and original.get("proposal") and original["session"] == session["id"]:
+                    self.provisioning.record_error(original["proposal"], exc.code)
+                raise
             if flow.get("proposal"):
                 self.provisioning.require(flow["proposal"])
             result = await self.finish_remote_oauth(flow, session)
@@ -628,8 +652,12 @@ class AdminController:
             if len(clients) >= 50:
                 raise Refused("oauth_client_limit", 409)
             clients[identifier] = details
+            if staged_version:
+                self.provisioning.mark_applied(row, state)
             result = await self._commit(state, operation)
             self.oauth.remember({"client": details})
+            if staged_version:
+                self.provisioning.finish_intake(proposal)
             return {**result, "id": identifier}
         if operation == "settings/gmail-oauth":
             from .admin_oauth import saved_gmail_client, store_gmail_client
@@ -839,24 +867,38 @@ class AdminController:
             except Exception as exc:
                 reason, incident = connector_failure(exc, conn.transport), secrets.token_hex(6)
                 self.runtime.gateway.audit.write("admin_connector_preview", reason=reason, detail=f"{incident}:{type(exc).__name__}")
+                if proposal:
+                    self.provisioning.record_error(proposal, reason)
                 raise Refused(reason, 422, incident=incident) from None
-            return self.preview_result(state, conn, added, definitions, session, proposal=proposal)
+            return self.preview_result(state, conn, added, definitions, session,
+                                       proposal=proposal, staged_version=staged_version)
         if operation == "connections/apply":
             draft = self.drafts.get(body.get("draft"))
             if not draft or draft["session"] != session["id"] or draft["expires"] <= time.time():
                 raise Refused("draft_expired", 409)
-            if draft["state"]["revision"] != self.store.state["revision"]:
-                raise Refused("configuration_changed", 409)
-            if body.get("reviewed") is not True:
-                raise Refused("review_required", 400)
-            if draft.get("proposal"):
-                self.provisioning.require(draft["proposal"])
-            draft = copy.deepcopy(draft)
-            if draft.get("remote"):
-                from .admin_remote import apply_selection
-                apply_selection(draft, body)
-            result = await self._commit(draft["state"], operation)
+            try:
+                if draft["state"]["revision"] != self.store.state["revision"]:
+                    raise Refused("configuration_changed", 409)
+                if body.get("reviewed") is not True:
+                    raise Refused("review_required", 400)
+                row = self.provisioning.require(draft["proposal"]) if draft["proposal"] else None
+                if draft["staged_version"]:
+                    self.provisioning.staged(row, draft["staged_version"])
+                draft = copy.deepcopy(draft)
+                if draft.get("remote"):
+                    from .admin_remote import apply_selection
+                    apply_selection(draft, body)
+                if row and row["config"].get("prepared"):
+                    self.provisioning.apply_grants(row, draft)
+                    self.provisioning.mark_applied(row, draft["state"])
+                result = await self._commit(draft["state"], operation)
+            except Refused as exc:
+                if draft["proposal"]:
+                    self.provisioning.record_error(draft["proposal"], exc.code)
+                raise
             self.drafts.pop(body["draft"], None)
+            if draft["staged_version"]:
+                self.provisioning.finish_intake(draft["proposal"])
             return result
         if operation == "connections/remove":
             name = body.get("id")
@@ -1095,6 +1137,48 @@ class AdminController:
             except Exception as exc:
                 return failure_response(exc, self.runtime.gateway.audit, _PAGE_HEADERS)
 
+        async def intake(request):
+            try:
+                if request.headers.get("host") != authority or "origin" in request.headers:
+                    raise Refused("wrong_origin")
+                scheme, _, token = request.headers.get("authorization", "").partition(" ")
+                if scheme.lower() != "bearer" or not 1 <= len(token) <= 512:
+                    raise Refused("invalid_intake_token", 401)
+                identifier = request.path_params["identifier"]
+                if not re.fullmatch(r"[0-9a-f]{32}", identifier):
+                    raise Refused("not_found", 404)
+                body = None
+                if request.method == "PUT":
+                    if not re.fullmatch(r"agw_intake_[A-Za-z0-9_-]{43}", token):
+                        raise Refused("invalid_intake_token", 401)
+                    if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+                        raise Refused("invalid_argument", 400)
+                    raw = bytearray()
+                    async for chunk in request.stream():
+                        raw.extend(chunk)
+                        if len(raw) > 16000:
+                            raise Refused("request_too_large", 413)
+                    try:
+                        body = json.loads(raw)
+                        if not isinstance(body, dict):
+                            raise ValueError()
+                    except (ValueError, UnicodeError):
+                        raise Refused("invalid_argument", 400) from None
+                async with self.editing():
+                    if request.method == "POST":
+                        gateway = self.runtime.gateway
+                        caller = await StaticTokenVerifier(gateway.cfg.clients).verify_token(token)
+                        if caller is None:
+                            raise Refused("invalid_intake_token", 401)
+                        result = self.provisioning.issue_intake(self.provisioning.require(identifier), caller)
+                    else:
+                        result = self.provisioning.stage(self.provisioning.require(identifier), token, body)
+                return _json(result, 200)
+            except Refused as exc:
+                return _json({"error": exc.code}, exc.status)
+            except Exception as exc:
+                return failure_response(exc, self.runtime.gateway.audit, _PAGE_HEADERS)
+
         async def oauth_callback(request):
             # Cross-site provider navigation has no SameSite=Strict cookie. The
             # one-use state is bound to a still-live session; only that session
@@ -1120,4 +1204,5 @@ class AdminController:
                 Route("/admin/oauth/google/callback", oauth_callback),
                 Route("/admin/oauth/mcp/callback", oauth_callback),
                 Route("/admin/assets/{name}", asset),
+                Route("/admin/intake/{identifier}", intake, methods=["POST", "PUT"]),
                 Route("/admin/api/{operation:path}", api, methods=["GET", "POST"])]

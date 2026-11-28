@@ -560,10 +560,22 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 `gateway_config_read` 或 `gateway_config_provision`。读工具列出可选 OAuth client 引用、
 该 Agent 已获准的远程连接和自己的申请状态。结果不含凭据。
 
-预注册 OAuth client 缺失时，先提交 `{"kind":"oauth_client","id":"example","issuer":"https://auth.example.test"}`。
+在新申请中设置 `"prepared": true`，让管理员直接审阅并批准。对预注册 OAuth 客户端，提交 `kind`、`id` 和 `issuer`。
+对 `http_mcp`，提交端点和认证方式。需要授权 Agent 时，加入 `grants`，每项给出 `client`、上游工具名 `tool` 和 `access`。
+可用权限是 `read`、`write`（调用时需审批）、`write_direct`（调用时无需审批）。
+
+需要凭据时，由获授权的程序将 JSON 经标准输入传给 `agw stage <网关 HTTPS 地址> <申请 ID>`。
+程序从已有安全配置读取申请者的 `AGW_AGENT_TOKEN`。OAuth 客户端使用 `client_id`、`client_secret` 和可选的 `auth_method`。
+Bearer 或 Header 认证使用 `token`。凭据有效期为 15 分钟，且不会超过申请有效期。管理员在「待审接入申请」核对配置和权限。
+需要 OAuth 同意时，先完成上游授权，再审阅工具及其读写类型并应用。申请者用 `gateway_config_read` 确认当前状态。
+
+未设置 `prepared` 的申请沿用原表单。预注册 OAuth client 缺失时，先提交 `{"kind":"oauth_client","id":"example","issuer":"https://auth.example.test"}`。
 管理员在「待审接入申请」打开表单，用 Passkey 保存已在提供商处登记的 client。再提交 `http_mcp` 类型的
 申请，填写 `id`、`url`、`auth`，需要时填写 `oauth_client` 和 `scope`。使用自动注册时留空
 `oauth_client`。审批前网关只保存待审记录，操作队列和待审列表中的申请字段均加密。管理员确认预览并保存连接后，继续在「权限」按现有规则授予服务工具。
+
+降级到 0.27.0 时，已应用的连接、客户端和权限保留。新版待审申请保存在 `admin.enc.prepared`，旧版只显示旧格式的申请。
+`admin.enc.staged` 是短期凭据暂存文件。恢复新版后，过期的暂存凭据需要重新投递。
 
 降级到有「网关配置」连接器的 0.25.0 或 0.26.0 时，可沿用当前连接和授权。降级到更早的版本时，先切回支持移除此连接器的 0.26.0 并在管理页移除。让队列中仍待 Passkey 审批的配置提交过期，或使用
 `agw approval cancel <id>` 取消。备份申请记录时包含 `approvals.sqlite` 与 `admin.enc.proposals`。
