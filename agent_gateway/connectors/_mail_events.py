@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -141,20 +141,23 @@ class MailEvents:
             return
         if len(pending) == 1:
             key = pending[0]
-            counts = [self._send(self._targets[key], queues[key])]
-        else:
-            with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as pool:
-                counts = list(pool.map(self._send, (self._targets[key] for key in pending),
-                                       (queues[key] for key in pending)))
-        for key, count in zip(pending, counts, strict=True):
-            del queues[key][:count]
-            if queues[key]:
-                delay = min(max(self._delivery_wait.get(key, (0, 0))[1] * 2, INTERVAL), MAX_DELAY)
-                self._delivery_wait[key] = (now + delay, delay)
-            else:
-                self._delivery_wait.pop(key, None)
-        if any(counts):
+            self._finish_delivery(state, key, self._send(self._targets[key], queues[key]), now)
+            return
+        with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as pool:
+            deliveries = {pool.submit(self._send, self._targets[key], queues[key]): key for key in pending}
+            for delivery in as_completed(deliveries):
+                self._finish_delivery(state, deliveries[delivery], delivery.result(), now)
+
+    def _finish_delivery(self, state: dict[str, Any], key: str, count: int, now: float) -> None:
+        outbox = state["queues"][key]
+        if count:
+            del outbox[:count]
             self._save(state)
+        if outbox:
+            delay = min(max(self._delivery_wait.get(key, (0, 0))[1] * 2, INTERVAL), MAX_DELAY)
+            self._delivery_wait[key] = (now + delay, delay)
+        else:
+            self._delivery_wait.pop(key, None)
 
     def _send(self, target: DeliveryTarget, outbox: list[dict[str, Any]]) -> int:
         done = 0

@@ -12,6 +12,7 @@ import fcntl
 import json
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -25,6 +26,7 @@ from helpers import base_config, prepare, running_gateway
 from imapclient import IMAPClient
 from passkey_helpers import approval_config
 from service_helpers import FakeGoogle, WebhookReceiver, free_port, mail_account
+from starlette.responses import Response
 from test_admin import change, login, setup, state, web_gateway
 from test_connector_mail import mail_connection
 
@@ -34,6 +36,7 @@ from agent_gateway.connectors import _mail_events
 from agent_gateway.connectors._mail_events import INTERVAL, DeliveryTarget, GmailSource, ImapSource, MailEvents
 from agent_gateway.connectors.gmail import Gmail
 from agent_gateway.connectors.imap_mail import Mailbox
+from agent_gateway.credentials import EncryptedFileStore
 from agent_gateway.upstream import Upstream
 
 pytestmark = pytest.mark.anyio
@@ -571,6 +574,72 @@ def web_config(port: int, google, url: str, **entry) -> dict:
     return out
 
 
+async def test_gateway_restart_does_not_retry_a_target_that_confirmed_while_another_was_waiting(
+    tmp_path, google, receiver,
+):
+    release = threading.Event()
+
+    class SlowReceiver(WebhookReceiver):
+        waiting_id = None
+
+        async def _receive(self, request):
+            if self.waiting_id is None:
+                self.waiting_id = request.headers["x-openbot-delivery-id"]
+                while not release.is_set():
+                    await anyio.sleep(0.02)
+                return Response(status_code=503)
+            return await super()._receive(request)
+
+    slow = SlowReceiver(SIGNING_SECRET)
+    try:
+        refresh = SECRETS["gmail_token_a"]
+        google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
+        config = web_config(free_port(), google, receiver.url)
+        config["mail_events"] = []
+        path = await prepare(tmp_path, config, secrets={**BASE_SECRETS, **SECRETS})
+        cfg = load_config(path)
+        store = EncryptedFileStore(cfg.admin.state, cfg.secrets.key_file)
+        store.set("state", json.dumps({
+            "revision": 0, "config": {}, "secrets": {}, "locks": {},
+            "mail_webhooks": {
+                name: {"label": name, "url": destination.url, "event_type": "mail.new",
+                       "secret": SIGNING_SECRET, "bindings": {"gmail-a": name}}
+                for name, destination in (("slow", slow), ("fast", receiver))
+            },
+        }))
+        outbox_path = cfg.audit.path.parent / "connectors" / "gmail-a" / "mail-events-web.json"
+        outbox_path.parent.mkdir(parents=True)
+        outbox_path.write_text(json.dumps({"cursor": {"history_id": "1000"}, "checked_at": time.time() - 60}))
+        google.add_message(refresh, "18c0a8", raw("new mail for both receivers"))
+
+        def queues():
+            return json.loads(outbox_path.read_text())["queues"]
+
+        async with running_gateway(path):
+            with anyio.fail_after(10):
+                while not receiver.events or slow.waiting_id is None:
+                    await anyio.sleep(0.02)
+            with anyio.move_on_after(2):
+                while queues()["fast"]:
+                    await anyio.sleep(0.02)
+            confirmed_before_restart = not queues()["fast"]
+            assert [item["id"] for item in queues()["slow"]] == [slow.waiting_id]
+
+        # Keep the first request blocked until the replacement gateway retries it.
+        async with running_gateway(path):
+            with anyio.fail_after(10):
+                while not slow.events or any(queues().values()):
+                    await anyio.sleep(0.02)
+
+        assert slow.attempts == [(slow.waiting_id, 202)]
+        assert [status for _, status in receiver.attempts] == [202]
+        assert confirmed_before_restart
+        assert slow.events == receiver.events
+    finally:
+        release.set()
+        slow.close()
+
+
 async def test_webhook_configuration_requires_confirmation_and_reloads_both_mailboxes(tmp_path):
     port = free_port()
     first_url = "https://signal.openbot.run/v1/webhooks/first-target"
@@ -610,6 +679,15 @@ async def test_webhook_configuration_requires_confirmation_and_reloads_both_mail
             assert signing_key.encode() not in (path.parent / "admin.enc").read_bytes()
             assert (await change(http, operation, **{**first, "url": first_url + "-changed", "secret": ""})).json()[
                 "error"] == "mail_webhook_secret_required"
+            before = json.loads(runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"])
+            first.update(url=first_url + "-changed", secret="replacement-key")
+            reply = await change(http, operation, **first)
+            assert reply.status_code == 200, reply.text
+            after = json.loads(runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"])
+            assert {key: target for key, target in before.items() if target["url"] == second_url} == {
+                key: target for key, target in after.items() if target["url"] == second_url}
+            assert len(before.keys() & after.keys()) == 1
+            assert next(after[key]["url"] for key in after.keys() - before.keys()) == first["url"]
 
         async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
             await login(http, key, origin)
@@ -619,7 +697,7 @@ async def test_webhook_configuration_requires_confirmation_and_reloads_both_mail
             runtime = gw.app.state.runtime
             assert runtime.gateway.upstreams["imap-a"].extra_env is None
             gmail_targets = runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"]
-            assert gmail_targets != first_targets and second_url in gmail_targets and first_url not in gmail_targets
+            assert gmail_targets != first_targets and second_url in gmail_targets and first["url"] not in gmail_targets
 
 
 @pytest.mark.browser
