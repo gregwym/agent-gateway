@@ -87,12 +87,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     lock = Lock.load(cfg.lock_file)
     # Built without secrets: this only inspects routes, it never connects.
     gateway = Gateway(cfg, lock, {name: "" for name in cfg.secret_names()}, Audit(None))
+    web_mail_targets = {}
     if cfg.admin:
+        from . import mail_webhooks
         from .admin_config import ManagedStore
         gateway.secrets = resolve_secrets(cfg)
         store = ManagedStore(gateway)
         cfg, lock, values = store.effective(store.state)
-        gateway = Gateway(cfg, lock, values, Audit(None))
+        web_mail_targets = mail_webhooks.runtime_targets(store.state, cfg)
+        gateway = Gateway(cfg, lock, values, Audit(None), web_mail_targets=web_mail_targets)
     else:
         from .catalog_sync import sync_catalog
         cfg, lock, _, _ = sync_catalog(cfg, lock)
@@ -146,10 +149,15 @@ def cmd_check(args: argparse.Namespace) -> int:
             hint = " (run `agw lock`)" if route.problem == "not_locked" else ""
             problems.append(f"tool {name} will not be served: {route.problem}{hint}")
     for event in cfg.mail_events:
+        if event.connection in web_mail_targets:
+            continue
         if event.connection in gateway.unused_mail_events:
             problems.append(f"mail_events {event.connection}: no bundled Gmail or IMAP connection has this id")
         else:
             print(f"new-mail events: {event.connection} -> {urlsplit(event.url).hostname} (type {event.type})")
+    for connection, targets in web_mail_targets.items():
+        for target in targets.values():
+            print(f"new-mail events: {connection} -> {urlsplit(target['url']).hostname} (type {target['event_type']})")
     try:
         if not cfg.admin:
             resolve_secrets(cfg)

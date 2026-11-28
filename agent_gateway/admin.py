@@ -14,7 +14,7 @@ import anyio
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
-from . import __version__, audit_history, registry
+from . import __version__, audit_history, mail_webhooks, registry
 from .admin_auth import AdminAuth, COOKIE
 from .admin_web_login import WebsiteLogin
 from .admin_config import (
@@ -58,6 +58,7 @@ def needs_admin_confirmation(operation, body):
         "members/enroll", "passkeys/remove", "clients/create", "clients/rotate", "tools/restrict",
         "connections/preview", "connections/save", "connections/apply", "oauth/start", "oauth/mcp/start",
         "settings/gmail-oauth", "oauth-clients/save", "proposals/reject", "web-login/start", "web-login/terminate",
+        "settings/mail-webhooks",
         "web-catalog/publisher", "web-catalog/origins",
     }
 
@@ -91,7 +92,8 @@ class AdminController:
         from .server import Gateway
         cfg, lock, values = self.store.effective(state)
         result = Gateway(cfg, lock, values, self.runtime.gateway.audit, self.runtime.gateway.approver,
-                         self.oauth, self.web_sessions, self.provisioning)
+                         self.oauth, self.web_sessions, self.provisioning,
+                         web_mail_targets=mail_webhooks.runtime_targets(state, cfg))
         from .catalog_sync import catalog_revision
         result.website_catalogs = self.website_catalogs
         result.configuration_revision = "web:" + str(state["revision"]) + ":" + catalog_revision(cfg, lock)
@@ -235,6 +237,7 @@ class AdminController:
                 "connections": connections, "passkeys": keys,
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
                 "oauth_clients": self.oauth.list_clients(),
+                "mail_webhooks": mail_webhooks.view(self.store.state, gw.cfg),
                 "config_proposals": [self.provisioning.view(row) for row in self.provisioning.rows()],
                 "gmail_oauth": {"default": self.store.state.get("gmail_oauth_client"),
                                 "clients": [name for name, details in self.oauth.clients().items() if gmail_compatible_client(details)],
@@ -601,6 +604,11 @@ class AdminController:
             return {"ok": True, "read_tool": probe}
 
         self._revision(body)
+        if operation == "settings/mail-webhooks":
+            state = self.store.candidate()
+            key = mail_webhooks.stage(state, self.runtime.gateway.cfg, body)
+            result = await self._commit(state, operation)
+            return {**result, "id": key}
         if operation == "settings/language":
             if set(body) != {"revision", "language"} or body["language"] not in ("auto", "en", "zh-CN"):
                 raise Refused("invalid_language", 400)
@@ -776,6 +784,8 @@ class AdminController:
             if any(event.connection == name for event in self.store.base.mail_events):
                 # gateway.yaml names it for new-mail events and the web cannot change that file (docs/deployment.md 5.4).
                 raise Refused("mail_events_rename_first", 409)
+            if any(name in target["bindings"] for target in state.get("mail_webhooks", {}).values()):
+                raise Refused("mail_webhook_disable_first", 409)
             _, lock, _ = self.store.effective(state)
             conn["id"] = renamed
             for rule in raw["policy"]:
@@ -856,6 +866,8 @@ class AdminController:
             raw["policy"] = [p for p in raw["policy"] if p["connection"] != name]
             state["locks"].pop(name, None)
             state.get("website_catalogs", {}).pop(name, None)
+            for target in state.get("mail_webhooks", {}).values():
+                target["bindings"].pop(name, None)
             referenced = {n for c in raw["connections"] for n in [*c.get("secret_env", {}).values(),
                           *c.get("secret_headers", {}).values(), c.get("bearer_secret")] if n}
             state["secrets"] = {k: v for k, v in state["secrets"].items() if k in referenced}

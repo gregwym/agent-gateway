@@ -192,6 +192,12 @@ const messages = {
   invalid_connector_name: ['Connector names must start with a lowercase letter and use up to 32 lowercase letters, numbers, underscores, or hyphens.', '连接器名称须以小写字母开头，最多 32 个小写字母、数字、下划线或连字符。'],
   duplicate_connector: ['This connector name already exists. Choose another name.', '此连接器名称已存在，请使用其他名称。'],
   mail_events_rename_first: ['This connector sends new-mail events. First put the new name under mail_events in gateway.yaml and restart the gateway, then rename it here.', '此连接器在发送新邮件通知。请先在 gateway.yaml 的 mail_events 里改成新名称并重启网关，再在这里改名。'],
+  mail_webhook_disable_first: ['Remove this mailbox from its new-mail webhooks before renaming it.', '请先在新邮件通知里解除这个邮箱的绑定，再改名。'],
+  mail_webhook_invalid: ['Enter a name, a valid OpenBot webhook URL and event type, and select a mailbox for a new webhook.', '请填写名称、有效的 OpenBot webhook 地址和事件类型。新增时至少选一个邮箱。'],
+  mail_webhook_duplicate: ['This webhook URL is already configured.', '这个 webhook 地址已经配置。'],
+  mail_webhook_limit: ['A mailbox can notify up to eight webhooks.', '每个邮箱最多可通知八个 webhook。'],
+  mail_webhook_secret_required: ['Enter a signing key for a new webhook URL.', '请为新的 webhook 地址输入签名密钥。'],
+  mail_webhook_takeover_required: ['Confirm that web settings should replace the selected host-managed notifications.', '请确认由网页接管选中的主机通知配置。'],
   invalid_mailbox_email: ['Enter a full mailbox email address.', '请填写完整的邮箱地址。'],
   invalid_mailbox_aliases: ['Enter up to 50 full email addresses, one per line.', '请填写完整的邮箱别名，每行一个，最多 50 个。'],
   website_origin_invalid: ['Enter up to eight distinct public HTTPS origins, with no paths or port numbers.', '请输入公网 HTTPS 网站地址，不含路径或端口，最多八个 API 地址。'],
@@ -1099,6 +1105,50 @@ function systemSettings() {
   for (const client of state.oauth_clients) el(card, 'p', client.id + ' · ' + client.issuer);
   button(card, tr('Add OAuth client', '添加 OAuth 客户端'), remoteOAuthClientDialog);
   button(card, tr('Import Google OAuth client', '导入 Google OAuth 客户端'), gmailClientDialog);
+  const webhooks = state.mail_webhooks;
+  if (!webhooks.mailboxes.length && !webhooks.targets.length) return;
+  const notifications = el(app, 'section', undefined, 'card');
+  el(notifications, 'h2', tr('New-mail notifications', '新邮件通知'));
+  for (const target of webhooks.targets) {
+    const row = el(notifications, 'div', undefined, 'actions');
+    el(row, 'span', target.label + ' · ' + (target.connections.join(', ') || tr('Off', '已停用')));
+    button(row, tr('Edit', '编辑'), () => mailWebhookDialog(target));
+  }
+  if (webhooks.mailboxes.length) {
+    button(notifications, tr('Add OpenBot webhook', '添加 OpenBot webhook'), () => mailWebhookDialog());
+  }
+}
+
+function mailWebhookDialog(target) {
+  const box = modal(target ? tr('Edit OpenBot webhook', '编辑 OpenBot webhook') : tr('Add OpenBot webhook', '添加 OpenBot webhook'));
+  const label = field(box, tr('Name', '名称'), 'webhook_label', target?.label);
+  const url = field(box, tr('Webhook URL', 'Webhook 地址'), 'webhook_url', target?.url, 'url');
+  const event = field(box, tr('Event type', '事件类型'), 'webhook_event_type', target?.event_type || 'mail.new');
+  const key = field(box, tr('Signing key', '签名密钥'), 'webhook_signing_key', '', 'password', target
+    ? tr('Leave blank to keep the current key if the URL is unchanged.', '地址不变时，留空会保留当前密钥。') : '');
+  key.autocomplete = 'new-password';
+  const group = el(box, 'fieldset');
+  el(group, 'legend', tr('Mailboxes', '邮箱'));
+  const checkboxes = state.mail_webhooks.mailboxes.map(id => {
+    const item = el(group, 'label');
+    const checkbox = el(item, 'input'); checkbox.type = 'checkbox'; checkbox.value = id;
+    checkbox.checked = target?.connections.includes(id) || false;
+    el(item, 'span', id + (state.mail_webhooks.host_managed.includes(id) ? tr(' (host-managed)', '（由主机管理）') : ''));
+    return checkbox;
+  });
+  const takeover = el(box, 'label');
+  const allow = el(takeover, 'input'); allow.type = 'checkbox';
+  el(takeover, 'span', tr('Replace the host notification for the selected mailboxes', '由网页接管所选邮箱的主机通知配置'));
+  const selected = () => checkboxes.filter(node => node.checked).map(node => node.value);
+  const showTakeover = () => { takeover.hidden = !selected().some(id => state.mail_webhooks.host_managed.includes(id)); };
+  for (const checkbox of checkboxes) checkbox.addEventListener('change', showTakeover);
+  showTakeover();
+  button(box, tr('Save webhook', '保存 webhook'), async () => {
+    await mutate('settings/mail-webhooks', {id: target?.id || '', label: label.value.trim(), url: url.value.trim(),
+      event_type: event.value.trim(), secret: key.value, connections: selected(), take_over: !takeover.hidden && allow.checked});
+    key.value = '';
+    box.close();
+  }, 'primary', tr('Saving…', '正在保存…'));
 }
 
 function remoteOAuthClientDialog(proposal) {
