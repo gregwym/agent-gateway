@@ -53,7 +53,7 @@ const messages = {
   oauth_client_settings_invalid: ["Check the OAuth client ID, secret and token authentication method. Use either a registered client or a client metadata URL.", "请核对 OAuth 客户端 ID、密钥和 Token 认证方式；已注册客户端与客户端元数据 URL 只能选一种。"],
   proposal_not_pending: ['This request is no longer pending. Reload the connector list.', '这条申请已结束，请刷新连接器列表。'],
   proposal_changed: ['The connector settings differ from the provisioning request.', '连接器设置与接入申请不一致。'],
-  invalid_configuration_connector: ['Create at most one configuration connector, owned by the gateway administrator.', '网关配置连接器只能由管理员持有，且最多创建一个。'],
+  invalid_configuration_connector: ['The gateway manages its built-in configuration connector.', '网关自动管理内置的网关配置连接器。'],
   oauth_client_exists: ['This name is already used by an OAuth client. Choose a different name.', '该名称已被 OAuth 客户端使用，请选择另一个名称。'],
   oauth_client_limit: ['The gateway has reached its limit for saved OAuth clients.', '网关已达 OAuth 客户端数量上限。'],
   oauth_client_unavailable: ['The selected OAuth client is unavailable. Refresh and choose a saved client.', '所选 OAuth 客户端不可用，请刷新后选择已登记的客户端。'],
@@ -851,7 +851,7 @@ function connectorDetails(id) {
       await refresh(); populate();
       notify(conn.kind === 'web' ? tr('Site reachable. Sign-in was not tested.', '网站可达，未验证登录状态。') : remote ? tr('MCP check passed.', 'MCP 验证通过。') : tr('Read check passed.', '读取验证通过。'));
     }, 'primary', tr('Testing connection…', '正在验证连接…'));
-    button(actions, tr('Rename', '改名'), () => renameConnector(conn, box));
+    if (conn.kind !== 'gateway_config') button(actions, tr('Rename', '改名'), () => renameConnector(conn, box));
     if (conn.kind === 'web') button(actions, tr('API description', 'API 描述'), async () => {
       const initial = await api('web-catalog/view', {id});
       websiteCatalog(conn, initial);
@@ -869,7 +869,7 @@ function connectorDetails(id) {
         notify(result.provider === 'revoked' ? tr('Authorization revoked locally and at the provider.', '已在网关和服务商撤销授权。') : result.provider === 'unsupported' ? tr('Gateway tokens cleared. The provider has no revocation endpoint; remove the grant in its account settings if needed.', '网关 Token 已清除。服务商未提供撤销接口，需要时请在其账号设置中移除授权。') : tr('Gateway tokens cleared. The provider revocation request failed; remove the grant in its account settings.', '网关 Token 已清除。服务商撤销请求失败，请在其账号设置中移除授权。'));
       }), 'danger');
     }
-    button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permissions will also be removed.', '工具和权限也会一并移除。'), async () => { await mutate('connections/remove', {id}); box.close(); }), 'danger');
+    if (conn.kind !== 'gateway_config') button(actions, tr('Remove', '移除'), () => confirmAction(tr('Remove connector?', '移除连接器？'), tr('Its tools and permissions will also be removed.', '工具和权限也会一并移除。'), async () => { await mutate('connections/remove', {id}); box.close(); }), 'danger');
   }
   populate();
 }
@@ -1058,7 +1058,7 @@ function gmailAccessLabels() {
     read_organize_send: tr('Read, organize, and send', '读取、整理和发送'),
   };
 }
-function gmailSettings(parent, existing, reauthorize) {
+function gmailSettings(parent, existing) {
   const settings = {};
   settings.gmail_access = select(parent, tr('Google permissions', 'Google 权限'), 'gmail_access',
     Object.entries(gmailAccessLabels()), existing?.settings.gmail_access || 'read');
@@ -1074,15 +1074,19 @@ function gmailSettings(parent, existing, reauthorize) {
   }
   settings.gmail_access.addEventListener('change', scopeNote); scopeNote();
 
-  const clientId = state.gmail_oauth.client_id;
-  if (!existing?.settings.client_id && !clientId) {
-    const link = el(parent, 'a', tr('Set up Gmail OAuth in Settings', '在「设置」中配置 Gmail OAuth'));
+  const {clients, default: defaultClient} = state.gmail_oauth;
+  const choices = clients.map(id => [id, id]);
+  if (existing?.settings.client_id) choices.unshift(['', tr('Keep the current client', '保留当前客户端')]);
+  if (choices.length) settings.oauth_client = select(parent, tr('System OAuth client', '系统 OAuth 客户端'), 'oauth_client',
+    choices, existing?.settings.client_id ? '' : defaultClient || clients[0]);
+  else {
+    const link = el(parent, 'a', tr('Add a Google OAuth client in Settings', '在「设置」中添加 Google OAuth 客户端'));
     link.href = tabUrls.settings;
     link.addEventListener('click', event => { event.preventDefault(); link.closest('dialog').close(); navigate('settings'); });
   }
-  const useSystemClient = existing && clientId ? checkbox(parent, tr('Use the system OAuth client on reauthorization', '重新授权时使用系统 OAuth 客户端'), reauthorize && clientId !== existing.settings.client_id) : null;
-  return {settings, useSystemClient};
+  return settings;
 }
+
 function systemSettings() {
   el(app, 'h1', tr('Settings', '设置'));
   const preferences = el(app, 'section', undefined, 'card');
@@ -1091,19 +1095,14 @@ function systemSettings() {
     [['auto', tr('Follow browser', '跟随浏览器')], ['en', 'English'], ['zh-CN', '简体中文']], state.language);
   button(preferences, tr('Save language', '保存语言'), () => mutate('settings/language', {language: language.value}));
   const card = el(app, 'section', undefined, 'card');
-  const remote = el(app, 'section', undefined, 'card');
-  el(remote, 'h2', tr('Remote MCP OAuth clients', '远程 MCP OAuth 客户端'));
-  for (const client of state.oauth_clients) el(remote, 'p', client.id + ' · ' + client.issuer);
-  button(remote, tr('Add OAuth client', '添加 OAuth 客户端'), remoteOAuthClientDialog);
-  el(card, 'h2', 'Gmail OAuth');
-  const {client_id: id} = state.gmail_oauth;
-  el(card, 'p', id ? tr('Configured for new Gmail connections.', '新建 Gmail 连接将使用这套配置。') :
-    tr('Set up one OAuth client for Gmail. Authorize each mailbox separately.', '配置一套 Gmail OAuth 客户端，每个邮箱单独授权。'), 'muted');
-  if (id) el(card, 'code', id, 'url');
-  button(card, id ? tr('Change OAuth client', '更换 OAuth 客户端') : tr('Configure OAuth client', '配置 OAuth 客户端'), gmailClientDialog);
+  el(card, 'h2', tr('System OAuth clients', '系统 OAuth 客户端'));
+  for (const client of state.oauth_clients) el(card, 'p', client.id + ' · ' + client.issuer);
+  button(card, tr('Add OAuth client', '添加 OAuth 客户端'), remoteOAuthClientDialog);
+  button(card, tr('Import Google OAuth client', '导入 Google OAuth 客户端'), gmailClientDialog);
 }
+
 function remoteOAuthClientDialog(proposal) {
-  const box = modal(tr('Add remote MCP OAuth client', '添加远程 MCP OAuth 客户端'));
+  const box = modal(tr('Add system OAuth client', '添加系统 OAuth 客户端'));
   const id = connectorNameField(box, proposal?.config.id || '');
   const issuer = field(box, 'Issuer', 'issuer', proposal?.config.issuer || '', 'url');
   id.readOnly = issuer.readOnly = Boolean(proposal);
@@ -1111,7 +1110,9 @@ function remoteOAuthClientDialog(proposal) {
   const clientSecret = field(box, tr('OAuth client secret', 'OAuth 客户端密钥'), 'client_secret', '', 'password');
   const method = select(box, tr('Client authentication', '客户端认证'), 'auth_method',
     [['none', tr('Public client (no secret)', '公共客户端（无密钥）')], ['client_secret_post', 'Client secret in POST'], ['client_secret_basic', 'Client secret in Basic header']], 'client_secret_post');
+  el(box, 'p', tr('Register the callback for each connector type that uses this client.', '请登记使用此客户端的各类连接器的回调地址。'), 'muted');
   el(box, 'code', location.origin + '/admin/oauth/mcp/callback', 'url');
+  el(box, 'code', location.origin + '/admin/oauth/google/callback', 'url');
   button(box, tr('Save OAuth client', '保存 OAuth 客户端'), async () => {
     await mutate('oauth-clients/save', {id: id.value.trim(), issuer: issuer.value.trim(),
       client_id: clientId.value.trim(), client_secret: clientSecret.value, auth_method: method.value,
@@ -1125,7 +1126,7 @@ function gmailClientDialog() {
   const saved = state.gmail_oauth.saved_clients;
   const source = saved.length ? select(box, tr('Client configuration', '客户端配置'), 'gmail_client_source',
     [['', tr('Import JSON or enter credentials', '导入 JSON 或填写凭据')], ...saved.map(id => [id, tr('Use client from: ', '采用连接中的客户端：') + id])],
-    state.gmail_oauth.client_id ? '' : saved[0]) : null;
+    state.gmail_oauth.default ? '' : saved[0]) : null;
   const parent = el(box, 'div');
   const {clientId, clientSecret} = googleClientFields(parent);
   function toggleImport() { parent.hidden = Boolean(source?.value); }
@@ -1215,11 +1216,11 @@ function connectorForm(existing, reauthorize = false, proposal) {
   const seed = existing?.settings || proposal?.config || {};
   const box = modal(existing ? tr('Edit connector', '编辑连接器') : tr('Add connector', '添加连接器'));
   const form = el(box, 'form'); form.addEventListener('submit', e => e.preventDefault());
-  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).filter(([key]) => key !== 'local' || existing || state.plugins?.some(p => p.kind !== 'web')).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = Boolean(existing || proposal);
+  const kind = select(form, tr('Service', '服务'), 'kind', Object.entries(state.catalog).filter(([key]) => key !== 'gateway_config' && (key !== 'local' || existing || state.plugins?.some(p => p.kind !== 'web'))).map(([key, spec]) => [key, spec.label]), existing?.kind || 'remote'); kind.disabled = Boolean(existing || proposal);
   const fixed = el(form, 'div', undefined, 'form-grid');
   const name = connectorNameField(fixed, existing?.id || proposal?.config.id || ''); name.disabled = !!existing; name.readOnly = !!proposal;
   const owner = select(fixed, tr('Account owner', '账号所有者'), 'owner', [...state.members.map(m => [m.id, m.name]), ...state.households.map(h => [h.id, tr('Group: ', '群组共享：') + h.name])], existing?.owner || state.owner); owner.disabled = !!existing;
-  const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider, useSystemClient;
+  const dynamic = el(form, 'div'); let settings = {}, credentials = {}, mailProvider;
   const labels = {username: tr('Account email / username', '账号邮箱 / 用户名'), host: tr('IMAP server', 'IMAP 服务器'), port: tr('TLS port', 'TLS 端口'),
     smtp_host: tr('SMTP server (blank disables sending)', 'SMTP 服务器（留空关闭发信）'), smtp_port: tr('SMTP port', 'SMTP 端口'),
     smtp_security: tr('SMTP encryption', 'SMTP 加密方式'), smtp_username: tr('SMTP username (optional override)', 'SMTP 用户名（可选覆盖）'),
@@ -1227,9 +1228,9 @@ function connectorForm(existing, reauthorize = false, proposal) {
     url: tr('HTTPS service URL', '服务 HTTPS 地址'), timezone: tr('Time zone', '时区'), password: tr('App-specific password', 'App 专用密码'),
     token: tr('Helper bearer token', '辅助服务 Bearer Token')};
   function fields() {
-    dynamic.replaceChildren(); settings = {}; credentials = {}; mailProvider = null; useSystemClient = null;
+    dynamic.replaceChildren(); settings = {}; credentials = {}; mailProvider = null;
     if (kind.value === 'gmail') {
-      ({settings, useSystemClient} = gmailSettings(dynamic, existing, reauthorize));
+      settings = gmailSettings(dynamic, existing);
       return;
     }
     const spec = state.catalog[kind.value];
@@ -1361,7 +1362,10 @@ function connectorForm(existing, reauthorize = false, proposal) {
         delete values.client_secret;
       }
     }
-    if (kind.value === 'gmail' && !systemGmail()) fields.client_id = existing.settings.client_id;
+    if (kind.value === 'gmail' && !fields.oauth_client) {
+      delete fields.oauth_client;
+      if (existing?.settings.client_id) fields.client_id = existing.settings.client_id;
+    }
     return {revision, id: name.value, kind: kind.value, owner: owner.value, settings: fields, credentials: values,
       ...(proposal && {proposal: proposal.id})};
   }
@@ -1377,9 +1381,8 @@ function connectorForm(existing, reauthorize = false, proposal) {
         .some(key => settings[key].value !== (existing?.settings[key] || '')))
     );
   }
-  function systemGmail() { return !existing?.settings.client_id || Boolean(useSystemClient?.checked); }
   function gmailConsent() {
-    return kind.value === 'gmail' && (systemGmail() || reauthorize || settings.gmail_access.value !== (existing.settings.gmail_access || 'read'));
+    return kind.value === 'gmail' && (!existing || settings.oauth_client?.value || reauthorize || settings.gmail_access.value !== (existing.settings.gmail_access || 'read'));
   }
   function saveLabel() {
     if (kind.value === 'web') return credentials.AGwSessionUpload?.files?.length
@@ -1433,7 +1436,7 @@ function connectorForm(existing, reauthorize = false, proposal) {
   save.classList.add('connector-save');
   kind.addEventListener('change', fields);
   function updateSave() {
-    save.hidden = (kind.value === 'gmail' && systemGmail() && !state.gmail_oauth.client_id)
+    save.hidden = (kind.value === 'gmail' && !existing && !settings.oauth_client?.value)
       || (kind.value === 'web' && !state.website_login && !credentials.AGwSessionUpload?.files?.length);
     if (!save.disabled) save.textContent = saveLabel();
   }

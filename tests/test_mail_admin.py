@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from agent_gateway import catalog_sync
 from helpers import SECRETS, TOKEN_A, prepare
 from passkey_helpers import Page, approval_config, request_id_in
 from service_helpers import free_port, mail_account
@@ -17,7 +18,9 @@ pytestmark = pytest.mark.anyio
 @pytest.mark.parametrize('operation', ['connections/preview', 'connections/review-tools'])
 async def test_review_extends_existing_mail_and_preserves_original_restrictions(tmp_path, operation, monkeypatch):
     # Non-bundled/externally managed connectors retain the manual review path.
-    monkeypatch.setattr('agent_gateway.catalog_sync.bundled_manifest', lambda conn: None)
+    bundled_manifest = catalog_sync.bundled_manifest
+    monkeypatch.setattr(catalog_sync, 'bundled_manifest',
+                        lambda conn: None if conn.id == 'mail' else bundled_manifest(conn))
     with mail_account(tmp_path / 'server', 'account@example.test', 'fake-app-password') as account:
         port = free_port()
         origin = f'http://localhost:{port}'
@@ -45,7 +48,8 @@ async def test_review_extends_existing_mail_and_preserves_original_restrictions(
             assert preview.status_code == 200, preview.text
             assert len(preview.json()['definitions']) == 11
             assert (await rpc(origin, TOKEN_A)).json()['result']['tools'] == before  # preview is read-only
-            assert (await change(http, 'connections/apply', draft=preview.json()['draft'], reviewed=True)).status_code == 200
+            applied = await change(http, 'connections/apply', draft=preview.json()['draft'], reviewed=True)
+            assert applied.status_code == 200, applied.text
             mail = next(c for c in (await state(http))['connections'] if c['id'] == 'mail')
             assert len(mail['tools']) == 11
             assert next(t for t in mail['tools'] if t['upstream'] == 'get_message')['pin'] == {'mailbox': 'INBOX'}

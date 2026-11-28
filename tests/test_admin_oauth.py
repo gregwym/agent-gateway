@@ -7,6 +7,9 @@ import pytest
 
 from agent_gateway.admin_oauth import AUTHORIZE, PROFILE, SCOPE, TOKEN
 from agent_gateway.gmail_scopes import MODIFY_SCOPE, ORGANIZE_TOOLS, SCOPES, SEND_SCOPE
+from helpers import prepare
+from passkey_helpers import approval_config
+from service_helpers import free_port
 from test_admin import change, login, setup, state, web_gateway
 
 pytestmark = pytest.mark.anyio
@@ -237,3 +240,39 @@ async def test_gmail_organize_scope_does_not_auto_grant_tools_or_expose_send(tmp
         assert tools['send_message']['permissions']['agent-a'] == 'deny'
         tools = await authorize('read_organize')
         assert 'send_message' not in tools and all(tools[name]['permissions']['agent-a'] == 'deny' for name in organize)
+
+
+async def test_legacy_gmail_client_joins_system_pool_without_reauthorizing(tmp_path):
+    port = free_port()
+    raw = approval_config(origin=f"http://localhost:{port}")
+    raw["admin"] = {"owner": "person_a", "state": "admin.enc"}
+    path = await prepare(tmp_path, raw)
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, _):
+        key, _ = await setup(http, origin, path)
+        store = gw.app.state.admin.store
+        previous = store.candidate()
+        previous["gmail_client"] = {"client_id": "test-web-client", "client_secret": "very-secret-client"}
+        store.save(previous)
+
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, _):
+        await login(http, key, origin)
+        current = await state(http)
+        assert current["oauth_clients"] == [{"id": "gmail", "issuer": "https://accounts.google.com",
+                                             "auth_method": "client_secret_post"}]
+        assert current["gmail_oauth"]["default"] == "gmail"
+        assert "very-secret-client" not in json.dumps(current)
+        args = {"kind": "gmail", "id": "google-mail", "owner": "person_a"}
+        for settings in ({"oauth_client": "gmail"}, {}):
+            reply = await change(http, "oauth/start", **args, settings=settings)
+            assert reply.status_code == 200, reply.text
+            query = parse_qs(urlsplit(reply.json()["url"]).query)
+            assert query["client_id"] == ["test-web-client"]
+            assert query["redirect_uri"] == [origin + "/admin/oauth/google/callback"]
+        response = await change(http, "oauth-clients/save", id="unrelated", issuer="https://example.test",
+                                client_id="other-client", client_secret="other-secret")
+        assert response.status_code == 200, response.text
+        denied = await change(http, "oauth/start", **args, settings={"oauth_client": "unrelated"})
+        assert denied.status_code == 409
+        persisted = json.loads(gw.app.state.admin.store.file.get("state"))
+        assert persisted["gmail_client"] == previous["gmail_client"]
+        assert b"very-secret-client" not in (tmp_path / "admin.enc").read_bytes()

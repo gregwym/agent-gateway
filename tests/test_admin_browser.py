@@ -94,7 +94,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
 
                 await page.get_by_role('link', name=t('Settings', '设置'), exact=True).click()
                 await page.get_by_role('button', name=t('Add OAuth client', '添加 OAuth 客户端'), exact=True).click()
-                client_form = page.get_by_role('dialog', name=t('Add remote MCP OAuth client', '添加远程 MCP OAuth 客户端'))
+                client_form = page.get_by_role('dialog', name=t('Add system OAuth client', '添加系统 OAuth 客户端'))
                 await client_form.get_by_label(t('Connector name', '连接器名称')).fill('system-mcp')
                 await client_form.get_by_label('Issuer').fill('https://auth.example.test')
                 await client_form.get_by_label('OAuth client ID').fill('browser-test-id')
@@ -143,6 +143,7 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 row = card.get_by_role('row').filter(has_text='browser_notes_list')
                 await row.get_by_label(t('Effect','权限效果'), exact=True).select_option('allow')
                 await row.get_by_role('button', name=t('Save access','保存权限'), exact=True).click()
+                await playwright.expect(card.get_by_role('status')).to_have_text(t('Permissions updated.', '权限已更新。'))
                 await playwright.expect(row.get_by_label(t('Effect','权限效果'), exact=True)).to_have_value('allow')
                 await row.get_by_role('button', name=t('Argument limits','参数限制'), exact=True).click()
                 await page.get_by_label(t('Fixed arguments (JSON object)','固定参数（JSON 对象）'), exact=True).fill('{"folder":"family"}')
@@ -184,22 +185,18 @@ async def test_browser_setup_members_agents_connector_review_permissions_and_log
                 await playwright.expect(renamed).to_be_visible()
                 await playwright.expect(version).to_be_visible()
                 if not zh:
-                    await page.get_by_role('button', name='Add connector', exact=True).click()
-                    await page.get_by_label('Service', exact=True).select_option('gateway_config')
-                    await page.get_by_label('Connector name', exact=True).fill('browser-config')
-                    await page.get_by_role('button', name='Save connector', exact=True).click()
-                    await playwright.expect(page.locator('tr[data-connection=browser-config]')).to_be_visible()
+                    await playwright.expect(page.locator('tr[data-connection=gateway_config]')).to_be_visible()
                     await page.get_by_role('link', name='Permissions', exact=True).click()
                     await page.get_by_label('Agent', exact=True).select_option('shared-agent')
-                    await page.locator('tr[data-connection=browser-config]').get_by_role('button', name='Edit access').click()
-                    config_card = page.get_by_role('dialog', name='Permissions: browser-config', exact=True)
+                    await page.locator('tr[data-connection=gateway_config]').get_by_role('button', name='Edit access').click()
+                    config_card = page.get_by_role('dialog', name='Permissions: gateway_config', exact=True)
                     await config_card.locator('summary').click()
-                    provision = config_card.get_by_role('row').filter(has_text='browser_config_provision')
+                    provision = config_card.get_by_role('row').filter(has_text='gateway_config_provision')
                     await provision.get_by_label('Effect', exact=True).select_option('allow')
                     async with page.expect_response(lambda response: response.url.endswith('/permissions/save') and response.ok):
                         await provision.get_by_role('button', name='Save access', exact=True).click()
                     await config_card.get_by_role('button', name='Close', exact=True).click()
-                    reply = await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name':'browser_config_provision',
+                    reply = await rpc(origin, TOKEN_HOUSE, 'tools/call', {'name':'gateway_config_provision',
                         'arguments':{'kind':'http_mcp', 'id':'browser-proposal',
                                      'url':'https://example.test/mcp', 'auth':'none'}})
                     assert json.loads(reply.json()['result']['content'][0]['text'])['status'] == 'pending'

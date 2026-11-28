@@ -86,10 +86,22 @@ class ManagedStore:
         # Fail closed on a malformed/corrupt state file, including tool locks.
         self.effective(self.state)
         self.state, self.catalog_updates = self.reconcile(self.upgrade(self.state))
+        if self.state.get("gmail_client"):
+            from .admin_oauth import store_gmail_client
+            store_gmail_client(self.state, self.state["gmail_client"])
 
     def reconcile(self, state):
         from .catalog_sync import sync_catalog
-        cfg, lock, _ = self.effective(state)
+        cfg, lock, values = self.effective(state)
+        if not any(kind_of(conn) == "gateway_config" for conn in cfg.connections):
+            name, suffix = "gateway_config", 1
+            occupied = {conn.id for conn in cfg.connections}
+            while name in occupied:
+                name = f"gateway_config-{suffix}"
+                suffix += 1
+            conn, _ = make_connection({"id": name, "kind": "gateway_config", "owner": cfg.admin.owner},
+                                      cfg, values)
+            cfg = cfg.model_copy(update={"connections": [*cfg.connections, conn]})
         cfg, lock, metadata, reports = sync_catalog(cfg, lock, state.get("bundled_catalog", {}))
         result = copy.deepcopy(state)
         result["config"] = {key: cfg.model_dump(mode="json")[key] for key in SECTIONS}
