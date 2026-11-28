@@ -135,3 +135,69 @@ async def test_rename_and_imap_preview_feedback_in_the_open_dialog(tmp_path, loc
         await card.get_by_role('button', name=t('Details', '详情'), exact=True).click()
         details = page.get_by_role('dialog', name='icloud-mail')
         await playwright.expect(details).to_contain_text('alias@example.test')
+
+
+async def test_prepared_proposals_review_in_browser_without_credential_fields(tmp_path, monkeypatch):
+    import json
+    import sys
+
+    from helpers import TOKEN_HOUSE, prepare
+    from passkey_helpers import approval_config
+    from service_helpers import free_port
+    from test_admin_remote import ISSUER, Remote, URL
+
+    port = free_port()
+    raw = approval_config(origin=f"http://localhost:{port}")
+    raw["admin"] = {"owner": "person_a", "state": "admin.enc"}
+    raw["server"]["tool_discovery"] = "search"
+    path = await prepare(tmp_path, raw)
+    remote = Remote(monkeypatch, mode="bearer")
+    async with admin_page(tmp_path, 'en-US', path=path, port=port) as (page, origin):
+        await page.evaluate("""() => mutate('permissions/connection', {
+          client: 'shared-agent', connection: 'gateway_config', access: 'read_write_direct'
+        })""")
+
+        async def prepare_request(config, credentials):
+            response = await rpc(origin, TOKEN_HOUSE, "tools/call", {"name": "gateway_call_tool", "arguments": {
+                "connection": "gateway_config", "tool": "gateway_config_provision",
+                "idempotency_key": config["id"], "arguments": {"prepared": True, **config},
+            }})
+            proposal = json.loads(response.json()["result"]["content"][0]["text"])
+            await page.goto(origin + "/admin/connections")
+            card = page.get_by_role('heading', name='Provisioning requests').locator('..')
+            row = card.locator('.row').filter(has_text=config["id"])
+            await playwright.expect(row.get_by_text('Waiting for credentials')).to_be_visible()
+            stage = await anyio.run_process(
+                [sys.executable, "-m", "agent_gateway.cli", "stage", origin, proposal["id"]],
+                input=json.dumps(credentials).encode(), env={**os.environ, "AGW_AGENT_TOKEN": TOKEN_HOUSE},
+            )
+            assert json.loads(stage.stdout)["proposal"] == proposal["id"]
+            assert all(secret.encode() not in stage.stdout for secret in credentials.values())
+            await page.goto(proposal["review_url"])
+            dialog = page.locator('dialog[open]').last
+            await playwright.expect(dialog).to_be_visible()
+            await playwright.expect(dialog.locator('input')).to_have_count(0)
+            return row, dialog
+
+        client, client_review = await prepare_request(
+            {"kind": "oauth_client", "id": "browser-oauth", "issuer": ISSUER},
+            {"client_id": "browser-synthetic-client", "client_secret": "browser-client-secret"},
+        )
+        await playwright.expect(client_review.get_by_text('OAuth client ID: browser-synthetic-client')).to_be_visible()
+        await client_review.get_by_role('button', name='Approve and save').click()
+        await playwright.expect(client).to_have_count(0)
+        assert not remote.requests
+
+        connection, connector_review = await prepare_request(
+            {"kind": "http_mcp", "id": "browser-remote", "url": URL, "auth": "bearer",
+             "grants": [{"client": "shared-agent", "tool": "read.note", "access": "read"}]},
+            {"token": remote.access},
+        )
+        await playwright.expect(connector_review.get_by_text('shared-agent · read.note · Read')).to_be_visible()
+        await connector_review.get_by_role('button', name='Approve and load tools').click()
+        tools = page.get_by_role('dialog', name='Review tool definitions')
+        await playwright.expect(tools.get_by_text('shared-agent · read.note · Read')).to_be_visible()
+        await tools.get_by_role('checkbox', name='I reviewed these definitions and permissions.').check()
+        await tools.get_by_role('button', name='Apply connector').click()
+        await playwright.expect(connection).to_have_count(0)
+        await playwright.expect(page.locator('tr[data-connection="browser-remote"]')).to_be_visible()

@@ -9,6 +9,20 @@ FIELDS = ["url", "service", "auth", "header", "issuer", "client_id", "auth_metho
 SPEC = {"label": "Remote MCP / 远程 MCP", "fields": FIELDS, "secrets": ["token", "client_secret"], "tools": [], "probe": (None, {})}
 
 
+def validate_remote_token(token):
+    if any(ord(c) < 32 or ord(c) == 127 for c in token):
+        raise Refused("invalid_remote_token", 400)
+
+
+def validate_credential_header(header):
+    # Routing, framing and protocol headers cannot be credentials.
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", header) or header.lower() in {
+        "host", "content-length", "content-type", "accept", "connection", "transfer-encoding", "cookie", "origin",
+        "referer", "mcp-session-id", "mcp-protocol-version", "proxy-authorization", "upgrade", "te", "trailer"
+    } or header.lower().startswith(("sec-", "x-forwarded-")):
+        raise Refused("invalid_credential_header", 400)
+
+
 def make_remote(name, owner, account, settings, provided, previous, values, credential_ref):
     url = https_url(settings.get("url", ""))
     service = settings.get("service") or "remote-mcp"
@@ -30,8 +44,7 @@ def make_remote(name, owner, account, settings, provided, previous, values, cred
         token = provided.get("token") or values.get(old)
         if not token:
             raise Refused("missing_token", 400)
-        if any(ord(c) < 32 or ord(c) == 127 for c in token):
-            raise Refused("invalid_remote_token", 400)
+        validate_remote_token(token)
         key = old if old and not provided.get("token") else credential_ref("token", old)
         if provided.get("token"):
             fresh[key] = token
@@ -39,12 +52,7 @@ def make_remote(name, owner, account, settings, provided, previous, values, cred
             raw["bearer_secret"] = key
         else:
             header = settings.get("header", "")
-            # Routing, framing and protocol headers cannot be credentials.
-            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", header) or header.lower() in {
-                "host", "content-length", "content-type", "accept", "connection", "transfer-encoding", "cookie", "origin",
-                "referer", "mcp-session-id", "mcp-protocol-version", "proxy-authorization", "upgrade", "te", "trailer"
-            } or header.lower().startswith(("sec-", "x-forwarded-")):
-                raise Refused("invalid_credential_header", 400)
+            validate_credential_header(header)
             raw["secret_headers"] = {header: key}
     if auth == "oauth" and previous and previous.url == url:
         raw["oauth_ref"] = previous.oauth_ref
