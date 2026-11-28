@@ -7,12 +7,14 @@ from urllib.parse import urlencode
 
 import httpx2
 from fido2.utils import websafe_encode
+from mcp.client.auth.utils import issuers_match
 
 from .admin_config import kind_of, make_connection
 from .gmail_scopes import SCOPE, SCOPES, scope_error
 from .mail_address import email_address
 from .passkey import Refused
 
+GOOGLE_ISSUER = "https://accounts.google.com"
 AUTHORIZE = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN = "https://oauth2.googleapis.com/token"
 PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
@@ -25,6 +27,27 @@ def saved_gmail_client(conn, values):
         if client_id and client_secret:
             return {"client_id": client_id, "client_secret": client_secret}
     return None
+
+
+def gmail_compatible_client(client):
+    return (issuers_match(client["issuer"], GOOGLE_ISSUER)
+            and client["auth_method"] == "client_secret_post")
+
+
+def store_gmail_client(state, credentials):
+    clients = state.setdefault("oauth_clients", {})
+    client = {**credentials, "issuer": GOOGLE_ISSUER, "auth_method": "client_secret_post"}
+    identifier = next((name for name, details in clients.items() if details == client), None)
+    if identifier is None:
+        identifier, suffix = "gmail", 1
+        while identifier in clients:
+            identifier = f"gmail-{suffix}"
+            suffix += 1
+        clients[identifier] = client
+    state["gmail_oauth_client"] = identifier
+    # Older releases only read this field. Keep their configured default usable.
+    state["gmail_client"] = credentials
+    return identifier
 
 
 def _profile_error(response):
@@ -94,12 +117,16 @@ class GoogleConsent(ConsentSessions):
             raise Refused("invalid_connector", 400)
         # An explicit ID reuses this connection's own client or the legacy
         # API path. Without one, use the system client with a new account grant.
-        if "client_id" not in settings:
-            if credentials:
+        selection = settings.pop("oauth_client", None)
+        if selection is not None or "client_id" not in settings:
+            if credentials or "client_id" in settings or (selection is not None and not isinstance(selection, str)):
                 raise Refused("invalid_connector", 400)
-            client = self.controller.store.state.get("gmail_client")
+            state = self.controller.store.state
+            client = state.get("oauth_clients", {}).get(selection or state.get("gmail_oauth_client"))
             if not client:
                 raise Refused("gmail_system_client_required", 400)
+            if not gmail_compatible_client(client):
+                raise Refused("oauth_client_unavailable", 409)
             settings["client_id"] = client["client_id"]
             credentials["client_secret"] = client["client_secret"]
         credentials["refresh_token"] = "pending-consent"

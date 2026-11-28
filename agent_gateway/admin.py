@@ -194,7 +194,7 @@ class AdminController:
         return {"revision": state["revision"]}
 
     def state(self):
-        from .admin_oauth import saved_gmail_client
+        from .admin_oauth import gmail_compatible_client, saved_gmail_client
         gw = self.runtime.gateway
         keys = self.auth.approver.passkeys()
         plugins = connector_plugins(self.store.base.admin.plugins_dir)
@@ -236,7 +236,8 @@ class AdminController:
                 "language": self.store.state.get("languages", {}).get(self.auth.owner, "auto"),
                 "oauth_clients": self.oauth.list_clients(),
                 "config_proposals": [self.provisioning.view(row) for row in self.provisioning.rows()],
-                "gmail_oauth": {"client_id": self.store.state.get("gmail_client", {}).get("client_id"),
+                "gmail_oauth": {"default": self.store.state.get("gmail_oauth_client"),
+                                "clients": [name for name, details in self.oauth.clients().items() if gmail_compatible_client(details)],
                                 "saved_clients": [c.id for c in gw.cfg.connections if saved_gmail_client(c, gw.secrets)]},
                 "plugins": [plugin.public() for plugin in plugins.values()],
                 "website_login": self.website_login.available(),
@@ -623,7 +624,7 @@ class AdminController:
             self.oauth.remember({"client": details})
             return {**result, "id": identifier}
         if operation == "settings/gmail-oauth":
-            from .admin_oauth import saved_gmail_client
+            from .admin_oauth import saved_gmail_client, store_gmail_client
             state = self.store.candidate()
             if set(body) == {"revision", "connection"} and isinstance(body["connection"], str):
                 gw = self.runtime.gateway
@@ -640,8 +641,12 @@ class AdminController:
                 raise Refused("gmail_client_config_invalid", 400)
             if client == state.get("gmail_client"):
                 return {"revision": state["revision"]}
-            state["gmail_client"] = client
-            return await self._commit(state, operation)
+            if len(state.get("oauth_clients", {})) >= 50:
+                raise Refused("oauth_client_limit", 409)
+            identifier = store_gmail_client(state, client)
+            result = await self._commit(state, operation)
+            self.oauth.remember({"client": client})
+            return {**result, "id": identifier}
         if operation == "oauth/revoke":
             conn = next((c for c in self.runtime.gateway.cfg.connections if c.id == body.get("id")), None)
             if not conn or not conn.oauth_ref:
@@ -666,6 +671,10 @@ class AdminController:
             return {"revision": self.store.state["revision"]}
         state = self.store.candidate()
         raw = state["config"]
+        if operation in {"connections/save", "connections/preview", "connections/rename", "connections/remove"}:
+            existing = next((c for c in self.runtime.gateway.cfg.connections if c.id == body.get("id")), None)
+            if body.get("kind") == "gateway_config" or (existing and kind_of(existing) == "gateway_config"):
+                raise Refused("invalid_configuration_connector", 400)
         if operation == "members/add":
             if body.get("shared") is True:
                 raise Refused("shared_identity_removed", 400)

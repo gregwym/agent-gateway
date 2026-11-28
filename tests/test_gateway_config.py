@@ -25,24 +25,27 @@ async def test_config_permission_and_two_stage_provision(tmp_path, monkeypatch):
     upstream = Remote(monkeypatch, mode="none")
     async with web_gateway(tmp_path, path=config_path, port=port) as (gw, http, origin, path):
         await setup(http, origin, path)
-        reply = await change(http, "connections/save", kind="gateway_config", id="config", owner="person_a")
-        assert reply.status_code == 200, reply.text
+        connectors = (await state(http))["connections"]
+        assert [(c["id"], c["owner"]) for c in connectors if c["kind"] == "gateway_config"] == [
+            ("gateway_config", "person_a")]
+        refused = await change(http, "connections/remove", id="gateway_config")
+        assert refused.status_code == 400
 
         async def search(token, query):
             data = (await rpc(origin, token, "tools/call", {"name": "gateway_search_tools",
-                        "arguments": {"connection": "config", "query": query}})).json()
+                        "arguments": {"connection": "gateway_config", "query": query}})).json()
             return {item["name"] for item in json.loads(data["result"]["content"][0]["text"])["tools"]}
 
         async def invoke(token, tool, key, arguments):
             return (await rpc(origin, token, "tools/call", {"name": "gateway_call_tool", "arguments": {
-                "connection": "config", "tool": tool, "idempotency_key": key, "arguments": arguments,
+                "connection": "gateway_config", "tool": tool, "idempotency_key": key, "arguments": arguments,
             }})).json()
 
         read, propose = "gateway_config_read", "gateway_config_provision"
         assert await search(TOKEN_HOUSE, "configuration") == set()
-        assert (await change(http, "permissions/connection", client="shared-agent", connection="config",
+        assert (await change(http, "permissions/connection", client="shared-agent", connection="gateway_config",
                              access="read_write_direct")).status_code == 200
-        assert (await change(http, "permissions/connection", client="agent-a", connection="config",
+        assert (await change(http, "permissions/connection", client="agent-a", connection="gateway_config",
                              access="read")).status_code == 200
         assert await search(TOKEN_HOUSE, "configuration") == {read, propose}
         assert await search(TOKEN_A, "configuration") == {read}
@@ -163,13 +166,12 @@ async def test_provisioning_queue_protects_arguments(tmp_path, monkeypatch, need
     monkeypatch.setattr(RequestStore, "dispatch_queue", lambda store, limit: [] if paused else dispatch_queue(store, limit))
     async with web_gateway(tmp_path) as (gw, http, origin, path):
         key, _ = await setup(http, origin, path)
-        assert (await change(http, "connections/save", kind="gateway_config", id="config", owner="person_a")).status_code == 200
         access = "read_write_approval" if needs_approval else "read_write_direct"
-        assert (await change(http, "permissions/connection", client="agent-a", connection="config",
+        assert (await change(http, "permissions/connection", client="agent-a", connection="gateway_config",
                              access=access, approver="person_a")).status_code == 200
         endpoint = "https://synthetic-private.example.test/mcp"
         args = {"kind": "http_mcp", "id": "new-remote", "url": endpoint, "auth": "none"}
-        wrapped = {"connection": "config", "tool": "gateway_config_provision", "arguments": args,
+        wrapped = {"connection": "gateway_config", "tool": "gateway_config_provision", "arguments": args,
                    "idempotency_key": "protected", "background": True}
         response = (await rpc(origin, TOKEN_A, "tools/call", {"name": "gateway_call_tool", "arguments": wrapped})).json()
         result = response["result"]["structuredContent"]

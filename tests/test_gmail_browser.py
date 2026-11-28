@@ -43,9 +43,9 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         for name, expected in [('host', 'imap.gmail.com'), ('port', '993'), ('smtp_host', 'smtp.gmail.com'), ('smtp_port', '587'), ('smtp_security', 'starttls')]:
             await playwright.expect(box.locator(f'[name={name}]')).to_have_value(expected)
         await service.select_option('gmail')
-        await box.get_by_role('link', name=t('Set up Gmail OAuth in Settings', '在「设置」中配置 Gmail OAuth'), exact=True).click()
+        await box.get_by_role('link', name=t('Add a Google OAuth client in Settings', '在「设置」中添加 Google OAuth 客户端'), exact=True).click()
         assert page.url == origin + '/admin/settings'
-        await page.get_by_role('button', name=t('Configure OAuth client', '配置 OAuth 客户端'), exact=True).click()
+        await page.get_by_role('button', name=t('Import Google OAuth client', '导入 Google OAuth 客户端'), exact=True).click()
         upload = box.get_by_label(t('Google OAuth client JSON', 'Google OAuth 客户端 JSON'), exact=True)
 
         async def import_json(data):
@@ -60,12 +60,14 @@ async def test_gmail_setup_import_scope_and_mail_preset(tmp_path, locale, monkey
         await box.get_by_role('button', name=t('Save OAuth client', '保存 OAuth 客户端'), exact=True).click()
         await playwright.expect(box).to_have_count(0)
         assert 'fake-client-secret' not in await page.locator('body').inner_text()
+        await playwright.expect(page.get_by_text('gmail · https://accounts.google.com', exact=True)).to_be_visible()
 
         await page.get_by_role('link', name=t('Connectors', '连接器'), exact=True).click()
         await add.click()
         await service.select_option('gmail')
         await box.get_by_label(t('Connector name', '连接器名称'), exact=True).fill('gmail-browser')
         await playwright.expect(box.locator('input[type=file],input[type=password]')).to_have_count(0)
+        await playwright.expect(box.get_by_label(t('System OAuth client', '系统 OAuth 客户端'))).to_have_value('gmail')
         scope = box.get_by_label(t('Google permissions', 'Google 权限'), exact=True)
         await playwright.expect(scope).to_have_value('read')
         await scope.select_option(access)

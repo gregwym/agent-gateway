@@ -491,7 +491,7 @@ admin:
 Google 回调失败也会显示管理页面。iCloud Mail 登录用户名通常是 `@icloud.com` 前的部分，也可尝试完整邮箱地址；
 密码须为 [Apple App 专用密码](https://support.apple.com/en-us/102654)，设置参见 [Apple 的 IMAP 说明](https://support.apple.com/en-us/102525)。
 
-在「设置 → Gmail OAuth」配置一次客户端：可采用已连接 Gmail 的 OAuth 客户端，或[在 Google Cloud](https://console.cloud.google.com/auth/clients) 启用 Gmail API、创建 **Web 应用**客户端、登记网关显示的重定向 URI，再导入客户端 JSON。
+在「设置 → 系统 OAuth 客户端」添加 Google 客户端。可从已连接的 Gmail 导入，或[在 Google Cloud](https://console.cloud.google.com/auth/clients) 启用 Gmail API、创建 **Web 应用**客户端、登记网关显示的重定向 URI，再导入客户端 JSON。
 在「连接器 → 添加连接器」选择 **Gmail (Google OAuth)**，选好权限后点「通过 Google 授权」。每个邮箱独立授权；更换系统客户端后，已连接的邮箱可通过「重新授权」切换：
 - 只读：`gmail.readonly`。
 - 读取和发送：`gmail.readonly` + `gmail.send`。
@@ -517,9 +517,10 @@ OAuth 会发现服务的授权服务器并打开授权页。服务商支持动�
 把 `https://<网关域名>/admin/oauth/mcp/callback` 登记为回调地址。
 支持客户端元数据 URL 的服务商也可使用该方式，不能同时填写 client ID。
 
-要在多个远程 MCP 连接间共用 OAuth 客户端，在「设置 → 远程 MCP OAuth 客户端」登记一个系统客户端，
+要在多个远程 MCP 连接间共用 OAuth 客户端，在「设置 → 系统 OAuth 客户端」登记一个客户端，
 然后在各连接中选择它。使用前向授权服务器登记同一个网关回调。每条连接仍分别完成用户同意，并保留自己的 scope
-和令牌。系统客户端只能用于声明同一 issuer 的服务，其密钥只保存在加密管理员状态。现有 Gmail OAuth 设置独立。
+和令牌。系统客户端只能用于声明同一 issuer 的服务，其密钥存于加密管理员状态。此前保存的 Gmail 系统客户端会自动出现在同一列表。
+Gmail REST 与 HTTP MCP 可以选择同一客户端，并分别完成授权。Google 需登记各自的回调地址。
 降级到不支持系统客户端的版本前，先移除引用系统客户端的新建连接，保留旧版已支持的连接与状态。
 Scope 留空时使用 MCP 服务要求的范围，填写时用空格分隔；授权页和工具审阅页会显示范围。
 授权服务器必须支持 PKCE S256。
@@ -547,8 +548,8 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 
 ### 让 Agent 申请接入
 
-在「连接器」新增一个由网关管理员持有的「网关配置」连接器。在「权限」给相应 Agent 开通读取或提交申请，
-然后用 `gateway_search_tools` 搜索 `gateway_config`。通过 `gateway_call_tool` 调用返回的
+网关自动登记管理员持有的「网关配置」连接器。已有配置连接器及其授权会沿用；首次登记时所有 Agent 默认无权访问。
+在「权限」给相应 Agent 开通读取或提交申请，然后用 `gateway_search_tools` 搜索 `gateway_config`。通过 `gateway_call_tool` 调用返回的
 `gateway_config_read` 或 `gateway_config_provision`。读工具列出可选 OAuth client 引用、
 该 Agent 已获准的远程连接和自己的申请状态。结果不含凭据。
 
@@ -557,7 +558,7 @@ OAuth 的 access token、refresh token、客户端信息及发现的元数据保
 申请，填写 `id`、`url`、`auth`，需要时填写 `oauth_client` 和 `scope`。使用自动注册时留空
 `oauth_client`。审批前网关只保存待审记录，操作队列和待审列表中的申请字段均加密。管理员确认预览并保存连接后，继续在「权限」按现有规则授予服务工具。
 
-降级到不支持「网关配置」连接器的版本前，在管理页移除此连接器。让队列中仍待 Passkey 审批的配置提交过期，或使用
+降级到有「网关配置」连接器的 0.25.0 或 0.26.0 时，可沿用当前连接和授权。降级到更早的版本时，先切回支持移除此连接器的 0.26.0 并在管理页移除。让队列中仍待 Passkey 审批的配置提交过期，或使用
 `agw approval cancel <id>` 取消。备份申请记录时包含 `approvals.sqlite` 与 `admin.enc.proposals`。
 
 <a id="connector-plugins"></a>
