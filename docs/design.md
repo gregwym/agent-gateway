@@ -283,9 +283,13 @@ Connector 不是新的抽象，就是一个普通的 MCP Server，外加四条�
 
 ### 7.8 新邮件通知
 
-Gateway 本身不轮询。主机配置里的 `mail_events` 为某条自带 Gmail 或 IMAP 连接打开后，这条连接的 Connector 进程里
+Gateway 本身不轮询。管理页或主机配置里的 `mail_events` 为某条自带 Gmail 或 IMAP 连接打开后，这条连接的 Connector 进程里
 多一个后台线程，每 30 秒问一次服务器「上次之后有什么新的」，有就向配置的 webhook 发一个签名请求。
 Agent 收到后再用这条连接的读取工具读信，所以凭据仍然只在 Gateway 里。
+
+- **网页配置多目标。** 管理页将 OpenBot webhook 的签名密钥和邮箱绑定存入现有的网页加密状态。每个邮箱只检查一次，
+  每个绑定分别记录待发和重试。更换地址或解除绑定会停止使用旧绑定的待发记录。网页投递状态平行保存在
+  `mail-events-web.json`，主机配置继续使用 `mail-events.json`。
 
 - **只发标识。** 请求体为 `{"type": <配置的类型>, "occurredAt": ..., "data": {"mailbox": <连接 ID>, "message_ids": [...]}}`；
   IMAP 为 `"uidvalidity": N, "uids": [...]`。不含发件人、主题、正文或附件，也不读取它们：Gmail 只调

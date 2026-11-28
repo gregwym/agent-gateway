@@ -287,7 +287,8 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
         readback = await invoke("gateway_config_read", "failed-readback", {})
         requests = json.loads(readback["result"]["content"][0]["text"])["proposals"]
         failure = next(row for row in requests if row["id"] == remote["id"])
-        assert failure["status"] == "pending" and failure["last_error"] == failed.json()["error"]
+        assert failure["status"] == "pending"
+        assert failure["last_error"] == failed.json()["error"] == "oauth_code_rejected"
         upstream.fail_token = None
         restarted = await change(http, "oauth/mcp/start", proposal=remote["id"])
         assert restarted.status_code == 200, restarted.text
@@ -318,6 +319,8 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
         assert {row["config"]["id"]: row["status"] for row in rows} == {
             "prepared-client": "applied", "other-client": "rejected", "expired-client": "pending", "prepared-remote": "applied",
         }
+        assert "last_error" not in next(row for row in rows if row["id"] == remote["id"])
+
         async def discover(token):
             result = (await rpc(origin, token, "tools/call", {"name": "gateway_search_tools",
                       "arguments": {"connection": args["id"]}})).json()

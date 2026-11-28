@@ -12,6 +12,7 @@ import fcntl
 import json
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -25,14 +26,17 @@ from helpers import base_config, prepare, running_gateway
 from imapclient import IMAPClient
 from passkey_helpers import approval_config
 from service_helpers import FakeGoogle, WebhookReceiver, free_port, mail_account
-from test_admin import change, setup, web_gateway
+from starlette.responses import Response
+from test_admin import change, login, setup, state, web_gateway
+from test_connector_mail import mail_connection
 
 from agent_gateway import cli
 from agent_gateway.config import ConfigError, load_config
 from agent_gateway.connectors import _mail_events
-from agent_gateway.connectors._mail_events import INTERVAL, GmailSource, ImapSource, MailEvents
+from agent_gateway.connectors._mail_events import INTERVAL, DeliveryTarget, GmailSource, ImapSource, MailEvents
 from agent_gateway.connectors.gmail import Gmail
 from agent_gateway.connectors.imap_mail import Mailbox
+from agent_gateway.credentials import EncryptedFileStore
 from agent_gateway.upstream import Upstream
 
 pytestmark = pytest.mark.anyio
@@ -79,8 +83,9 @@ def gmail_events(tmp_path, google, receiver, refresh="1//refresh-token-a", *, se
     if refresh not in google.accounts:
         google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
     gmail = Gmail(CLIENT_ID, CLIENT_SECRET, refresh, google.base, f"{google.base}/token")
-    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", secret, "gmail-a", GmailSource(gmail),
-                      clock=clock or Clock())
+    target = DeliveryTarget(receiver.url, "person.mail.new", secret)
+    return MailEvents(tmp_path / "state", "gmail-a", GmailSource(gmail), {"": target},
+                      clock=clock or Clock(), legacy=True)
 
 
 def saved(tmp_path) -> dict:
@@ -150,6 +155,52 @@ def test_an_undelivered_event_keeps_its_delivery_id_across_retries_and_restarts(
     assert len({delivery for delivery, _ in receiver.attempts}) == 1
     assert receiver.events[0]["data"]["message_ids"] == ["18c0b1"]
     assert saved(tmp_path)["outbox"] == []
+
+
+def test_multitarget_checks_once_and_retries_only_undelivered_destinations(tmp_path, google, receiver):
+    refresh = "1//refresh-token-a"
+    google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
+    source = GmailSource(Gmail(CLIENT_ID, CLIENT_SECRET, refresh, google.base, f"{google.base}/token"))
+    other = WebhookReceiver("another-signing-key")
+    try:
+        clock = Clock()
+        targets = {
+            "primary": DeliveryTarget(receiver.url, "mail.new", SIGNING_SECRET),
+            "secondary": DeliveryTarget(other.url, "mail.new", "another-signing-key"),
+        }
+        events = MailEvents(tmp_path, "gmail-a", source, targets, clock=clock)
+        events.run_once()
+        receiver.statuses = [503, 503]
+        google.add_message(refresh, "18c0b1", raw("first"))
+        google.requests.clear()
+        clock.later()
+        events.run_once()
+        assert sum(path == "/gmail/v1/users/me/history" for _, path in google.requests) == 1
+        assert [code for _, code in receiver.attempts] == [503]
+        assert [event["data"]["message_ids"] for event in other.events] == [["18c0b1"]]
+
+        clock.later()
+        google.add_message(refresh, "18c0b2", raw("second"))
+        events.run_once()
+        assert [event["data"]["message_ids"] for event in other.events] == [["18c0b1"], ["18c0b2"]]
+
+        restarted = MailEvents(tmp_path, "gmail-a", source, targets, clock=clock)
+        restarted.run_once()
+        assert [event["data"]["message_ids"] for event in receiver.events] == [["18c0b1"], ["18c0b2"]]
+        assert receiver.attempts[0][0] == receiver.attempts[2][0]
+        assert len(other.attempts) == 2
+
+        receiver.statuses = [503]
+        google.add_message(refresh, "18c0b3", raw("while removing a destination"))
+        clock.later()
+        restarted.run_once()
+        replacement = MailEvents(tmp_path, "gmail-a", source, {"replacement": targets["primary"],
+                                                               "secondary": targets["secondary"]}, clock=clock)
+        replacement.run_once()
+        assert len(receiver.attempts) == 5
+        assert [event["data"]["message_ids"] for event in other.events][-1] == ["18c0b3"]
+    finally:
+        other.close()
 
 
 def test_waits_grow_after_failures_and_stop_at_five_minutes(tmp_path, google, receiver):
@@ -292,7 +343,8 @@ def flags(account, uid: int):
 
 def imap_events(tmp_path, account, receiver, clock):
     mailbox = Mailbox("localhost", account.front.port, USER, PASSWORD)
-    return MailEvents(tmp_path / "state", receiver.url, "person.mail.new", SIGNING_SECRET, "icloud-a", ImapSource(mailbox), clock=clock)
+    target = DeliveryTarget(receiver.url, "person.mail.new", SIGNING_SECRET)
+    return MailEvents(tmp_path / "state", "icloud-a", ImapSource(mailbox), {"": target}, clock=clock, legacy=True)
 
 
 def test_imap_reports_new_uids_without_marking_anything_read(tmp_path, monkeypatch, receiver):
@@ -520,6 +572,174 @@ def web_config(port: int, google, url: str, **entry) -> dict:
     out["policy"] += mail["policy"]
     out["mail_events"] = mail["mail_events"]
     return out
+
+
+async def test_gateway_restart_does_not_retry_a_target_that_confirmed_while_another_was_waiting(
+    tmp_path, google, receiver,
+):
+    release = threading.Event()
+
+    class SlowReceiver(WebhookReceiver):
+        waiting_id = None
+
+        async def _receive(self, request):
+            if self.waiting_id is None:
+                self.waiting_id = request.headers["x-openbot-delivery-id"]
+                while not release.is_set():
+                    await anyio.sleep(0.02)
+                return Response(status_code=503)
+            return await super()._receive(request)
+
+    slow = SlowReceiver(SIGNING_SECRET)
+    try:
+        refresh = SECRETS["gmail_token_a"]
+        google.add_account(refresh, CLIENT_ID, CLIENT_SECRET)
+        config = web_config(free_port(), google, receiver.url)
+        config["mail_events"] = []
+        path = await prepare(tmp_path, config, secrets={**BASE_SECRETS, **SECRETS})
+        cfg = load_config(path)
+        store = EncryptedFileStore(cfg.admin.state, cfg.secrets.key_file)
+        store.set("state", json.dumps({
+            "revision": 0, "config": {}, "secrets": {}, "locks": {},
+            "mail_webhooks": {
+                name: {"label": name, "url": destination.url, "event_type": "mail.new",
+                       "secret": SIGNING_SECRET, "bindings": {"gmail-a": name}}
+                for name, destination in (("slow", slow), ("fast", receiver))
+            },
+        }))
+        outbox_path = cfg.audit.path.parent / "connectors" / "gmail-a" / "mail-events-web.json"
+        outbox_path.parent.mkdir(parents=True)
+        outbox_path.write_text(json.dumps({"cursor": {"history_id": "1000"}, "checked_at": time.time() - 60}))
+        google.add_message(refresh, "18c0a8", raw("new mail for both receivers"))
+
+        def queues():
+            return json.loads(outbox_path.read_text())["queues"]
+
+        async with running_gateway(path):
+            with anyio.fail_after(10):
+                while not receiver.events or slow.waiting_id is None:
+                    await anyio.sleep(0.02)
+            with anyio.move_on_after(2):
+                while queues()["fast"]:
+                    await anyio.sleep(0.02)
+            confirmed_before_restart = not queues()["fast"]
+            assert [item["id"] for item in queues()["slow"]] == [slow.waiting_id]
+
+        # Keep the first request blocked until the replacement gateway retries it.
+        async with running_gateway(path):
+            with anyio.fail_after(10):
+                while not slow.events or any(queues().values()):
+                    await anyio.sleep(0.02)
+
+        assert slow.attempts == [(slow.waiting_id, 202)]
+        assert [status for _, status in receiver.attempts] == [202]
+        assert confirmed_before_restart
+        assert slow.events == receiver.events
+    finally:
+        release.set()
+        slow.close()
+
+
+async def test_webhook_configuration_requires_confirmation_and_reloads_both_mailboxes(tmp_path):
+    port = free_port()
+    first_url = "https://signal.openbot.run/v1/webhooks/first-target"
+    second_url = "https://signal.openbot.run/v1/webhooks/second-target"
+    signing_key = "fake-webhook-key-never-export"
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        config = web_config(port, STUB, "https://hooks.example.test/v1/webhooks/old")
+        config["connections"].append(mail_connection("imap-a", "person_a", account, "imap-password", "i"))
+        path = await prepare(tmp_path / "gateway", config, secrets={**BASE_SECRETS, **SECRETS, "imap-password": PASSWORD})
+        operation = "settings/mail-webhooks"
+        first = {"id": "", "label": "Mail", "url": first_url, "event_type": "mail.new", "secret": signing_key,
+                 "connections": ["gmail-a", "imap-a"], "take_over": False}
+        async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
+            assert (await http.post("/admin/api/" + operation, json=first)).status_code == 401
+            key, _ = await setup(http, origin, path)
+            current = await state(http)
+            assert current["mail_webhooks"]["host_managed"] == ["gmail-a"]
+            pending = await http.post("/admin/api/" + operation, json={**first, "revision": current["revision"]})
+            assert pending.json()["error"] == "admin_confirmation_required"
+            first["take_over"] = True
+            invalid = await change(http, operation, **{**first, "url": first_url + "?leak=key"})
+            assert invalid.json()["error"] == "mail_webhook_invalid"
+            refused = await change(http, operation, **{**first, "take_over": False})
+            assert refused.json()["error"] == "mail_webhook_takeover_required"
+            reply = await change(http, operation, **first)
+            assert reply.status_code == 200, reply.text
+            first["id"] = reply.json()["id"]
+            runtime = gw.app.state.runtime
+            first_targets = runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"]
+            assert runtime.gateway.upstreams["gmail-a"].extra_env.keys() == {"AGW_MAIL_EVENTS_TARGETS", "AGW_MAIL_EVENTS_MAILBOX"}
+            reply = await change(http, operation, **{**first, "id": "", "label": "Backup", "url": second_url,
+                                                       "connections": ["gmail-a"], "take_over": False})
+            assert reply.status_code == 200, reply.text
+            assert len(json.loads(runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"])) == 2
+            assert len(json.loads(runtime.gateway.upstreams["imap-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"])) == 1
+            assert signing_key not in json.dumps(await state(http)) and signing_key not in gw.audit_text()
+            assert signing_key.encode() not in (path.parent / "admin.enc").read_bytes()
+            assert (await change(http, operation, **{**first, "url": first_url + "-changed", "secret": ""})).json()[
+                "error"] == "mail_webhook_secret_required"
+            before = json.loads(runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"])
+            first.update(url=first_url + "-changed", secret="replacement-key")
+            reply = await change(http, operation, **first)
+            assert reply.status_code == 200, reply.text
+            after = json.loads(runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"])
+            assert {key: target for key, target in before.items() if target["url"] == second_url} == {
+                key: target for key, target in after.items() if target["url"] == second_url}
+            assert len(before.keys() & after.keys()) == 1
+            assert next(after[key]["url"] for key in after.keys() - before.keys()) == first["url"]
+
+        async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
+            await login(http, key, origin)
+            assert len((await state(http))["mail_webhooks"]["targets"]) == 2
+            turned_off = await change(http, operation, **{**first, "connections": [], "secret": ""})
+            assert turned_off.status_code == 200, turned_off.text
+            runtime = gw.app.state.runtime
+            assert runtime.gateway.upstreams["imap-a"].extra_env is None
+            gmail_targets = runtime.gateway.upstreams["gmail-a"].extra_env["AGW_MAIL_EVENTS_TARGETS"]
+            assert gmail_targets != first_targets and second_url in gmail_targets and first["url"] not in gmail_targets
+
+
+@pytest.mark.browser
+async def test_browser_saves_one_webhook_for_two_mailboxes(tmp_path):
+    playwright = pytest.importorskip("playwright.async_api")
+    port = free_port()
+    with mail_account(tmp_path / "imap", USER, PASSWORD) as account:
+        config = web_config(port, STUB, "https://hooks.example.test/v1/webhooks/old")
+        config["mail_events"] = []
+        config["connections"].append(mail_connection("imap-a", "person_a", account, "imap-password", "i"))
+        path = await prepare(tmp_path / "gateway", config, secrets={**BASE_SECRETS, **SECRETS, "imap-password": PASSWORD})
+        async with web_gateway(tmp_path, path=path, port=port):
+            async with playwright.async_playwright() as driver:
+                browser = await driver.chromium.launch()
+                try:
+                    context = await browser.new_context(locale="en-US")
+                    page = await context.new_page()
+                    cdp = await context.new_cdp_session(page)
+                    await cdp.send("WebAuthn.enable")
+                    await cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+                        "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
+                        "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})
+                    await page.goto((path.parent / "admin-setup-link").read_text().strip())
+                    await page.get_by_role("button", name="Create administrator passkey").click()
+                    await page.get_by_role("link", name="Settings", exact=True).click()
+                    await page.get_by_role("button", name="Add OpenBot webhook").click()
+                    dialog = page.get_by_role("dialog", name="Add OpenBot webhook")
+                    await dialog.get_by_label("Name", exact=True).fill("Inbox workflow")
+                    await dialog.get_by_label("Webhook URL").fill("https://signal.openbot.run/v1/webhooks/test")
+                    await dialog.get_by_label("Signing key").fill("browser-test-signing-key")
+                    await dialog.get_by_role("checkbox", name="gmail-a").check()
+                    await dialog.get_by_role("checkbox", name="imap-a").check()
+                    await dialog.get_by_role("button", name="Save webhook").click()
+                    await playwright.expect(page.get_by_text("Inbox workflow · gmail-a, imap-a")).to_be_visible()
+                    await page.reload()
+                    await page.get_by_role("button", name="Edit", exact=True).click()
+                    dialog = page.get_by_role("dialog", name="Edit OpenBot webhook")
+                    await playwright.expect(dialog.get_by_label("Signing key")).to_have_value("")
+                    await playwright.expect(dialog.get_by_role("checkbox", name="gmail-a")).to_be_checked()
+                    await playwright.expect(dialog.get_by_role("checkbox", name="imap-a")).to_be_checked()
+                finally:
+                    await browser.close()
 
 
 async def test_a_connection_with_events_is_renamed_only_after_gateway_yaml(tmp_path, monkeypatch):

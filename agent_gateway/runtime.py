@@ -58,6 +58,8 @@ class Runtime:
                             await self.condition.wait()
                     reuse = (gateway.secrets == self.gateway.secrets and gateway.lock.entries == self.gateway.lock.entries
                              and set(gateway.upstreams) == set(self.gateway.upstreams)
+                             and all(getattr(upstream, "extra_env", None) == getattr(self.gateway.upstreams[key], "extra_env", None)
+                                     for key, upstream in gateway.upstreams.items())
                              and all(gateway.upstreams[key].conn.model_dump(exclude={'approver', 'mailbox_email', 'mailbox_aliases'}) ==
                                      self.gateway.upstreams[key].conn.model_dump(exclude={'approver', 'mailbox_email', 'mailbox_aliases'})
                                      for key in gateway.upstreams))
