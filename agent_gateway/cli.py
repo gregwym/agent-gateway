@@ -7,7 +7,7 @@
     agw secret -c gateway.yaml init|set NAME|rm NAME|list
     agw approval -c gateway.yaml enroll PERSON|passkeys|forget ID|requests|cancel ID
 
-All of these are run by a human on the gateway host. None is reachable over the network.
+Host administration commands run locally. The stage command delivers credentials to an existing proposal.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -327,6 +328,47 @@ def cmd_admin(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_stage(args: argparse.Namespace) -> int:
+    import httpx2
+    try:
+        origin = urlsplit(args.origin)
+        loopback = origin.hostname in {"127.0.0.1", "::1", "localhost"}
+        if ((origin.scheme != "https" and not (origin.scheme == "http" and loopback))
+                or not origin.hostname or origin.username is not None or origin.password is not None
+                or origin.path not in ("", "/") or origin.query or origin.fragment
+                or not re.fullmatch(r"[0-9a-f]{32}", args.proposal)):
+            raise ValueError()
+    except ValueError:
+        print("error: expected a gateway origin and a proposal ID", file=sys.stderr)
+        return 2
+    agent_token = os.environ.get("AGW_AGENT_TOKEN")
+    if not agent_token:
+        print("error: AGW_AGENT_TOKEN is required", file=sys.stderr)
+        return 2
+    try:
+        raw = sys.stdin.buffer.read(16001)
+        credentials = json.loads(raw)
+        if len(raw) > 16000 or not isinstance(credentials, dict):
+            raise ValueError()
+    except (UnicodeError, ValueError):
+        print("error: expected a JSON object on standard input", file=sys.stderr)
+        return 2
+    endpoint = args.origin.rstrip("/") + "/admin/intake/" + args.proposal
+    try:
+        with httpx2.Client(timeout=15, follow_redirects=False, trust_env=False) as http:
+            issued = http.post(endpoint, headers={"Authorization": "Bearer " + agent_token})
+            issued.raise_for_status()
+            ticket = issued.json()["token"]
+            staged = http.put(endpoint, headers={"Authorization": "Bearer " + ticket}, json=credentials)
+            staged.raise_for_status()
+            result = staged.json()
+            print(json.dumps({"proposal": args.proposal, "version": result["version"], "expires_at": result["expires_at"]}))
+    except (httpx2.HTTPError, ValueError, KeyError):
+        print("error: credential delivery failed; check the proposal status before retrying", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agw", description="Personal / family MCP gateway")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -359,6 +401,11 @@ def main(argv: list[str] | None = None) -> int:
     p_admin.add_argument("action", choices=["setup"])
     p_admin.add_argument("--rotate", action="store_true", help="invalidate the previous setup link")
     p_admin.set_defaults(func=cmd_admin)
+
+    p_stage = sub.add_parser("stage", help="deliver a JSON credential object from stdin to one proposal")
+    p_stage.add_argument("origin", help="gateway HTTPS origin")
+    p_stage.add_argument("proposal", help="prepared proposal ID")
+    p_stage.set_defaults(func=cmd_stage)
 
     args = parser.parse_args(argv)
     os.umask(0o077)  # whatever these commands write (lock file, secret store, audit log) is owner-only

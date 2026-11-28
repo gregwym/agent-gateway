@@ -195,3 +195,130 @@ async def test_provisioning_queue_protects_arguments(tmp_path, monkeypatch, need
         assert watched["result"]["structuredContent"]["status"] == "succeeded"
         rows = gw.app.state.admin.provisioning.rows()
         assert len(rows) == 1 and rows[0]["config"]["url"] == endpoint
+
+
+async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_grants(tmp_path, monkeypatch):
+    import httpx2
+
+    port = free_port()
+    raw = approval_config(origin=f"http://localhost:{port}")
+    raw["admin"] = {"owner": "person_a", "state": "admin.enc"}
+    raw["server"]["tool_discovery"] = "search"
+    path = await prepare(tmp_path, raw)
+    upstream = Remote(monkeypatch, mode="oauth")
+    upstream.no_registration = True
+    upstream.grant_scope = "notes.read"
+    async with web_gateway(tmp_path, path=path, port=port) as (gw, http, origin, path):
+        await setup(http, origin, path)
+        assert (await change(http, "permissions/connection", client="shared-agent", connection="gateway_config",
+                             access="read_write_direct")).status_code == 200
+
+        async def invoke(tool, key, arguments, *, connection="gateway_config", token=TOKEN_HOUSE):
+            return (await rpc(origin, token, "tools/call", {"name": "gateway_call_tool", "arguments": {
+                "connection": connection, "tool": tool, "idempotency_key": key, "arguments": arguments,
+            }})).json()
+
+        async def propose(key, args):
+            result = await invoke("gateway_config_provision", key, {"prepared": True, **args})
+            return json.loads(result["result"]["content"][0]["text"])
+
+        oauth = await propose("prepared-client", {"kind": "oauth_client", "id": "prepared-client", "issuer": ISSUER})
+        other = await propose("other-client", {"kind": "oauth_client", "id": "other-client", "issuer": ISSUER})
+        assert not upstream.requests
+        credentials = {"client_id": "prepared-client-id", "client_secret": "prepared-private-client-secret"}
+        async with httpx2.AsyncClient(trust_env=False) as runner:
+            auth = {"Authorization": f"Bearer {TOKEN_HOUSE}"}
+            wrong_agent = await runner.post(oauth["intake_url"], headers={"Authorization": f"Bearer {TOKEN_A}"})
+            assert wrong_agent.status_code == 404
+            assert (await runner.post(oauth["intake_url"], headers=auth | {"Origin": origin})).status_code == 403
+            ticket = (await runner.post(oauth["intake_url"], headers=auth)).json()["token"]
+            headers = {"Authorization": f"Bearer {ticket}"}
+            assert (await runner.get(origin + "/admin/api/state", headers=headers)).status_code == 401
+            assert (await rpc(origin, ticket)).status_code == 401
+            assert (await runner.put(other["intake_url"], headers=headers, json=credentials)).status_code == 401
+            staged = await runner.put(oauth["intake_url"], headers=headers, json=credentials)
+            assert staged.status_code == 200, staged.text
+            version = staged.json()["version"]
+            assert (await runner.put(oauth["intake_url"], headers=headers, json=credentials)).status_code == 401
+            assert (await runner.post(oauth["intake_url"], headers=auth)).status_code == 409
+            assert (await runner.post(other["intake_url"], headers=auth)).status_code == 200
+
+        assert credentials["client_secret"].encode() not in (tmp_path / "admin.enc.staged").read_bytes()
+        data = await state(http)
+        review = next(row for row in data["config_proposals"] if row["id"] == oauth["id"])
+        assert review["staged_client_id"] == credentials["client_id"]
+        assert credentials["client_secret"] not in json.dumps(data)
+        approval = {"proposal": oauth["id"], "staged_version": version}
+        unapproved = await http.post("/admin/api/oauth-clients/save", json=approval | {"revision": data["revision"]})
+        assert unapproved.status_code == 403
+        assert (await change(http, "oauth-clients/save", **(approval | {"staged_version": "changed"}))).status_code == 409
+        assert (await change(http, "oauth-clients/save", **approval)).status_code == 200
+        assert (await change(http, "oauth-clients/save", **approval)).status_code == 409
+        assert not upstream.requests
+        assert oauth["id"] not in gw.app.state.admin.provisioning.intake.names()
+        assert (await change(http, "proposals/reject", id=other["id"])).status_code == 200
+        assert other["id"] not in gw.app.state.admin.provisioning.intake.names()
+
+        expired = await propose("expired-client", {"kind": "oauth_client", "id": "expired-client", "issuer": ISSUER})
+        intake_store = gw.app.state.admin.provisioning.intake
+        async with httpx2.AsyncClient(trust_env=False) as runner:
+            ticket = (await runner.post(expired["intake_url"], headers=auth)).json()["token"]
+            stage_auth = {"Authorization": f"Bearer {ticket}"}
+            staged = await runner.put(expired["intake_url"], headers=stage_auth, json=credentials)
+        record = json.loads(intake_store.get(expired["id"]))
+        intake_store.set(expired["id"], json.dumps(record | {"expires_at": 0}))
+        assert (await change(http, "oauth-clients/save", proposal=expired["id"],
+                             staged_version=staged.json()["version"])).status_code == 409
+        assert not upstream.requests
+        assert all(client["id"] != "expired-client" for client in (await state(http))["oauth_clients"])
+
+        args = {"kind": "http_mcp", "id": "prepared-remote", "url": URL, "auth": "oauth",
+                "oauth_client": "prepared-client", "scope": "notes.read",
+                "grants": [{"client": "shared-agent", "tool": "read.note", "access": "read"}]}
+        remote = await propose("prepared-remote", args)
+        assert not upstream.requests
+        started = await change(http, "oauth/mcp/start", proposal=remote["id"])
+        assert started.status_code == 200, started.text
+        upstream.query = parse_qs(urlsplit(started.json()["url"]).query)
+        assert upstream.query["client_id"] == [credentials["client_id"]]
+        upstream.fail_token = "invalid_grant"
+        failed = await consent_complete(http, upstream)
+        assert failed.status_code == 400
+        readback = await invoke("gateway_config_read", "failed-readback", {})
+        requests = json.loads(readback["result"]["content"][0]["text"])["proposals"]
+        failure = next(row for row in requests if row["id"] == remote["id"])
+        assert failure["status"] == "pending" and failure["last_error"] == failed.json()["error"]
+        upstream.fail_token = None
+        restarted = await change(http, "oauth/mcp/start", proposal=remote["id"])
+        assert restarted.status_code == 200, restarted.text
+        upstream.query = parse_qs(urlsplit(restarted.json()["url"]).query)
+        reviewed = await consent_complete(http, upstream)
+        draft = reviewed.json()["draft"]
+        assert reviewed.json()["proposal_grants"] == args["grants"]
+        assert (await apply(http, reviewed, [{"upstream": "write.note", "access": "write"}])).status_code == 409
+        assert all(row["id"] != args["id"] for row in (await state(http))["connections"])
+        assert (await apply(http, reviewed)).status_code == 200
+        assert (await change(http, "connections/apply", draft=draft, reviewed=True, tools=[])).status_code == 409
+        data = await state(http)
+        connection = next(row for row in data["connections"] if row["id"] == args["id"])
+        tools = {row["upstream"]: row for row in connection["tools"]}
+        assert tools["read.note"]["permissions"]["shared-agent"] == "allow"
+        assert tools["write.note"]["permissions"]["shared-agent"] == "deny"
+        result = await invoke("gateway_config_read", "prepared-readback", {})
+        rows = json.loads(result["result"]["content"][0]["text"])["proposals"]
+        assert {row["config"]["id"]: row["status"] for row in rows} == {
+            "prepared-client": "applied", "other-client": "rejected", "expired-client": "pending", "prepared-remote": "applied",
+        }
+        async def discover(token):
+            result = (await rpc(origin, token, "tools/call", {"name": "gateway_search_tools",
+                      "arguments": {"connection": args["id"]}})).json()
+            return [tool["name"] for tool in json.loads(result["result"]["content"][0]["text"])["tools"]]
+
+        read_tool, = await discover(TOKEN_HOUSE)
+        assert await discover(TOKEN_A) == []
+        used = await invoke(read_tool, "prepared-call", {}, connection=args["id"])
+        assert "result" in used and "simulated result" in used["result"]["content"][0]["text"], used
+        denied = await invoke(read_tool, "prepared-denied", {}, connection=args["id"], token=TOKEN_A)
+        assert denied["error"]["message"] == "Unknown tool"
+        await propose("legacy-pending", {"kind": "http_mcp", "id": "legacy-pending",
+                                         "url": URL, "auth": "none", "prepared": False})
