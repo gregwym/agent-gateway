@@ -34,6 +34,10 @@ def definitions():
         "oauth_client": ALIAS,
         "scope": string("Space-separated OAuth scopes for this connection.", 500),
         "prepared": {"type": "boolean", "description": "Use the no-entry approval flow."},
+        "intake_sha256": {
+            "type": "string",
+            "description": "Lowercase SHA-256 hex digest of a private upload token. Only for prepared requests that need credentials. Send the digest only.",
+        },
         "owner": ALIAS,
         "header": string("Credential header name for header authentication.", 64),
         "grants": {"type": "array", "maxItems": 20, "items": {
@@ -119,7 +123,7 @@ class Provisioning:
             view["review_url"] += "?proposal=" + row["id"]
             if status == "pending" and row.get("last_error"):
                 view["last_error"] = row["last_error"]
-            required = self.needs_credentials(row)
+            required = self.needs_credentials(row["config"])
             view["credentials_required"] = required
             if required and status == "pending":
                 record = self.intake_record(row["id"])
@@ -147,6 +151,10 @@ class Provisioning:
     def validate(self, gateway, client_id, arguments):
         args = dict(arguments)
         prepared = args.pop("prepared", False)
+        intake_sha256 = args.pop("intake_sha256", None)
+        if intake_sha256 is not None and not (
+                prepared and self.needs_credentials(args) and re.fullmatch(r"[0-9a-f]{64}", intake_sha256)):
+            raise Refused("invalid_proposal", 400)
         if args["kind"] == "oauth_client":
             if set(args) != {"kind", "id", "issuer"}:
                 raise Refused("invalid_proposal", 400)
@@ -173,7 +181,11 @@ class Provisioning:
         if (not re.fullmatch(NAME, args["id"]) or gateway.scrubber.data(args) != args
                 or re.search(r"\bagw_(?:intake_)?[a-zA-Z0-9_-]{43}\b", json.dumps(args))):
             raise Refused("invalid_proposal", 400)
-        return args | ({"prepared": True} if prepared else {})
+        if prepared:
+            args["prepared"] = True
+        if intake_sha256 is not None:
+            args["intake_sha256"] = intake_sha256
+        return args
 
     @staticmethod
     def validate_permissions(cfg, client_id, args):
@@ -240,8 +252,7 @@ class Provisioning:
             })
 
     @staticmethod
-    def needs_credentials(row):
-        args = row["config"]
+    def needs_credentials(args):
         return args["kind"] == "oauth_client" or args.get("auth") in ("bearer", "header")
 
     def intake_record(self, identifier):
@@ -253,15 +264,25 @@ class Provisioning:
     def issue_intake(self, row, caller):
         if row["client"] != caller.client_id or not hmac.compare_digest(row["token"], caller.token_sha256):
             raise Refused("not_found", 404)
-        if not row["config"].get("prepared") or not self.needs_credentials(row):
+        if not row["config"].get("prepared") or not self.needs_credentials(row["config"]):
             raise Refused("proposal_without_credentials", 409)
-        record = self.intake_record(row["id"])
-        if record and "version" in record:
-            raise Refused("proposal_credentials_already_staged", 409)
         token = "agw_intake_" + secrets.token_urlsafe(32)
-        expires = min(int(time.time()) + INTAKE_TTL, row["expires_at"])
-        self.intake.set(row["id"], json.dumps({"hash": hash_token(token), "expires_at": expires}))
+        expires = self.reserve_intake(row, hash_token(token))
+        if expires is None:
+            raise Refused("proposal_credentials_already_staged", 409)
         return {"token": token, "expires_at": expires}
+
+    def reserve_intake(self, row, digest):
+        identifier = row["id"]
+        record = self.intake_record(identifier)
+        if record:
+            if "version" in record:
+                return None
+            if record["hash"] == digest:
+                return record["expires_at"]
+        expires = min(int(time.time()) + INTAKE_TTL, row["expires_at"])
+        self.intake.set(identifier, json.dumps({"hash": digest, "expires_at": expires}))
+        return expires
 
     def stage(self, row, token, body):
         identifier, args = row["id"], row["config"]
@@ -315,7 +336,7 @@ class Provisioning:
         args = row["config"]
         if set(body) - {"revision", "staged_version"}:
             raise Refused("proposal_changed", 409)
-        credentials = self.staged(row, body.pop("staged_version", None)) if self.needs_credentials(row) else {}
+        credentials = self.staged(row, body.pop("staged_version", None)) if self.needs_credentials(args) else {}
         if args["kind"] == "oauth_client" and operation == "oauth-clients/save":
             return body | {key: args[key] for key in ("id", "issuer")} | credentials
         expected = "oauth/mcp/start" if args.get("auth") == "oauth" else "connections/preview"
@@ -326,10 +347,13 @@ class Provisioning:
                        "settings": {key: args[key] for key in SETTING_KEYS if key in args}}
 
     def submit(self, gateway, client, args):
+        digest = args.pop("intake_sha256", None)
         rows = self.rows()
         own = [row for row in rows if row["client"] == client.id and row["token"] == client.token_sha256]
         for row in own:
             if row["config"] == args:
+                if digest is not None and self.status(row) == "pending":
+                    self.reserve_intake(row, digest)
                 return self.view(row)
         if len(rows) >= 50 or len(own) >= 10:
             raise Refused("proposal_limit", 409)
@@ -338,6 +362,8 @@ class Provisioning:
         if self.status(row) != "pending":
             raise Refused("configuration_already_exists", 409)
         self.save_row(row)
+        if digest is not None:
+            self.reserve_intake(row, digest)
         gateway.audit.write("configuration_proposed", client=client.id, detail=row["id"])
         return self.view(row)
 

@@ -1,14 +1,22 @@
 """Use the normal management and MCP routes to provision disposable resources."""
+import hashlib
 import json
+import os
+import secrets
 import sqlite3
+import sys
+import time
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
+import anyio
 import pytest
 
 from helpers import TOKEN_A, TOKEN_HOUSE, prepare
 from passkey_helpers import Page, approval_config, request_id_in
 from service_helpers import free_port
 
+from agent_gateway.connectors import gateway_config
 from agent_gateway.request_store import RequestStore
 from test_admin import change, rpc, setup, state, web_gateway
 from test_admin_remote import ISSUER, Remote, URL, apply, consent_complete
@@ -197,7 +205,13 @@ async def test_provisioning_queue_protects_arguments(tmp_path, monkeypatch, need
         assert len(rows) == 1 and rows[0]["config"]["url"] == endpoint
 
 
-async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_grants(tmp_path, monkeypatch):
+def upload_token():
+    token = "agw_intake_" + secrets.token_urlsafe(32)
+    return token, hashlib.sha256(token.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("intake_method", ["agent-token", "digest"])
+async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_grants(tmp_path, monkeypatch, intake_method):
     import httpx2
 
     port = free_port()
@@ -220,10 +234,32 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
 
         async def propose(key, args):
             result = await invoke("gateway_config_provision", key, {"prepared": True, **args})
+            assert not result["result"].get("isError"), result
             return json.loads(result["result"]["content"][0]["text"])
 
-        oauth = await propose("prepared-client", {"kind": "oauth_client", "id": "prepared-client", "issuer": ISSUER})
-        other = await propose("other-client", {"kind": "oauth_client", "id": "other-client", "issuer": ISSUER})
+        client_args = {"kind": "oauth_client", "id": "prepared-client", "issuer": ISSUER}
+        other_args = client_args | {"id": "other-client"}
+        ticket, digest = upload_token()
+        other_ticket, other_digest = upload_token()
+        use_digest = intake_method == "digest"
+        if use_digest:
+            malformed = await invoke("gateway_config_provision", "invalid-digest",
+                                     client_args | {"prepared": True, "intake_sha256": ticket})
+            assert malformed["result"]["isError"]
+            assert "invalid_proposal" in json.dumps(malformed) and ticket not in json.dumps(malformed)
+            no_auth = await invoke("gateway_config_provision", "no-auth-digest", {
+                "kind": "http_mcp", "id": "no-auth", "url": URL, "auth": "none",
+                "prepared": True, "intake_sha256": digest,
+            })
+            assert no_auth["result"]["isError"]
+            unprepared = await invoke("gateway_config_provision", "unprepared-digest",
+                                      client_args | {"intake_sha256": digest})
+            assert unprepared["result"]["isError"]
+            denied = await invoke("gateway_config_provision", "denied-intake",
+                                  client_args | {"prepared": True, "intake_sha256": digest}, token=TOKEN_A)
+            assert denied["error"]["message"] == "Unknown tool"
+        oauth = await propose("prepared-client", client_args | ({"intake_sha256": digest} if use_digest else {}))
+        other = await propose("other-client", other_args | ({"intake_sha256": other_digest} if use_digest else {}))
         assert not upstream.requests
         credentials = {"client_id": "prepared-client-id", "client_secret": "prepared-private-client-secret"}
         async with httpx2.AsyncClient(trust_env=False) as runner:
@@ -231,17 +267,38 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
             wrong_agent = await runner.post(oauth["intake_url"], headers={"Authorization": f"Bearer {TOKEN_A}"})
             assert wrong_agent.status_code == 404
             assert (await runner.post(oauth["intake_url"], headers=auth | {"Origin": origin})).status_code == 403
-            ticket = (await runner.post(oauth["intake_url"], headers=auth)).json()["token"]
+            if not use_digest:
+                ticket = (await runner.post(oauth["intake_url"], headers=auth)).json()["token"]
             headers = {"Authorization": f"Bearer {ticket}"}
             assert (await runner.get(origin + "/admin/api/state", headers=headers)).status_code == 401
             assert (await rpc(origin, ticket)).status_code == 401
             assert (await runner.put(other["intake_url"], headers=headers, json=credentials)).status_code == 401
-            staged = await runner.put(oauth["intake_url"], headers=headers, json=credentials)
-            assert staged.status_code == 200, staged.text
-            version = staged.json()["version"]
+            command = [sys.executable, "-m", "agent_gateway.cli", "stage", origin, oauth["id"]]
+            env = {key: value for key, value in os.environ.items() if key != "AGW_AGENT_TOKEN"}
+            payload = json.dumps(credentials)
+            if use_digest:
+                digest_auth = {"Authorization": f"Bearer {digest}"}
+                assert (await runner.put(oauth["intake_url"], headers=digest_auth, json=credentials)).status_code == 401
+                command.append("--intake-token-stdin")
+                payload = ticket + "\n" + payload
+            else:
+                env["AGW_AGENT_TOKEN"] = TOKEN_HOUSE
+            cli = await anyio.run_process(command, env=env, input=payload.encode(), check=False)
+            assert cli.returncode == 0, cli.stderr.decode()
+            receipt = json.loads(cli.stdout)
+            assert receipt["proposal"] == oauth["id"]
+            version = receipt["version"]
+            assert all(value.encode() not in cli.stdout for value in (ticket, TOKEN_HOUSE, credentials["client_secret"]))
+            assert not cli.stderr
+            if use_digest:
+                duplicate = await propose("duplicate-client", client_args | {"intake_sha256": other_digest})
+                assert duplicate["id"] == oauth["id"] and duplicate["staged_version"] == version
+                new_auth = {"Authorization": f"Bearer {other_ticket}"}
+                assert (await runner.put(oauth["intake_url"], headers=new_auth, json=credentials)).status_code == 401
             assert (await runner.put(oauth["intake_url"], headers=headers, json=credentials)).status_code == 401
             assert (await runner.post(oauth["intake_url"], headers=auth)).status_code == 409
-            assert (await runner.post(other["intake_url"], headers=auth)).status_code == 200
+            if not use_digest:
+                assert (await runner.post(other["intake_url"], headers=auth)).status_code == 200
 
         assert credentials["client_secret"].encode() not in (tmp_path / "admin.enc.staged").read_bytes()
         data = await state(http)
@@ -258,17 +315,40 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
         assert oauth["id"] not in gw.app.state.admin.provisioning.intake.names()
         assert (await change(http, "proposals/reject", id=other["id"])).status_code == 200
         assert other["id"] not in gw.app.state.admin.provisioning.intake.names()
+        if use_digest:
+            async with httpx2.AsyncClient(trust_env=False) as runner:
+                response = await runner.put(other["intake_url"], headers=new_auth, json=credentials)
+                assert response.json()["error"] == "proposal_not_pending"
 
-        expired = await propose("expired-client", {"kind": "oauth_client", "id": "expired-client", "issuer": ISSUER})
-        intake_store = gw.app.state.admin.provisioning.intake
+        expiry_args = client_args | {"id": "expired-client"}
         async with httpx2.AsyncClient(trust_env=False) as runner:
-            ticket = (await runner.post(expired["intake_url"], headers=auth)).json()["token"]
-            stage_auth = {"Authorization": f"Bearer {ticket}"}
-            staged = await runner.put(expired["intake_url"], headers=stage_auth, json=credentials)
-        record = json.loads(intake_store.get(expired["id"]))
-        intake_store.set(expired["id"], json.dumps(record | {"expires_at": 0}))
-        assert (await change(http, "oauth-clients/save", proposal=expired["id"],
-                             staged_version=staged.json()["version"])).status_code == 409
+            if use_digest:
+                expiring_ticket, expiring_digest = upload_token()
+                now, elapsed = time.time(), 0
+                with monkeypatch.context() as clock:
+                    clock.setattr(gateway_config, "time", SimpleNamespace(time=lambda: now + elapsed))
+                    expiring_args = expiry_args | {"intake_sha256": expiring_digest}
+                    expired = await propose("expired-client", expiring_args)
+                    elapsed = 600
+                    duplicate = await propose("same-digest", expiring_args)
+                    assert duplicate["id"] == expired["id"]
+                    elapsed = 901
+                    expired_auth = {"Authorization": f"Bearer {expiring_ticket}"}
+                    refusal = await runner.put(expired["intake_url"], headers=expired_auth, json=credentials)
+                    assert refusal.json()["error"] == "invalid_intake_token"
+            else:
+                expired = await propose("expired-client", expiry_args)
+                expiring_ticket = (await runner.post(expired["intake_url"], headers=auth)).json()["token"]
+                stage_auth = {"Authorization": f"Bearer {expiring_ticket}"}
+                staged = await runner.put(expired["intake_url"], headers=stage_auth, json=credentials)
+                assert staged.status_code == 200
+                replay = await runner.put(expired["intake_url"], headers=stage_auth, json=credentials)
+                assert replay.status_code == 401
+                intake_store = gw.app.state.admin.provisioning.intake
+                record = json.loads(intake_store.get(expired["id"]))
+                intake_store.set(expired["id"], json.dumps(record | {"expires_at": 0}))
+                assert (await change(http, "oauth-clients/save", proposal=expired["id"],
+                                     staged_version=staged.json()["version"])).status_code == 409
         assert not upstream.requests
         assert all(client["id"] != "expired-client" for client in (await state(http))["oauth_clients"])
 
@@ -315,6 +395,9 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
         assert tools["read.note"]["permissions"]["shared-agent"] == "allow"
         assert tools["write.note"]["permissions"]["shared-agent"] == "deny"
         result = await invoke("gateway_config_read", "prepared-readback", {})
+        for private_value in (ticket, other_ticket, expiring_ticket, credentials["client_secret"]):
+            assert all(private_value not in json.dumps(value) for value in (oauth, other, result))
+            assert private_value not in gw.audit_text()
         rows = json.loads(result["result"]["content"][0]["text"])["proposals"]
         assert {row["config"]["id"]: row["status"] for row in rows} == {
             "prepared-client": "applied", "other-client": "rejected", "expired-client": "pending", "prepared-remote": "applied",
@@ -334,3 +417,12 @@ async def test_prepared_oauth_uses_staged_credentials_and_applies_exact_agent_gr
         assert denied["error"]["message"] == "Unknown tool"
         await propose("legacy-pending", {"kind": "http_mcp", "id": "legacy-pending",
                                          "url": URL, "auth": "none", "prepared": False})
+        if use_digest:
+            revoked_ticket, revoked_digest = upload_token()
+            revoked = await propose("revoked", client_args | {"id": "revoked", "intake_sha256": revoked_digest})
+            assert (await change(http, "permissions/connection", client="shared-agent", connection="gateway_config",
+                                 access="read")).status_code == 200
+            async with httpx2.AsyncClient(trust_env=False) as runner:
+                revoked_auth = {"Authorization": f"Bearer {revoked_ticket}"}
+                refusal = await runner.put(revoked["intake_url"], headers=revoked_auth, json=credentials)
+                assert refusal.json()["error"] == "proposal_not_pending"
