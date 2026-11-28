@@ -86,7 +86,7 @@ class ManagedStore:
         # Fail closed on a malformed/corrupt state file, including tool locks.
         self.effective(self.state)
         self.state, self.catalog_updates = self.reconcile(self.upgrade(self.state))
-        if self.state.get("gmail_client") and not self.state.get("gmail_oauth_client"):
+        if self.state.get("gmail_client"):
             from .admin_oauth import store_gmail_client
             store_gmail_client(self.state, self.state["gmail_client"])
 
