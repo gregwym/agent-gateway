@@ -684,11 +684,11 @@ networks:
 
 1. 启动 sidecar：`docker compose --profile amazon-orders up -d --no-build`。网关多挂了一个套接字卷，会重建一次。
 2. 在装有 uv 和 Chrome 的 Mac 上运行下面这条命令。把 `GATEWAY_COMMIT` 换成部署对应的完整 GitHub 提交号。
-   uv 会自动准备 Python 环境。在弹出的 Chrome 中手动登录，勾选「保持登录」，然后按 `Cmd+Q` 完全退出 Chrome。
-   导出器把会话写到当前目录的 `amazon-session.json`，只有当前用户能读写。
+   uv 会自动准备 Python 环境。在弹出的 Chrome 中手动登录，如有「保持登录」选项就勾选，然后按 `Cmd+Q` 完全退出 Chrome。
+   导出器确认文件包含未过期的 Amazon 美国站登录数据后，写入当前目录的 `amazon-session.json`，只有当前用户能读写。
 
    ```sh
-   uvx --python 3.12 --from "agent-gateway[session-export] @ https://github.com/gregwym/agent-gateway/archive/GATEWAY_COMMIT.tar.gz" agw-export-session amazon-us ./amazon-session.json
+   uvx --python 3.12 --from "agent-gateway[session-export] @ https://github.com/gregwym/agent-gateway/archive/GATEWAY_COMMIT.tar.gz" agw-export-session amazon-orders ./amazon-session.json
    ```
 
 3. 「连接器 → 添加连接器 → 本地连接器」选「Amazon Orders」，在「浏览器会话 JSON」选择文件，点「预览工具」。
@@ -697,7 +697,8 @@ networks:
    用管理员 Passkey 应用后删除本地文件。在「权限」中给 Agent 设为「只读」。
 
 工具返回「There's no saved Amazon session.」或登录失败时，重新导出会话，在「编辑设置」里选择新文件。
-用管理员 Passkey 保存后删除本地文件。留空会保留已保存的会话。
+网关会拒绝缺少有效登录数据的文件并保留已保存的会话。留空也会保留已保存的会话。
+用管理员 Passkey 保存后删除本地文件。详情页的「验证连接」检查能否列出工具，实际登录状态请用已授权的订单查询确认。
 sidecar 在 `amazon-orders-state` 卷里给每个连接单独存一份 `cookies.json`（0600），包括 Amazon 中途更新的 Cookie。
 工具审阅使用临时文件。应用新凭据后，下次启动会覆盖对应连接的 Cookie。这个卷不用备份，丢了就重新导出。
 

@@ -68,3 +68,43 @@ async def test_host_plugin_install_review_and_account_credentials(tmp_path, kind
             assert "--query=--force; touch pwned" in result["result"]["content"][0]["text"]
             assert "REDACTED" in result["result"]["content"][0]["text"]
         assert secret not in str(result) + gw.audit_text()
+
+
+async def test_amazon_session_api_rejects_invalid_replacements(tmp_path):
+    directory = tmp_path / "plugins"
+    directory.mkdir()
+    slot = "ORDERS_SESSION_SECRET"
+    (directory / "amazon-orders.json").write_text(json.dumps({
+        "id": "amazon-orders", "label": "Amazon Orders", "kind": "stdio",
+        "command": [sys.executable, "-m", "agent_gateway.demo_connector"],
+        "env": {"DEMO_API_KEY": "synthetic-test-credential"},
+        "credentials": {slot: "Amazon session file"},
+    }))
+    login = {"name": "x-main", "value": '"synthetic-amazon-login"', "domain": ".amazon.com", "path": "/"}
+    body = {"id": "orders", "owner": "person_a", "kind": "local", "settings": {"plugin": "amazon-orders"}}
+
+    async with web_gateway(tmp_path) as (gw, http, origin, path):
+        await setup(http, origin, path)
+
+        async def submit(operation, value):
+            return await change(http, operation, **body, credentials={slot: value})
+
+        rejected = await submit("connections/preview", json.dumps([{**login, "name": "session-id"}]))
+        assert rejected.status_code == 400 and rejected.json() == {"error": "amazon_session_invalid"}
+        assert not gw.cfg.admin.state.exists()
+
+        preview = await submit("connections/preview", json.dumps([login]))
+        assert preview.status_code == 200, preview.text
+        review = preview.json()
+        applied = await change(http, "connections/apply", draft=review["draft"], reviewed=True, tools=review["tools"])
+        assert applied.status_code == 200, applied.text
+        before = gw.cfg.admin.state.read_bytes()
+        invalid = ("not JSON", json.dumps({"cookies": [login]}),
+                   *(json.dumps([{**login, **changes}]) for changes in (
+                       {"expires": 1}, {"domain": ".amazon.co.uk"}, {"path": "/orders"},
+                   )))
+        for value in invalid:
+            rejected = await submit("connections/save", value)
+            assert rejected.status_code == 400 and rejected.json() == {"error": "amazon_session_invalid"}
+        assert gw.cfg.admin.state.read_bytes() == before
+        assert "synthetic-amazon-login" not in preview.text + applied.text + gw.audit_text()

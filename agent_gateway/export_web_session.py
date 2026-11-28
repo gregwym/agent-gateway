@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from agent_gateway.connectors.amazon_orders_session import AMAZON_ORDERS, AMAZON_US_PROFILE, import_amazon_orders_session
 from agent_gateway.connectors.web import import_session
 from agent_gateway.web_profiles import bundled_profiles
 
@@ -94,11 +95,12 @@ def saved_cookies(chrome, profile_dir):
 def main():
     profiles = bundled_profiles()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("site", choices=profiles)
+    parser.add_argument("site", choices=(*profiles, AMAZON_ORDERS))
     parser.add_argument("output", type=Path, help="New file, written with owner-only permissions")
     parser.add_argument("--chrome", help="Path to the Chrome or Chromium executable")
     args = parser.parse_args()
-    profile = profiles[args.site][1]
+    amazon_orders = args.site == AMAZON_ORDERS
+    profile = AMAZON_US_PROFILE if amazon_orders else profiles[args.site][1]
     host = urlsplit(profile.origin).hostname
     chrome = find_chrome(args.chrome)
     if not chrome:
@@ -119,8 +121,12 @@ def main():
         shutil.rmtree(profile_dir, ignore_errors=True)
 
     try:
-        raw = import_session(json.dumps(cookies), profile)
-    except ValueError:
+        captured = json.dumps(cookies)
+        raw = import_amazon_orders_session(captured) if amazon_orders else import_session(captured, profile)
+    except (ValueError, RecursionError):
+        if amazon_orders:
+            parser.exit(1, "No valid Amazon Orders sign-in was found. Sign in to Amazon US, "
+                        "choose 'Keep me signed in' if offered, then quit Chrome and try again.\n")
         parser.exit(1, f"No saved cookies for {host}. Sign in with 'Keep me signed in', then quit Chrome.\n")
     fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as file:

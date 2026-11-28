@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Config, ConnectionCfg, allocate_tool_name, is_mail_send, validate_name
+from .connectors.amazon_orders_session import AMAZON_ORDERS, ORDERS_SESSION_SECRET, import_amazon_orders_session
 from .credentials import EncryptedFileStore
 from .gmail_scopes import ORGANIZE_TOOLS, SCOPES, tool_enabled
 from .lock import Lock, digest_of
@@ -411,6 +412,12 @@ def make_connection(body, cfg, values, *, gmail_email=None, plugins=None):
                 provided = {SESSION_ENV: import_session(provided[SESSION_ENV], profile, connection_origins(previous)[1:] if previous else ())}
             except (ValueError, RecursionError):
                 raise Refused("web_session_invalid", 400) from None
+        elif kind == "local" and plugin_id == AMAZON_ORDERS and provided.get(ORDERS_SESSION_SECRET):
+            try:
+                session = import_amazon_orders_session(provided[ORDERS_SESSION_SECRET])
+            except (ValueError, RecursionError):
+                raise Refused("amazon_session_invalid", 400) from None
+            provided = {**provided, ORDERS_SESSION_SECRET: session}
         refs = {}
         for env_name in allowed_secrets:
             if not provided.get(env_name) and (not previous or not values.get(previous.secret_env.get(env_name))):

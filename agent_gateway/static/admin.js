@@ -233,6 +233,7 @@ const messages = {
   web_browser_multiple_submit: ['This form has multiple submit buttons. Choose one on the website.', '此表单有多个提交按钮，请在网页上点选。'],
   web_browser_input: ['This browser action is invalid. Try again.', '浏览器操作无效，请重试。'],
   web_session_invalid: ['The file has no valid, unexpired cookies for this website.', '文件中没有该网站有效且未过期的 Cookie。'],
+  amazon_session_invalid: ['The file contains no valid Amazon Orders sign-in. Sign in to Amazon US and export a new file.', '文件中没有有效的 Amazon Orders 登录会话。请登录 Amazon 美国站并重新导出文件。'],
   web_login_required: ['The website needs you to sign in again. Use Edit settings to reconnect.', '网站需要重新登录。请在「编辑设置」中重新连接。'],
   web_response_encoding: ['The website returned an unsupported content encoding.', '网站返回了不支持的内容编码。'],
   web_unsafe_address: ['The website resolved to a non-public address. The gateway stopped the request.', '网站解析到了非公网地址，网关已停止请求。'],
